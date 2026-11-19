@@ -1,0 +1,55 @@
+# 测试算例：虚构站址与设备参数，仅用于开发和测试，不对应任何真实电站。
+# 坐标系：x = 东，y = 北，z = 上，单位 m，原点在塔底。方位角按罗盘：北 = 0°，东 = 90°。
+name: example
+
+site:
+  latitude: 40.0        # 北纬 (°)
+  longitude: 94.7       # 东经 (°)
+  elevation_m: 1200     # 海拔 (m)，影响晴空 DNI
+  timezone: Asia/Shanghai
+
+receiver:               # 外置圆柱集热器，竖直轴
+  center: [0, 0, 100]   # 圆柱中心点 (m)
+  diameter: 7.0
+  height: 8.0
+  max_flux_kw_m2: 1000  # 允许最大通量密度
+  n_azimuth: 72         # 通量图周向网格数（5°）
+  n_height: 32          # 通量图高度方向网格数
+
+heliostat:
+  width: 8.0
+  height: 8.0
+  pivot_height: 5.0     # 镜面旋转中心离地高度
+  reflectivity: 0.94
+  cleanliness: 0.97
+  slope_error_mrad: 1.5      # 镜面斜率误差 (1σ)
+  tracking_error_mrad: 1.0   # 跟踪误差 (镜面法向 1σ)
+  focusing: slant_range      # slant_range（按斜距聚焦）| flat（平面镜）| 焦距数值 (m)
+
+sun:
+  sigma_mrad: 2.51      # 太阳形状等效标准差
+  dni_model: meinel     # meinel（晴空模型）| constant
+  dni_constant_w_m2: 900
+
+field:
+  # 二选一：layout_file: my_layout.csv（列 x,y[,z]，相对本文件路径）或 generator
+  generator:
+    type: radial_staggered
+    r_min: 50              # 最内圈半径 (m)
+    r_max: 500             # 最外圈半径 (m)
+    spacing_factor: 1.1    # 防碰撞直径 DM = 镜面对角线 × 此系数
+    radial_spacing: 0.866  # 径向排距（DM 的倍数，≥0.866）
+    radial_growth: 0.3     # 排距随 (r - r_min)/塔高 增大的系数
+    azimuthal_spacing: 1.2 # 周向最小间距（DM 的倍数，≥1）
+  boundary:                # 场地边界多边形 [[x, y], ...]，北侧更大
+    - [-420, -300]
+    - [420, -300]
+    - [420, 480]
+    - [-420, 480]
+  exclusion_radius: 50     # 塔周围禁排半径 (m)
+
+annual:
+  year: 2025
+  day_of_month: 15         # 每月取一天作代表日
+  time_step_min: 60
+  min_sun_elevation_deg: 5
