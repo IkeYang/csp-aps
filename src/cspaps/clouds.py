@@ -1,0 +1,113 @@
+"""Cloud shadows on the field: per-heliostat DNI for real-time APS.
+
+Clouds are modelled directly as their ground shadows: soft-edged discs that
+drift with a constant velocity. Inside a shadow DNI is multiplied by the
+cloud's transmittance. Measured DNI maps (e.g. from a sky camera or a
+pyrheliometer network) can be loaded from CSV instead.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+from .config import Case
+from .field import Field
+
+
+@dataclass
+class Cloud:
+    x: float  # shadow centre at t0, m
+    y: float
+    radius: float  # m
+    transmittance: float = 0.2  # fraction of DNI that still reaches the ground
+    vx: float = 0.0  # shadow velocity, m/s
+    vy: float = 0.0
+    edge: float = 30.0  # width of the soft edge, m
+
+
+class CloudField:
+    def __init__(self, clouds: list[Cloud], t0: pd.Timestamp):
+        self.clouds = list(clouds)
+        self.t0 = pd.Timestamp(t0)
+
+    def transmittance(self, xy: np.ndarray, t) -> np.ndarray:
+        dt = (pd.Timestamp(t) - self.t0).total_seconds()
+        f = np.ones(len(xy))
+        for c in self.clouds:
+            d = np.hypot(xy[:, 0] - (c.x + c.vx * dt), xy[:, 1] - (c.y + c.vy * dt))
+            # smoothstep from 0 (outside) to 1 (inside) across the edge band
+            s = np.clip((c.radius - d) / max(c.edge, 1e-6) + 0.5, 0.0, 1.0)
+            s = s * s * (3 - 2 * s)
+            f *= 1.0 - (1.0 - c.transmittance) * s
+        return f
+
+    def dni(self, xy: np.ndarray, t, dni_clear: float) -> np.ndarray:
+        return dni_clear * self.transmittance(xy, t)
+
+    def max_dni(self, xy: np.ndarray, t, horizon_s: float, dni_clear: float, n_samples: int = 7) -> np.ndarray:
+        """Highest DNI each heliostat will see over [t, t + horizon] (perfect forecast)."""
+        out = self.dni(xy, t, dni_clear)
+        if horizon_s <= 0:
+            return out
+        for dt in np.linspace(0.0, horizon_s, n_samples)[1:]:
+            out = np.maximum(out, self.dni(xy, pd.Timestamp(t) + pd.Timedelta(seconds=float(dt)), dni_clear))
+        return out
+
+
+def random_clouds(spec: dict, fld: Field, duration_s: float, center_xy=(0.0, 0.0)) -> list[Cloud]:
+    """Random clouds that cross the field during the simulated window.
+
+    spec keys: n (5), seed (0), radius_m [80, 250], transmittance [0.05, 0.4],
+    speed_m_s (8), direction_deg (90 = moving towards the east), edge_m (40).
+    """
+    rng = np.random.default_rng(int(spec.get("seed", 0)))
+    n = int(spec.get("n", 5))
+    r_lo, r_hi = spec.get("radius_m", [80.0, 250.0])
+    tau_lo, tau_hi = spec.get("transmittance", [0.05, 0.4])
+    speed = float(spec.get("speed_m_s", 8.0))
+    direction = np.radians(float(spec.get("direction_deg", 90.0)))
+    edge = float(spec.get("edge_m", 40.0))
+    wind = np.array([np.sin(direction), np.cos(direction)])
+    lateral = np.array([wind[1], -wind[0]])
+    rel = fld.xyz[:, :2] - np.asarray(center_xy) if fld.n else np.zeros((1, 2))
+    extent = float(np.hypot(rel[:, 0], rel[:, 1]).max()) + 1.0
+    clouds = []
+    for _ in range(n):
+        radius = rng.uniform(r_lo, r_hi)
+        # place the cloud upwind so that it reaches the field at a random moment of the window
+        along = -rng.uniform(-extent - radius, extent + radius + speed * duration_s)
+        across = rng.uniform(-extent, extent)
+        pos = np.asarray(center_xy) + along * wind + across * lateral
+        clouds.append(Cloud(float(pos[0]), float(pos[1]), radius, rng.uniform(tau_lo, tau_hi),
+                            float(speed * wind[0]), float(speed * wind[1]), edge))
+    return clouds
+
+
+def cloud_field(case: Case, fld: Field, t0: pd.Timestamp) -> CloudField:
+    rt = case.realtime
+    clouds = [Cloud(**c) for c in (rt.clouds or [])]
+    if rt.random_clouds:
+        rec = case.receiver
+        clouds += random_clouds(rt.random_clouds, fld, rt.duration_min * 60.0, rec.center[:2])
+    return CloudField(clouds, t0)
+
+
+def load_dni_map(path, xy: np.ndarray) -> np.ndarray:
+    """Per-heliostat DNI from a CSV of measurements with columns x,y,dni (linear, nearest outside)."""
+    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+    df = pd.read_csv(path)
+    if not {"x", "y", "dni"} <= set(df.columns):
+        raise ValueError(f"{path}: DNI map CSV needs columns x,y,dni")
+    pts = df[["x", "y"]].to_numpy(float)
+    val = df["dni"].to_numpy(float)
+    if len(df) == len(xy) and np.allclose(pts, xy[:, :2], atol=1e-3):
+        return np.clip(val, 0.0, None)
+    nearest = NearestNDInterpolator(pts, val)(xy[:, 0], xy[:, 1])
+    if len(df) >= 3:
+        lin = LinearNDInterpolator(pts, val)(xy[:, 0], xy[:, 1])
+        nearest = np.where(np.isfinite(lin), lin, nearest)
+    return np.clip(nearest, 0.0, None)

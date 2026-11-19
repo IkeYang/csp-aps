@@ -1,5 +1,6 @@
 # 测试算例：虚构站址与设备参数，仅用于开发和测试，不对应任何真实电站。
 # 坐标系：x = 东，y = 北，z = 上，单位 m，原点在塔底。方位角按罗盘：北 = 0°，东 = 90°。
+# 每个参数都可以省略（使用默认值），拼错的参数名会直接报错。
 name: example
 
 site:
@@ -8,48 +9,116 @@ site:
   elevation_m: 1200     # 海拔 (m)，影响晴空 DNI
   timezone: Asia/Shanghai
 
-receiver:               # 外置圆柱集热器，竖直轴
+receiver:               # 外置圆柱集热器，竖直轴，装在塔顶
   center: [0, 0, 100]   # 圆柱中心点 (m)
   diameter: 7.0
   height: 8.0
   max_flux_kw_m2: 1000  # 允许最大通量密度
   n_azimuth: 72         # 通量图周向网格数（5°）
   n_height: 32          # 通量图高度方向网格数
+  tower_diameter: 8.0   # 塔身直径（计算塔影）；0 = 不算塔影
 
 heliostat:
   width: 8.0
   height: 8.0
-  pivot_height: 5.0     # 镜面旋转中心离地高度
+  pivot_height: 5.0          # 镜面旋转中心离地高度
   reflectivity: 0.94
   cleanliness: 0.97
-  slope_error_mrad: 1.5      # 镜面斜率误差 (1σ)
-  tracking_error_mrad: 1.0   # 跟踪误差 (镜面法向 1σ)
+  slope_error_mrad: 1.5      # 镜面斜率误差 (1σ，每轴)
+  tracking_error_mrad: 1.0   # 跟踪误差 (镜面法向 1σ，每轴)
   focusing: slant_range      # slant_range（按斜距聚焦）| flat（平面镜）| 焦距数值 (m)
 
 sun:
-  sigma_mrad: 2.51      # 太阳形状等效标准差
-  dni_model: meinel     # meinel（晴空模型）| constant
+  shape: gaussian       # gaussian（用 sigma_mrad）| pillbox（太阳圆盘，用 half_angle_mrad）
+  sigma_mrad: 2.51
+  half_angle_mrad: 4.65
+  dni_model: meinel     # 晴空 DNI 模型：meinel | constant
   dni_constant_w_m2: 900
+
+atmosphere:
+  model: vittitoe_biggs_clear   # vittitoe_biggs_clear（能见度~23km）| vittitoe_biggs_hazy（~5km）| beer_lambert
+  extinction_per_km: 0.1        # beer_lambert 时的消光系数 (1/km)
+
+weather:
+  source: clear_sky     # clear_sky | file
+  # file: my_site.epw   # EPW 或 CSV（列 time,dni，当地时间），用于全年计算
+
+shading:
+  enabled: true
+  n_points: 8           # 每面镜子 8×8 个采样点
+  tower_shadow: true
 
 field:
   # 二选一：layout_file: my_layout.csv（列 x,y[,z]，相对本文件路径）或 generator
   generator:
-    type: radial_staggered
-    r_min: 50              # 最内圈半径 (m)
-    r_max: 500             # 最外圈半径 (m)
-    spacing_factor: 1.1    # 防碰撞直径 DM = 镜面对角线 × 此系数
-    radial_spacing: 0.866  # 径向排距（DM 的倍数，≥0.866）
-    radial_growth: 0.3     # 排距随 (r - r_min)/塔高 增大的系数
-    azimuthal_spacing: 1.2 # 周向最小间距（DM 的倍数，≥1）
-  boundary:                # 场地边界多边形 [[x, y], ...]，北侧更大
+    type: radial_staggered   # radial_staggered | biomimetic
+    r_min: 50                # 最内圈半径 (m)
+    r_max: 500               # 最外圈半径 (m)
+    spacing_factor: 1.1      # 防碰撞直径 DM = 镜面对角线 × 此系数
+    radial_spacing: 0.866    # 径向排距（DM 的倍数，≥0.866）
+    radial_growth: 0.3       # 排距随 (r - r_min)/塔高 增大的系数
+    azimuthal_spacing: 1.2   # 周向最小间距（DM 的倍数，≥1）
+  boundary:                  # 场地边界多边形 [[x, y], ...]，北侧更大
     - [-420, -300]
     - [420, -300]
     - [420, 480]
     - [-420, 480]
-  exclusion_radius: 50     # 塔周围禁排半径 (m)
+  exclusion_radius: 50       # 塔周围禁排半径 (m)
+
+aps:                         # 内层：瞄准点优化
+  method: greedy             # center | kfactor | greedy | milp（仅小规模）
+  safety_margin: 0.05        # 通量控制在 (1 - 裕度) × 上限以内
+  n_height_levels: 7         # 每面镜子的候选瞄准高度数
+  height_span: 0.8           # 候选高度覆盖集热器高度的比例
+  azimuth_offsets_deg: [-4, 0, 4]  # 候选周向偏移（集热器方位角）
+  passes: 3                  # 贪心构造后的改进轮数
+  tie_tolerance: 0.005       # 功率差在此比例内视为相同，选通量更低的点（更均匀）
+  move_penalty_per_m: 0.0    # 实时运行：瞄准点每移动 1 m 扣除的功率比例（平滑）
+  allow_defocus: true        # 无可行瞄准点时让镜子散焦待机
+  milp_time_limit_s: 60
+
+realtime:                    # 云影下的实时 APS 仿真
+  start: "2025-06-21 12:30"
+  duration_min: 20
+  step_s: 60                 # 刷新周期
+  forecast_horizon_s: 120    # 预报时长：约束按此时段内的最大 DNI 计算
+  strategies: [center, aps_reactive, aps_predictive]
+  random_clouds:             # 随机云影（也可用 clouds: 列表逐个给出）
+    n: 4
+    seed: 3
+    radius_m: [120, 250]
+    transmittance: [0.05, 0.3]
+    speed_m_s: 10
+    direction_deg: 70        # 云影移动方向（罗盘方位）
+    edge_m: 40
 
 annual:
+  method: sun_bins           # sun_bins（代表太阳位置，快）| representative_days | hourly
+  n_sun_bins: 30
   year: 2025
-  day_of_month: 15         # 每月取一天作代表日
+  day_of_month: 15
   time_step_min: 60
   min_sun_elevation_deg: 5
+  aiming: center             # center（快）| greedy / kfactor（每个时刻做 APS）
+
+layout_opt:                  # 外层：镜场布置优化
+  generator: radial_staggered
+  n_heliostats: 1200         # 固定镜子数，选全年能量最高的位置
+  bounds:                    # 被优化的布置参数及范围
+    radial_spacing: [0.866, 1.6]
+    radial_growth: [0.0, 1.5]
+    azimuthal_spacing: [1.0, 2.0]
+  fixed:                     # 不参与优化的布置参数
+    spacing_factor: 1.1
+  n_sun_bins: 20
+  shading_points: 5
+  maxiter: 6
+  popsize: 5
+  seed: 1
+  workers: -1                # 并行进程数，-1 = 全部 CPU
+  polish_rounds: 4           # 全局搜索后的局部微调轮数
+  refine_top: 2              # 前几名方案用 APS 精算全年能量
+
+mcrt:
+  rays_per_heliostat: 1000
+  seed: 0

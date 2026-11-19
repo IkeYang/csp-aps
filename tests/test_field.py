@@ -3,7 +3,8 @@ import pytest
 
 from cspaps.config import Heliostat
 from cspaps.field import (
-    Field, build_field, load_layout_csv, points_in_polygon, radial_staggered, save_layout_csv,
+    Field, biomimetic, build_field, generate, load_layout_csv, points_in_polygon, radial_staggered,
+    remove_collisions, save_layout_csv,
 )
 
 
@@ -31,6 +32,20 @@ def test_radial_staggered_rejects_overlap():
         radial_staggered(h, (0, 0), 60, r_min=40, r_max=100, radial_spacing=0.5)
 
 
+@pytest.mark.parametrize("a,b", [(0.6, 0.5), (0.8, 0.58)])
+def test_biomimetic_no_collisions(a, b):
+    h = Heliostat(width=6, height=6, pivot_height=4)
+    xy = biomimetic(h, (0, 0), 60, r_min=40, r_max=200, a=a, b=b)
+    assert len(xy) > 50
+    assert _min_distance(xy) >= h.diagonal * 1.1 * (1 - 1e-6)
+
+
+def test_remove_collisions_keeps_earlier_points():
+    xy = np.array([[0, 0], [1, 0], [2, 0], [10, 0]], dtype=float)
+    out = remove_collisions(xy, 1.5)
+    np.testing.assert_allclose(out, [[0, 0], [2, 0], [10, 0]])
+
+
 def test_points_in_polygon():
     poly = [[0, 0], [10, 0], [10, 10], [0, 10]]
     mask = points_in_polygon(np.array([[5, 5], [15, 5], [-1, -1]]), poly)
@@ -44,6 +59,13 @@ def test_build_field_applies_boundary(small_case):
     assert 0 < north.n < full.n
     assert np.all(north.xyz[:, 1] >= 0)
     assert np.all(north.xyz[:, 2] == small_case.heliostat.pivot_height)
+
+
+def test_generate_defaults_r_max_from_boundary(small_case):
+    small_case.field.boundary = [[-150, -150], [150, -150], [150, 150], [-150, 150]]
+    xyz = generate(small_case, "biomimetic", {"a": 0.7, "b": 0.55})
+    assert len(xyz) > 0
+    assert np.abs(xyz[:, :2]).max() <= 150
 
 
 def test_layout_csv_roundtrip(tmp_path):

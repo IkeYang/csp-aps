@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.special import ndtr
 
-from .config import Heliostat, Receiver, Sun
+from .config import Atmosphere, Heliostat, Receiver, Sun
 from .receiver import ReceiverGrid
 
 
@@ -26,12 +26,27 @@ def _unit(v: np.ndarray) -> np.ndarray:
     return v / np.linalg.norm(v, axis=-1, keepdims=True)
 
 
-def attenuation(slant_range_m) -> np.ndarray:
-    """Atmospheric transmittance over the slant range (Vittitoe & Biggs, 'clear day')."""
-    d = np.asarray(slant_range_m, dtype=float)
-    near = 0.99321 - 1.176e-4 * d + 1.97e-8 * d**2
-    far = np.exp(-1.106e-4 * d)
-    return np.where(d <= 1000.0, near, far)
+def attenuation(slant_range_m, atm: Atmosphere | None = None) -> np.ndarray:
+    """Atmospheric transmittance between heliostat and receiver.
+
+    vittitoe_biggs_clear: 0.99321 - 0.1176 S + 0.0197 S^2 (S <= 1 km), exp(-0.1106 S) beyond
+    vittitoe_biggs_hazy:  0.98707 - 0.2748 S + 0.03394 S^2 (S <= 1 km), continued
+                          exponentially beyond 1 km with the slope at 1 km
+    beer_lambert:         exp(-beta S), beta = extinction_per_km
+    with S the slant range in km.
+    """
+    model = atm.model if atm is not None else "vittitoe_biggs_clear"
+    s = np.asarray(slant_range_m, dtype=float) / 1000.0
+    if model == "vittitoe_biggs_clear":
+        return np.where(s <= 1.0, 0.99321 - 0.1176 * s + 0.0197 * s**2, np.exp(-0.1106 * s))
+    if model == "vittitoe_biggs_hazy":
+        at_1km = 0.98707 - 0.2748 + 0.03394
+        slope = (-0.2748 + 2 * 0.03394) / at_1km
+        near = 0.98707 - 0.2748 * s + 0.03394 * s**2
+        return np.where(s <= 1.0, near, at_1km * np.exp(slope * (s - 1.0)))
+    if model == "beer_lambert":
+        return np.exp(-atm.extinction_per_km * s)
+    raise ValueError(f"Unknown atmosphere model '{model}'")
 
 
 def heliostat_geometry(helio_xyz: np.ndarray, aim_xyz: np.ndarray, sun_vec: np.ndarray):
@@ -39,13 +54,14 @@ def heliostat_geometry(helio_xyz: np.ndarray, aim_xyz: np.ndarray, sun_vec: np.n
 
     Returns (normal, target_dir, slant_range, cos_incidence). ``target_dir``
     is the unit vector from the heliostat to its aim point; the mirror normal
-    bisects the sun vector and the target direction.
+    bisects the sun vector and the target direction. Works on any leading
+    shape (..., 3).
     """
     to_aim = aim_xyz - helio_xyz
     slant = np.linalg.norm(to_aim, axis=-1)
-    t = to_aim / slant[:, None]
-    n = _unit(sun_vec[None, :] + t)
-    cos_inc = np.clip(n @ sun_vec, 0.0, 1.0)
+    t = to_aim / slant[..., None]
+    n = _unit(sun_vec + t)
+    cos_inc = np.clip(np.einsum("...k,k->...", n, sun_vec), 0.0, 1.0)
     return n, t, slant, cos_inc
 
 
@@ -63,7 +79,7 @@ def beam_sigma(slant_range: np.ndarray, cos_inc: np.ndarray, helio: Heliostat, s
     w_s = d_m * np.abs(d_over_f * cos_inc - 1.0)
     sigma_ast = np.sqrt(0.5 * (h_t**2 + w_s**2)) / (4.0 * d)
     s2 = (
-        (sun.sigma_mrad * 1e-3) ** 2
+        (sun.effective_sigma_mrad * 1e-3) ** 2
         + (2e-3 * helio.slope_error_mrad) ** 2
         + (2e-3 * helio.tracking_error_mrad) ** 2
         + sigma_ast**2
@@ -99,9 +115,13 @@ def intercept_fraction(
     evaluated with Gauss-Legendre nodes restricted to +-8 sigma around the
     beam centre so that narrow beams are always resolved.
     """
+    shape = aim_xyz.shape[:-1]
+    aim_xyz = aim_xyz.reshape(-1, 3)
+    t = t.reshape(-1, 3)
+    sigma = np.asarray(sigma, dtype=float).reshape(-1)
     n = aim_xyz.shape[0]
     if n == 0:
-        return np.zeros(0)
+        return np.zeros(shape)
     e_u, e_v = image_plane_basis(t)
     R = rec.radius
     c_bot = np.array([rec.center[0], rec.center[1], rec.center[2] - 0.5 * rec.height])
@@ -125,7 +145,33 @@ def intercept_fraction(
     pdf = np.exp(-0.5 * (u / s) ** 2) / (np.sqrt(2 * np.pi) * s)
     band = np.abs(ndtr(v_top / s) - ndtr(v_bot / s))
     frac = (pdf * band) @ w * half
-    return np.clip(np.where(ok, frac, 0.0), 0.0, 1.0)
+    return np.clip(np.where(ok, frac, 0.0), 0.0, 1.0).reshape(shape)
+
+
+def footprints(
+    grid: ReceiverGrid,
+    aim_xyz: np.ndarray,
+    t: np.ndarray,
+    sigma: np.ndarray,
+    power: np.ndarray,
+) -> np.ndarray:
+    """Flux (W/m2) of each beam on every receiver cell, dense (R, M).
+
+    aim points (R, 3), ray directions heliostat->aim (R, 3), beam sigma (R,)
+    in m, beam power arriving at the image plane (R,) in W.
+    """
+    e_u, e_v = image_plane_basis(t)
+    # Projections as matrix products (BLAS) instead of forming (R, M, 3) offsets.
+    pts = grid.points
+    u = e_u @ pts.T - np.sum(aim_xyz * e_u, axis=1)[:, None]  # (R, M)
+    v = e_v @ pts.T - np.sum(aim_xyz * e_v, axis=1)[:, None]
+    cos_s = np.clip(-(t @ grid.normals.T), 0.0, None)
+    inv2s2 = (0.5 / sigma**2)[:, None]
+    q = (u * u + v * v) * inv2s2
+    out = np.exp(-q.astype(np.float32)).astype(np.float64)
+    out *= cos_s
+    out *= (power / (2 * np.pi * sigma**2))[:, None]
+    return out
 
 
 def flux_on_receiver(
@@ -138,8 +184,6 @@ def flux_on_receiver(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Superpose all heliostat images on the receiver surface.
 
-    Parameters: aim points (N, 3), ray directions heliostat->aim (N, 3), beam
-    sigma (N,) in m, beam power arriving at the image plane (N,) in W.
     Returns (flux per cell (M,) in W/m2, intercepted power per heliostat (N,) in W).
     Flux is sampled at cell centres; the per-heliostat intercepted power from
     this sum is only as accurate as the grid -- use ``intercept_fraction`` for
@@ -148,17 +192,9 @@ def flux_on_receiver(
     n = aim_xyz.shape[0]
     flux = np.zeros(grid.points.shape[0])
     intercepted = np.zeros(n)
-    if n == 0:
-        return flux, intercepted
-    e_u, e_v = image_plane_basis(t)
     for start in range(0, n, chunk):
         sl = slice(start, start + chunk)
-        r = grid.points[None, :, :] - aim_xyz[sl, None, :]  # (c, M, 3)
-        u = np.einsum("cmk,ck->cm", r, e_u[sl])
-        v = np.einsum("cmk,ck->cm", r, e_v[sl])
-        cos_s = np.clip(-(t[sl] @ grid.normals.T), 0.0, None)  # (c, M)
-        s2 = sigma[sl, None] ** 2
-        f = power[sl, None] / (2 * np.pi * s2) * np.exp(-(u * u + v * v) / (2 * s2)) * cos_s
+        f = footprints(grid, aim_xyz[sl], t[sl], sigma[sl], power[sl])
         flux += f.sum(axis=0)
         intercepted[sl] = f.sum(axis=1) * grid.cell_area
     return flux, intercepted

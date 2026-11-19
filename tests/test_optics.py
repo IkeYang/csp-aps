@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from cspaps import optics
-from cspaps.config import Heliostat, Receiver, Sun
+from cspaps.config import Atmosphere, Heliostat, Receiver, Sun
 from cspaps.receiver import build_grid, default_aim, surface_point
 
 
@@ -20,13 +20,20 @@ def test_cosine_efficiency():
     assert cos[0] == pytest.approx(1.0)
 
 
-def test_attenuation_values():
+def test_attenuation_models():
     assert optics.attenuation(0.0) == pytest.approx(0.99321)
     assert optics.attenuation(500.0) == pytest.approx(0.99321 - 0.0588 + 0.004925, abs=1e-6)
-    # The two branches nearly meet at 1 km and decrease monotonically
     assert abs(optics.attenuation(999.999) - optics.attenuation(1000.001)) < 0.01
     d = np.linspace(0, 2000, 50)
-    assert np.all(np.diff(optics.attenuation(d)) < 0)
+    clear = optics.attenuation(d, Atmosphere("vittitoe_biggs_clear"))
+    hazy = optics.attenuation(d, Atmosphere("vittitoe_biggs_hazy"))
+    assert np.all(np.diff(clear) < 0) and np.all(np.diff(hazy) < 0)
+    assert np.all(hazy[1:] < clear[1:])
+    # hazy branch is continuous at 1 km
+    assert optics.attenuation(1000.0, Atmosphere("vittitoe_biggs_hazy")) == pytest.approx(
+        optics.attenuation(1000.001, Atmosphere("vittitoe_biggs_hazy")), abs=1e-5)
+    bl = optics.attenuation(2000.0, Atmosphere("beer_lambert", extinction_per_km=0.2))
+    assert bl == pytest.approx(math.exp(-0.4))
 
 
 def test_beam_sigma_focused_vs_flat():
@@ -34,10 +41,8 @@ def test_beam_sigma_focused_vs_flat():
     focused = Heliostat(width=8, height=8, pivot_height=5, slope_error_mrad=1.5, tracking_error_mrad=1.0)
     flat = Heliostat(width=8, height=8, pivot_height=5, focusing="flat")
     d = np.array([300.0])
-    # Focused heliostat at normal incidence: astigmatism vanishes
-    expected = 300.0 * math.sqrt(2.51e-3**2 + 3e-3**2 + 2e-3**2)
+    expected = 300.0 * math.sqrt(2.51e-3**2 + 3e-3**2 + 2e-3**2)  # no astigmatism at normal incidence
     assert optics.beam_sigma(d, np.array([1.0]), focused, sun)[0] == pytest.approx(expected)
-    # A flat mirror always makes a larger image
     assert optics.beam_sigma(d, np.array([0.9]), flat, sun)[0] > optics.beam_sigma(d, np.array([0.9]), focused, sun)[0]
 
 
@@ -102,16 +107,24 @@ def test_intercept_matches_fine_grid(receiver, helio, aim_offset):
 def test_flux_conservation_and_peak(receiver):
     sigma = 1.5
     grid, flux, intercepted, _ = _single_beam(receiver, sigma)
-    # Integral of the flux map equals the sum of per-heliostat intercepted power
     assert flux.sum() * grid.cell_area == pytest.approx(intercepted.sum(), rel=1e-12)
-    # Peak at the aim point equals the Gaussian peak P / (2 pi sigma^2)
     assert flux.max() == pytest.approx(1e6 / (2 * math.pi * sigma**2), rel=5e-3)
-    # Back side of the cylinder (facing away from the heliostat) receives nothing
     back = grid.to_map(flux)[:, np.abs(grid.azimuth_deg - 180) < 60]
-    assert back.max() == 0.0
+    assert back.max() == 0.0  # the far side of the cylinder gets nothing
 
 
 def test_flux_peak_is_at_aim_point(receiver):
     grid, flux, _, aim = _single_beam(receiver, 1.0, helio=(150.0, 0.0, 10.0))
     k = int(np.argmax(flux))
     assert np.linalg.norm(grid.points[k] - aim[0]) < 0.3
+
+
+def test_intercept_accepts_candidate_shapes(receiver):
+    helio = np.array([[100.0, 50.0, 5.0], [-80.0, -40.0, 5.0]])
+    az, z = default_aim(receiver, helio)
+    aims = surface_point(receiver, az[:, None] + np.array([-5.0, 0.0, 5.0]), np.broadcast_to(z[:, None], (2, 3)))
+    t = aims - helio[:, None, :]
+    t /= np.linalg.norm(t, axis=-1, keepdims=True)
+    out = optics.intercept_fraction(receiver, aims, t, np.full((2, 3), 1.0))
+    assert out.shape == (2, 3)
+    assert np.all(out[:, 1] >= out[:, 0] - 1e-9) and np.all(out[:, 1] >= out[:, 2] - 1e-9)
