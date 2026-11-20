@@ -40,3 +40,8 @@ def test_realtime_runs_and_reports(small_case):
     assert s["aps_predictive"]["max_peak_to_limit"] <= 1.0
     assert s["center"]["max_peak_to_limit"] > 1.0
     assert s["aps_predictive"]["energy_mwh"] > 0
+
+    # A failed first interval contributes one step in hours, regardless of the sample count.
+    res.table["uniformity_feasible"] = res.table["time"] != res.table["time"].min()
+    for report in res.summary().values():
+        assert report["hours_uniformity_failed"] == pytest.approx(small_case.realtime.step_s / 3600)

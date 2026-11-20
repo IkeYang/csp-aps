@@ -94,3 +94,30 @@ def test_gui_walkthrough(monkeypatch):
     assert not at.exception
     at.radio(key="page").set_value("运行记录").run()
     assert not at.exception
+
+
+def test_single_result_keeps_completed_objective(monkeypatch, tmp_path):
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CSPAPS_GUI_SYNC", "1")
+    data = small_case_dict()
+    data["uniformity"] = {"enabled": True, "mode": "weighted", "weight": 0.3}
+    at = AppTest.from_file(str(Path(ROOT) / "src" / "cspaps" / "gui_app.py"), default_timeout=120)
+    at.session_state["case_dict"] = data
+    at.session_state["base_dir"] = str(ROOT)
+    at.session_state["ver"] = 1
+    at.run()
+    at.radio(key="ops_mode").set_value("单时刻（导入实测 / 预报 DNI）").run()
+    at.button(key="btn_single").click().run()
+    assert not at.exception and not at.error
+    at.number_input(key="1:uniformity.weight").set_value(2.0).run()
+    assert at.session_state["case_dict"]["uniformity"]["weight"] == 2.0
+    assert any("均匀度目标 λ = 0.3" in c.value for c in at.caption)
+    at.radio(key="single_goal:1").set_value("cv_limit").run()
+    at.number_input(key="1:uniformity.max_cv").set_value(0.001).run()
+    at.button(key="btn_single").click().run()
+    assert not at.exception
+    assert at.session_state["res_single"]["summary"]["status"] == "uniformity_infeasible"
+    assert "记录为人工已确认" not in [b.label for b in at.button]

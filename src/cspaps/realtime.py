@@ -72,7 +72,7 @@ class RealtimeResult:
                 "absorbed_energy_mwh": round(float((g["p_absorbed_mw"] * d).sum() / 3600.0), 4),
                 "feasible_absorbed_energy_mwh": round(float((g["feasible_absorbed_mw"] * d).sum() / 3600.0), 4)
                     if "feasible_absorbed_mw" in g else round(float((g.loc[feasible, "p_absorbed_mw"] * d[feasible]).sum() / 3600.0), 4),
-                "hours_uniformity_failed": round(float(d[~g["uniformity_feasible"].to_numpy(bool)].sum()), 1)
+                "hours_uniformity_failed": float(d[~g["uniformity_feasible"].to_numpy(bool)].sum()) / 3600.0
                     if "uniformity_feasible" in g else 0.0,
                 "feasible_intervals": int(feasible.sum()),
                 "max_peak_flux_kw_m2": round(float(g["peak_flux_kw_m2"].max()), 1),
