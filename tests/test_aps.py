@@ -66,9 +66,9 @@ def test_milp_and_lp_bound_on_tiny_problem(tight):
     milp = optimize_aims(tight, fld, el, az, dni, method="milp", problem=prob)
     bound = lp_upper_bound(prob)
     assert milp.feasible and greedy.feasible
-    assert milp.power_w >= greedy.power_w - 1e-6 * bound
-    assert bound >= milp.power_w * (1 - 1e-6)
-    assert greedy.power_w >= 0.85 * milp.power_w  # greedy close to the proven MILP optimum
+    assert milp.info["objective_absorbed_power_w"] >= greedy.info["objective_absorbed_power_w"] - 1e-6 * bound
+    assert bound >= milp.info["objective_absorbed_power_w"] * (1 - 1e-6)
+    assert greedy.info["objective_absorbed_power_w"] >= 0.85 * milp.info["objective_absorbed_power_w"]
 
 
 def test_defocus_when_limit_unreachable(small_case):

@@ -75,6 +75,28 @@ def test_engine_availability_and_reachability(setup):
     assert not moved.any()
 
 
+def test_engine_uniformity_fallback_and_weighted_plan(setup):
+    case, fld, dni = setup
+    case.shading.enabled = False
+    case.uniformity.enabled = True
+    case.uniformity.mode = "cv_limit"
+    case.uniformity.max_cv = 1e-4
+    eng = APSEngine(case, fld)
+    result = eng.step(ControlRequest(T0, np.full(fld.n, dni), T0, _forecasts(T0, fld.n, dni)))
+    assert result.state == "infeasible"
+    assert not result.active.any()
+    assert not result.uniformity["met"]
+    assert "uniformity_not_achievable_safe_plan_defocused" in result.reasons
+
+    case.uniformity.mode = "weighted"
+    case.uniformity.weight = 0.3
+    eng = APSEngine(case, fld)
+    result = eng.step(ControlRequest(T0, np.full(fld.n, dni), T0, _forecasts(T0, fld.n, dni)))
+    assert result.uniformity["mode"] == "weighted"
+    assert result.uniformity["met"]
+    assert result.uniformity["cv_2d"] is not None
+
+
 def test_engine_json_service(setup):
     case, fld, dni = setup
     lines = [

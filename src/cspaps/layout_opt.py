@@ -62,12 +62,14 @@ class LayoutEval:
     params: dict
     n_candidates: int
     xyz: np.ndarray
-    energy_mwh: float  # annual energy on the receiver, single-point aiming, search sampling
+    energy_mwh: float  # absorbed-energy score for the configured search objective
     result: AnnualResult | None = dc_field(default=None, repr=False)
     candidates_xyz: np.ndarray | None = dc_field(default=None, repr=False)
     candidate_energy: np.ndarray | None = dc_field(default=None, repr=False)
     aps_energy_mwh: float | None = None
     aps_result: AnnualResult | None = dc_field(default=None, repr=False)
+    center_energy_mwh: float | None = None
+    search_aiming: str = "center"
 
     @property
     def n(self) -> int:
@@ -92,6 +94,7 @@ def evaluate_layout(
     samples: sun.Samples,
     n_select: int | None,
     shading_points: int | None = None,
+    aiming: str = "center",
 ) -> LayoutEval:
     try:
         xyz = generate(case, kind, params)
@@ -99,23 +102,34 @@ def evaluate_layout(
         return LayoutEval(params, 0, np.zeros((0, 3)), 0.0)
     if len(xyz) == 0:
         return LayoutEval(params, 0, xyz, 0.0)
-    res = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
-                 shading_points=shading_points, workers=1)
-    cand_xyz, cand_e = xyz, res.heliostat_energy_mwh
+    center_all = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
+                        shading_points=shading_points, workers=1)
+    cand_xyz, cand_e = xyz, center_all.heliostat_energy_mwh
     n_cand = len(xyz)
-    if n_select and n_cand > n_select:
-        keep = np.sort(np.argsort(-res.heliostat_energy_mwh, kind="stable")[:n_select])
+    selected = bool(n_select and n_cand > n_select)
+    if selected:
+        # Center-aim single-mirror potential cheaply seeds a fixed-size candidate layout.
+        keep = np.sort(np.argsort(-center_all.heliostat_energy_mwh, kind="stable")[:n_select])
         xyz = xyz[keep]
-        res = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
-                     shading_points=shading_points, workers=1)
-    return LayoutEval(params, n_cand, xyz, res.energy_mwh["intercept"], res, cand_xyz, cand_e)
+    center_res = (annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
+                         shading_points=shading_points, workers=1) if selected else center_all)
+    center_energy = center_res.summary()["absorbed_energy_mwh"]
+    if aiming == "center":
+        return LayoutEval(params, n_cand, xyz, center_energy, center_res, cand_xyz, cand_e,
+                          center_energy_mwh=center_energy, search_aiming="center")
+    res = annual(case, Field(xyz), samples=samples, aiming=aiming, with_flux=True,
+                 shading_points=shading_points, workers=1)
+    aps_energy = res.summary()["feasible_absorbed_energy_mwh"]
+    return LayoutEval(params, n_cand, xyz, aps_energy, res, cand_xyz, cand_e,
+                      aps_energy_mwh=aps_energy, aps_result=res, center_energy_mwh=center_energy,
+                      search_aiming=aiming)
 
 
 class _Objective:
     """Picklable objective for scipy's differential evolution (supports workers > 1)."""
 
-    def __init__(self, case: Case, kind: str, names: list[str], samples: sun.Samples):
-        self.case, self.kind, self.names, self.samples = case, kind, names, samples
+    def __init__(self, case: Case, kind: str, names: list[str], samples: sun.Samples, aiming: str):
+        self.case, self.kind, self.names, self.samples, self.aiming = case, kind, names, samples, aiming
 
     def params(self, x) -> dict:
         p = dict(self.case.layout_opt.fixed)
@@ -125,7 +139,7 @@ class _Objective:
     def __call__(self, x) -> float:
         lo = self.case.layout_opt
         ev = evaluate_layout(self.case, self.kind, self.params(x), self.samples, lo.n_heliostats,
-                             lo.shading_points)
+                             lo.shading_points, self.aiming)
         return -ev.energy_mwh
 
 
@@ -179,14 +193,24 @@ class LayoutOptResult:
 
     def summary(self) -> dict:
         b = self.best
+        aps_summary = b.aps_result.summary() if b.aps_result is not None else None
         return {
             "status": self.status,
+            "operational_status": ("no_feasible_annual_states" if aps_summary and aps_summary["feasible_sun_states"] == 0
+                                   else "reviewed_feasible_states" if aps_summary else "not_reviewed_with_aps"),
             "generator_params": {k: round(v, 4) if isinstance(v, float) else v for k, v in b.params.items()},
             "n_heliostats": b.n,
             "n_required": self.validation.get("n_required"),
             "n_candidates": b.n_candidates,
-            "annual_energy_mwh_center_aiming": round(b.energy_mwh, 1),
+            "search_aiming": b.search_aiming,
+            "search_method": "differential_evolution_plus_local_search_and_APS_review",
+            "global_optimality_proven": False,
+            "annual_energy_mwh_search_objective": round(b.energy_mwh, 1),
+            "annual_energy_mwh_center_aiming": round(b.center_energy_mwh, 1) if b.center_energy_mwh is not None else None,
             "annual_energy_mwh_with_aps": round(b.aps_energy_mwh, 1) if b.aps_energy_mwh is not None else None,
+            "annual_energy_mwh_raw_aps": aps_summary["absorbed_energy_mwh"] if aps_summary else None,
+            "annual_hours_uniformity_failed": aps_summary["hours_uniformity_failed"] if aps_summary else None,
+            "annual_hours_flux_or_verification_failed": aps_summary["hours_flux_or_verification_failed"] if aps_summary else None,
             "n_evaluations": int(len(self.history)),
             "search_sampling": {"method": self.samples.label, "n_states": len(self.samples)},
             "review_sampling": ({"method": self.review_samples.label, "n_states": len(self.review_samples)}
@@ -218,10 +242,14 @@ def optimize_layout(
     say = progress or (lambda msg: None)
     stop = cancel or (lambda: False)
     hourly = sun.hourly_samples(case)
-    samples = make_samples(case, spec.search_sampling, spec.n_sun_bins, 1, hourly, spec.seed)
-    say(f"search sampling: {samples.label}, {len(samples)} sun states; optimising {names}")
+    search_aiming = spec.search_aiming
+    if search_aiming == "auto":
+        search_aiming = "greedy" if case.uniformity.enabled else "center"
+    search_bands = spec.review_dni_bands if search_aiming != "center" else 1
+    samples = make_samples(case, spec.search_sampling, spec.n_sun_bins, search_bands, hourly, spec.seed)
+    say(f"search sampling: {samples.label}, {len(samples)} states, aiming={search_aiming}; optimising {names}")
 
-    obj = _Objective(case, kind, names, samples)
+    obj = _Objective(case, kind, names, samples, search_aiming)
     records: list[dict] = []
 
     def record(x, energy, stage):
@@ -306,43 +334,54 @@ def optimize_layout(
     grid = build_grid(case.receiver)
     review_center = make_samples(case, spec.review_sampling, spec.review_n_sun_bins, 1, hourly, spec.seed)
     review_aps = make_samples(case, spec.review_sampling, spec.review_n_sun_bins, spec.review_dni_bands, hourly, spec.seed)
-    use_aps = spec.refine_top > 0 and case.aps.method != "center"
+    review_aiming = case.aps.method if case.aps.method != "center" else search_aiming
+    use_aps = spec.refine_top > 0 and review_aiming != "center"
     evals: list[LayoutEval] = []
     rows = []
     for rank, (_, row) in enumerate(top.iterrows(), start=1):
         params = {**spec.fixed, **{k: float(row[k]) for k in names}}
-        ev = evaluate_layout(case, kind, params, samples, spec.n_heliostats, spec.shading_points)
+        ev = evaluate_layout(case, kind, params, samples, spec.n_heliostats, spec.shading_points,
+                             aiming=search_aiming)
         info = {**{k: params[k] for k in names}, "search_rank": rank, "n_heliostats": ev.n,
-                "n_candidates": ev.n_candidates, "energy_search_center_mwh": ev.energy_mwh}
+                "n_candidates": ev.n_candidates, "search_aiming": search_aiming,
+                "energy_search_objective_mwh": ev.energy_mwh,
+                "energy_search_center_mwh": ev.center_energy_mwh,
+                "energy_search_center_absorbed_mwh": ev.center_energy_mwh}
         if ev.n and spec.refine_top > 0:
             say(f"review {rank}/{len(top)}: centre aiming on {len(review_center)} states")
             rc = annual(case, Field(ev.xyz), samples=review_center, aiming="center", grid=grid,
                         shading_points=spec.shading_points)
-            info["energy_review_center_mwh"] = rc.energy_mwh["intercept"]
+            info["energy_review_center_mwh"] = rc.summary()["absorbed_energy_mwh"]
             info["constrained_states_center"] = int(rc.timeseries["over_limit"].sum())
             info["hours_over_limit_center"] = float(rc.timeseries.loc[rc.timeseries["over_limit"], "weight_h"].sum())
             if spec.review_check_hourly:
                 say(f"review {rank}/{len(top)}: hourly year with centre aiming (sampling error)")
                 rh = annual(case, Field(ev.xyz), samples=hourly, aiming="center", grid=grid, with_flux=False,
                             shading_points=spec.shading_points)
-                e_h = rh.energy_mwh["intercept"]
+                e_h = rh.summary()["absorbed_energy_mwh"]
                 info["energy_hourly_center_mwh"] = e_h
-                info["search_sampling_error_pct"] = 100 * (ev.energy_mwh / e_h - 1) if e_h else None
+                info["search_sampling_error_pct"] = 100 * (float(ev.center_energy_mwh or 0.0) / e_h - 1) if e_h else None
                 info["review_sampling_error_pct"] = 100 * (info["energy_review_center_mwh"] / e_h - 1) if e_h else None
             if use_aps and not stop():
                 say(f"review {rank}/{len(top)}: constrained APS on {len(review_aps)} states")
-                ra = annual(case, Field(ev.xyz), samples=review_aps, aiming=case.aps.method, grid=grid,
+                ra = annual(case, Field(ev.xyz), samples=review_aps, aiming=review_aiming, grid=grid,
                             shading_points=spec.shading_points)
                 ev.aps_result = ra
-                ev.aps_energy_mwh = ra.energy_mwh["intercept"]
+                ra_summary = ra.summary()
+                ev.aps_energy_mwh = ra_summary["feasible_absorbed_energy_mwh"]
                 info["energy_constrained_aps_mwh"] = ev.aps_energy_mwh
+                info["energy_raw_aps_absorbed_mwh"] = ra_summary["absorbed_energy_mwh"]
+                info["aps_hours_uniformity_failed"] = ra_summary["hours_uniformity_failed"]
+                info["aps_hours_flux_or_verification_failed"] = ra_summary["hours_flux_or_verification_failed"]
+                cv_rows = ra.timeseries["uniformity_cv_2d"].dropna()
+                info["aps_max_cv_2d"] = float(cv_rows.max()) if len(cv_rows) else None
                 info["aps_max_peak_kw_m2"] = float(ra.timeseries["peak_flux_kw_m2"].max())
-                info["aps_states_not_ok"] = int((ra.timeseries["aps_status"] != "ok").sum())
+                info["aps_states_not_ok"] = int((~ra.timeseries["operational_feasible"]).sum())
                 info["aps_max_defocused"] = int(ra.timeseries["n_defocused"].max())
         evals.append(ev)
         rows.append(info)
     ranking = pd.DataFrame(rows)
-    key_col = "energy_constrained_aps_mwh" if "energy_constrained_aps_mwh" in ranking else "energy_search_center_mwh"
+    key_col = "energy_constrained_aps_mwh" if "energy_constrained_aps_mwh" in ranking else "energy_search_objective_mwh"
     ranking = ranking.sort_values(key_col, ascending=False).reset_index(drop=True)
     ranking["final_rank"] = np.arange(1, len(ranking) + 1)
     ranking["rank_change"] = ranking["search_rank"] - ranking["final_rank"]
@@ -365,9 +404,11 @@ def optimize_layout(
             drop = np.argsort(cur_res.heliostat_energy_mwh)[:len(add)]
             new_xyz = np.vstack([np.delete(cur_xyz, drop, axis=0), best.candidates_xyz[add]])
             say(f"swap round {r + 1}: trying {len(add)} swaps")
-            new_res = annual(case, Field(new_xyz), samples=review_aps, aiming=case.aps.method, grid=grid,
+            new_res = annual(case, Field(new_xyz), samples=review_aps, aiming=review_aiming, grid=grid,
                              shading_points=spec.shading_points)
-            gain = new_res.energy_mwh["intercept"] - cur_res.energy_mwh["intercept"]
+            new_feasible = new_res.summary()["feasible_absorbed_energy_mwh"]
+            cur_feasible = cur_res.summary()["feasible_absorbed_energy_mwh"]
+            gain = new_feasible - cur_feasible
             swaps.append({"round": r + 1, "swapped": int(len(add)), "gain_mwh": round(float(gain), 2),
                           "accepted": bool(gain > 0)})
             if gain > 0:
@@ -375,7 +416,23 @@ def optimize_layout(
             else:
                 break
         best.xyz, best.aps_result = cur_xyz, cur_res
-        best.aps_energy_mwh = cur_res.energy_mwh["intercept"]
+        best.aps_energy_mwh = cur_res.summary()["feasible_absorbed_energy_mwh"]
+        center_final = annual(case, Field(best.xyz), samples=review_center, aiming="center", grid=grid,
+                              with_flux=False, shading_points=spec.shading_points)
+        best.center_energy_mwh = center_final.summary()["absorbed_energy_mwh"]
+        best_row = ranking.index[ranking["search_rank"] == best_rank + 1]
+        if len(best_row):
+            row_i = best_row[0]
+            ranking.loc[row_i, "energy_constrained_aps_mwh"] = best.aps_energy_mwh
+            ranking.loc[row_i, "energy_review_center_mwh"] = best.center_energy_mwh
+            ranking.loc[row_i, "energy_raw_aps_absorbed_mwh"] = cur_res.summary()["absorbed_energy_mwh"]
+            ranking.loc[row_i, "aps_states_not_ok"] = int((~cur_res.timeseries["operational_feasible"]).sum())
+            cv_rows = cur_res.timeseries["uniformity_cv_2d"].dropna()
+            if len(cv_rows):
+                ranking.loc[row_i, "aps_max_cv_2d"] = float(cv_rows.max())
+            ranking = ranking.sort_values("energy_constrained_aps_mwh", ascending=False).reset_index(drop=True)
+            ranking["final_rank"] = np.arange(1, len(ranking) + 1)
+            ranking["rank_change"] = ranking["search_rank"] - ranking["final_rank"]
 
     # ---- final checks and capacity
     dm = case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))

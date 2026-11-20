@@ -32,8 +32,9 @@ from .clouds import CloudField, cloud_field
 from .config import Case
 from .engine import APSEngine, ControlRequest, ForecastSnapshot, Receipt
 from .field import Field
-from .receiver import build_grid, default_aim
+from .receiver import build_grid, default_aim, region_mask
 from .simulate import Snapshot, evaluate, sun_state
+from .uniformity import uniformity_metrics
 
 OVER_LIMIT_BASIS = ("sample-and-hold: the verified peak at sample t_k holds for [t_k, t_k+1); "
                     "time over limit = sum of those intervals")
@@ -65,9 +66,15 @@ class RealtimeResult:
             d = g["interval_s"].to_numpy()
             over = g["over_limit"].to_numpy(bool)
             lat = g["engine_total_s"].dropna().to_numpy()
+            feasible = g["operational_feasible"].to_numpy(bool) if "operational_feasible" in g else ~over
             item = {
                 "energy_mwh": round(float((g["p_intercepted_mw"] * d).sum() / 3600.0), 4),
                 "absorbed_energy_mwh": round(float((g["p_absorbed_mw"] * d).sum() / 3600.0), 4),
+                "feasible_absorbed_energy_mwh": round(float((g["feasible_absorbed_mw"] * d).sum() / 3600.0), 4)
+                    if "feasible_absorbed_mw" in g else round(float((g.loc[feasible, "p_absorbed_mw"] * d[feasible]).sum() / 3600.0), 4),
+                "hours_uniformity_failed": round(float(d[~g["uniformity_feasible"].to_numpy(bool)].sum()), 1)
+                    if "uniformity_feasible" in g else 0.0,
+                "feasible_intervals": int(feasible.sum()),
                 "max_peak_flux_kw_m2": round(float(g["peak_flux_kw_m2"].max()), 1),
                 "max_peak_to_limit": round(float(g["peak_to_limit"].max()), 4),
                 "max_exceedance_kw_m2": round(float(g["exceedance_kw_m2"].max()), 1),
@@ -159,6 +166,24 @@ def run_realtime(
             snap = evaluate(case, fld, el, az, dni_now, aim=(aim_az, aim_z), active=active, grid=grid, time=ts)
             chk = snap.verify(rec) if snap.beams is not None and len(snap.beams["power"]) else None
             peak_ratio = chk.peak_ratio if chk is not None else 0.0
+            if case.uniformity.enabled:
+                h_mask = region_mask(rec, case.uniformity, grid.cell_az, grid.cell_z)
+                uni_metrics = uniformity_metrics(grid.to_map(snap.absorbed_flux), grid.to_map(h_mask))
+                power_h_mw = float(snap.absorbed_flux.ravel()[h_mask].sum() * grid.cell_area / 1e6)
+                if case.uniformity.mode == "weighted":
+                    uni_met = power_h_mw >= case.uniformity.min_load_mw - 1e-9
+                    uni_status = "weighted" if uni_met else "below_min_load"
+                else:
+                    uni_met = (power_h_mw >= case.uniformity.min_load_mw - 1e-9
+                               and np.isfinite(uni_metrics["cv_2d"])
+                               and uni_metrics["cv_2d"] <= case.uniformity.max_cv)
+                    uni_status = "feasible" if uni_met else (
+                        "below_min_load" if power_h_mw < case.uniformity.min_load_mw - 1e-9 else "not_reached")
+            else:
+                uni_metrics = {"cv_2d": float("nan"), "cv_circ": float("nan"), "cv_height": float("nan")}
+                power_h_mw, uni_met, uni_status = snap.p_absorbed / 1e6, True, "disabled"
+            flux_met = chk is not None and chk.status == "ok"
+            operational = bool(flux_met and uni_met)
             rows.append({
                 "time": ts, "interval_s": float(dt), "strategy": strat,
                 "dni_mean_w_m2": float(dni_now.mean()), "dni_min_w_m2": float(dni_now.min()),
@@ -167,13 +192,19 @@ def run_realtime(
                 "peak_to_limit": peak_ratio, "over_limit": bool(peak_ratio > 1.0 + 1e-9),
                 "exceedance_kw_m2": chk.exceedance_kw_m2 if chk is not None else 0.0,
                 "hotspot_panel": chk.hotspot_panel if chk is not None else 0,
+                "uniformity_status": uni_status, "uniformity_cv_2d": uni_metrics["cv_2d"],
+                "uniformity_cv_circ": uni_metrics["cv_circ"], "uniformity_cv_height": uni_metrics["cv_height"],
+                "uniformity_power_h_mw": power_h_mw, "uniformity_feasible": bool(uni_met),
+                "flux_feasible": bool(flux_met), "operational_feasible": operational,
+                "feasible_absorbed_mw": snap.p_absorbed / 1e6 if operational else 0.0,
                 "n_defocused": int((~np.asarray(active)).sum()), "n_moved": n_moved,
                 "plan_state": state, "plan_reasons": reasons,
                 "engine_total_s": eng_time, "response_reused": reused,
             })
             frame["plans"][strat] = {"aim_azimuth": aim_az, "aim_z": aim_z, "active": np.asarray(active),
                                      "flux": snap.flux, "check": chk.summary() if chk is not None else None,
-                                     "state": state}
+                                     "state": state, "uniformity_status": uni_status,
+                                     "uniformity_metrics": uni_metrics, "operational_feasible": operational}
             if strat not in worst or peak_ratio > worst[strat][0]:
                 worst[strat] = (peak_ratio, snap)
             if strat != "center" and step + 1 < len(times):

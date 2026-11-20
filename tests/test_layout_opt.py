@@ -1,8 +1,12 @@
 import numpy as np
+import pandas as pd
 import pytest
 
-from cspaps import sun
+from cspaps import load_case, sun
+from cspaps.field import build_field
 from cspaps.layout_opt import evaluate_layout, optimize_layout
+from cspaps.sun import load_weather
+from cspaps.workflows import task_optimize_layout
 
 
 def test_evaluate_layout_selects_best(small_case):
@@ -63,3 +67,26 @@ def test_capacity_shortfall(small_case):
     assert res.status == "capacity_shortfall"
     assert res.validation["shortfall"] == 200 - res.best.n > 0
     assert res.capacity["max_placeable_with_densest_parameters"] < 200
+
+
+def test_optimized_case_export_keeps_weather_and_layout_loadable(small_case, tmp_path):
+    weather = tmp_path / "weather.csv"
+    pd.DataFrame({"time": ["2024-06-21 12:30", "2024-06-21 13:30", "2024-06-21 14:30"],
+                  "dni": [800.0, 900.0, 700.0]}).to_csv(weather, index=False)
+    small_case.weather.source = "file"
+    small_case.weather.file = str(weather)
+    small_case.annual.year = 2024
+    small_case.layout_opt.n_heliostats = 24
+    small_case.layout_opt.maxiter = 1
+    small_case.layout_opt.popsize = 2
+    small_case.layout_opt.refine_top = 0
+    small_case.layout_opt.swap_rounds = 0
+    small_case.layout_opt.search_aiming = "center"
+    result = task_optimize_layout(small_case, tmp_path / "results")
+
+    exported = load_case(result["files"]["case_yaml"])
+    field = build_field(exported)
+    series = load_weather(exported)
+    assert field.n == small_case.layout_opt.n_heliostats
+    assert len(series) == 3
+    assert exported.weather.file == "input_weather_weather.csv"

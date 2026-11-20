@@ -15,7 +15,7 @@ from pathlib import Path
 from . import workflows as wf
 from .config import load_case
 
-BAD_STATUS = {"infeasible", "capacity_shortfall", "constraint_violation", "missed_losses"}
+BAD_STATUS = {"infeasible", "uniformity_infeasible", "capacity_shortfall", "constraint_violation", "missed_losses"}
 
 
 def _print(result: dict) -> int:

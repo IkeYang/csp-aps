@@ -1,6 +1,6 @@
 # csp-aps
 
-光热塔式电站（圆柱外置集热器）**镜场自动布置**与**实时瞄准点策略（APS）**优化软件。自用、非商业。
+光热塔式电站（圆柱外置集热器）**设计仿真、镜场自动布置与实时瞄准策略（APS）**软件原型。
 
 已按导师评审稿（2026-11-20，基线 0d9292d）逐条落实，对应关系见 [docs/REVIEW_RESPONSE.md](docs/REVIEW_RESPONSE.md)；模型细节见 [docs/MODEL.md](docs/MODEL.md)。
 
@@ -10,10 +10,10 @@
 | --- | --- |
 | 在线 APS 控制引擎 | 每个控制周期输入时刻、逐镜实测 DNI、带有效时刻的预报快照、镜子可用状态、上一轮执行回执，输出每面镜子的瞄准坐标、散焦状态、方案有效时段和复核结果。<br>• 按管屏的通量上限<br>• 安全裕度、预报裕度<br>• 数据过期 / 缺失时回退<br>• 瞄准点平滑、可达性筛选<br>• 光斑响应缓存与热启动（热路径约 0.4 s / 1500 面镜） |
 | 可行性复核 | 每个方案都在自适应细网格上用完整光斑复核：超限热点自动加入约束重解，仍不行就明确给出"不可执行"状态及热点位置、所在管屏、超限量、主要贡献镜 |
-| 均匀受热 | 预热器考核区的二维 / 周向 / 高度 CV；在 CV ≤ ε 约束下最大化吸收功率；ε 扫描曲线；上下边缘功率上界（证明某些目标不可达）；小规模问题可用 SCIP 求精确最优 |
+| 均匀受热 | 预热器考核区的面积加权二维 / 周向 / 高度 CV；支持 CV 上限和固定 λ 权重两种模式；输出受限功率、实际 CV、最低负荷和功率–均匀度曲线；小规模问题可用 SCIP 求精确最优 |
 | 云影回放 | 随机云、云边扫过、云突然移开、DNI 延迟 / 丢失。对比不做 APS、只用当前 DNI、带预报三种策略：能量、超限时长（按区间统计）、端到端延迟 P50/P95、回退次数 |
 | 全年能量 | 20 / 30 / 40 个 DNI 加权代表太阳位置（误差 < 0.5%）、高度角 × 方位角分箱、逐时；受限 APS 时按 DNI 分档；可读 EPW/CSV 气象文件；多进程并行 |
-| 外层布置优化 | 径向交错 / 仿生螺旋参数化布局 → 差分进化 + 局部微调 → 前几名方案用受限 APS 复核并重新排名 → 换位微调 → 镜数、边界、禁排区、最小镜距最终校验（布不满时报告缺额） |
+| 外层布置优化 | 径向交错 / 仿生螺旋参数化布局 → 可选中心瞄准或 APS 年收益搜索 → 前几名按通过通量与均匀度检查后的吸收能量复核排名 → 换位微调 → 镜数、边界、禁排区、最小镜距最终校验（布不满时报告缺额） |
 | 光学校验 | 内部 MCRT：独立误差项、多随机种子的统计不确定度、光线数收敛表。SolTrace 对标：导出同场算例和 PySolTrace 驱动脚本。遮挡筛选：与暴力求交逐镜比对 |
 
 ## 安装
@@ -28,13 +28,25 @@ pip install -e ".[gui,exact]"
 
 `gui` 安装 Streamlit 和 plotly；`exact` 安装 SCIP（用于小规模精确基准，可选）。开发和测试用 `pip install -e ".[dev]"`。
 
+Windows 本地开发安装：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\cspaps.exe gui
+```
+
 ## 使用
 
 ### 图形界面
 
 ```bash
-cspaps gui [cases/example.yaml]
+cspaps gui [cases/aksai_demo.yaml]
 ```
+
+不传算例时默认打开阿克塞合成演示，使用阿克塞 2024 年逐小时 DNI 和可编辑的模拟设备 / 镜场输入。
+
+不传算例时默认打开阿克塞合成演示。它使用阿克塞 2024 年逐小时 DNI，镜场、吸热器和控制参数是可编辑的设计输入。
 
 | 工作区 | 内容 |
 | --- | --- |
@@ -46,6 +58,9 @@ cspaps gui [cases/example.yaml]
 ### 命令行
 
 ```bash
+cspaps aps cases/aksai_demo.yaml --time "2024-03-19 15:30" --method greedy
+cspaps annual cases/aksai_demo.yaml --method sun_bins --aiming greedy
+cspaps optimize-layout cases/aksai_demo.yaml
 cspaps layout          CASE                          # 生成镜场
 cspaps snapshot        CASE --time "2025-06-21 13:40"  # 单时刻，中心瞄准
 cspaps aps             CASE --time ... [--dni-map now.csv --forecast-dni-map max.csv --prev-aims last.csv]

@@ -31,7 +31,7 @@ from cspaps.receiver import build_grid, incident_limit_w_m2, panel_of, surface_n
 from cspaps.simulate import evaluate, sun_state
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CASE = ROOT / "cases" / "example.yaml"
+DEFAULT_CASE = ROOT / "cases" / "aksai_demo.yaml"
 RESULTS = Path.cwd() / "results" / "gui"
 UPLOADS = RESULTS / "_uploads"
 
@@ -71,6 +71,7 @@ LABELS = {
     "aps.allow_defocus": "允许散焦", "aps.milp_time_limit_s": "MILP 时限 (s)", "aps.verify": "细网格复核",
     "aps.verify_max_rounds": "热点约束最多轮数", "aps.verify_max_cells": "复核网格上限",
     "uniformity.enabled": "启用均匀度约束", "uniformity.max_cv": "允许二维 CV (ε)",
+    "uniformity.mode": "均匀度目标模式", "uniformity.weight": "均匀度权重 λ (越大越均匀)",
     "uniformity.panels": "考核管屏 H (YAML 列表，空 = 全部)", "uniformity.z_range": "考核高度范围 [z1, z2]",
     "uniformity.min_load_mw": "预热器最低负荷 (MW)", "uniformity.mu_iters": "权重二分次数",
     "uniformity.passes": "局部搜索轮数",
@@ -93,6 +94,7 @@ LABELS = {
     "layout_opt.generator": "布置生成器", "layout_opt.n_heliostats": "镜子数量",
     "layout_opt.bounds": "优化参数范围 (YAML)", "layout_opt.fixed": "固定参数 (YAML)",
     "layout_opt.search_sampling": "搜索阶段采样", "layout_opt.n_sun_bins": "搜索代表点数",
+    "layout_opt.search_aiming": "布局搜索的 APS 目标",
     "layout_opt.review_sampling": "复核阶段采样", "layout_opt.review_n_sun_bins": "复核代表点数",
     "layout_opt.review_dni_bands": "复核 DNI 分档数", "layout_opt.review_check_hourly": "复核时与逐时对比误差",
     "layout_opt.min_spacing_factor": "最小镜距系数 (空 = 用 spacing_factor)",
@@ -107,15 +109,22 @@ CHOICES = {
     "sun.shape": ["gaussian", "pillbox"], "sun.dni_model": ["meinel", "constant"],
     "atmosphere.model": ["vittitoe_biggs_clear", "vittitoe_biggs_hazy", "beer_lambert"],
     "weather.source": ["clear_sky", "file"], "aps.method": ["greedy", "kfactor", "center", "milp"],
+    "uniformity.mode": ["cv_limit", "weighted"],
     "annual.method": ["sun_bins", "sun_grid", "representative_days", "hourly"],
     "annual.aiming": ["center", "greedy", "kfactor"], "layout_opt.generator": ["radial_staggered", "biomimetic"],
     "layout_opt.search_sampling": ["sun_bins", "sun_grid", "hourly"],
+    "layout_opt.search_aiming": ["auto", "center", "greedy", "kfactor"],
     "layout_opt.review_sampling": ["sun_bins", "sun_grid", "hourly"],
     "receiver.flux_limit_basis": ["incident", "absorbed"],
     "engine.no_forecast_policy": ["clear_sky", "current"], "engine.stale_policy": ["clear_sky", "last"],
     "engine.fallback": ["hold_or_defocus", "defocus", "none"],
     "realtime.scenario": ["clouds", "moving_edge", "sudden_clear"],
     "mcrt.tracking_mode": ["per_ray", "per_heliostat"],
+}
+CHOICE_LABELS = {
+    "uniformity.mode": {"cv_limit": "CV 上限约束", "weighted": "固定权重折中"},
+    "layout_opt.search_aiming": {"auto": "自动（启用均匀度时用 APS）", "center": "中心瞄准快速搜索",
+                                 "greedy": "贪心 APS 搜索", "kfactor": "瞄准因子 APS 搜索"},
 }
 STATE_ZH = {"ready": "已执行", "fallback": "已回退", "infeasible": "不可执行", "pending": "待复核", "n/a": "—",
             "ok": "可行", "margin_reduced": "可行（裕度不足）"}
@@ -159,6 +168,9 @@ def _widget(section: str, name: str, value, key: str):
     if full in CHOICES:
         opts = CHOICES[full]
         idx = opts.index(value) if value in opts else 0
+        fmt = CHOICE_LABELS.get(full)
+        if fmt:
+            return st.selectbox(label, opts, index=idx, key=key, format_func=lambda item: fmt.get(item, item))
         return st.selectbox(label, opts, index=idx, key=key)
     if isinstance(value, bool):
         return st.checkbox(label, value=value, key=key)
@@ -353,6 +365,7 @@ def _ops_replay(case) -> None:
     with st.expander("回放设置", expanded="res_rt" not in st.session_state):
         _section_form("realtime", expanded=True)
         _section_form("engine")
+    case, _ = _case()
     _job_button("rt", "运行回放", wf.task_realtime, progress=True)
     _job_error("rt")
     res = st.session_state.get("res_rt")
@@ -380,6 +393,11 @@ def _ops_replay(case) -> None:
         ("最高通量（复核）", f"{row['peak_flux_kw_m2']:.1f} kW/m²，{int(row['hotspot_panel'])} 号管屏"),
         ("距上限余量", f"{(limit_kw - row['peak_flux_kw_m2']):.1f} kW/m²"),
         ("散焦镜数", f"{int(row['n_defocused'])} 面"),
+        ("二维 / 周向 / 高度 CV", " / ".join(
+            f"{row[k]:.3f}" if np.isfinite(row[k]) else "—"
+            for k in ("uniformity_cv_2d", "uniformity_cv_circ", "uniformity_cv_height"))),
+        ("均匀度状态", row["uniformity_status"]),
+        ("该时段可行", "是" if row["operational_feasible"] else "否"),
     ])
     grid = build_grid(case.receiver)
     left, right = st.columns([1, 1])
@@ -433,6 +451,8 @@ def _ops_replay(case) -> None:
     summ = rr.summary()
     comp = pd.DataFrame({STRAT_ZH.get(s, s): {
         "能量 (MWh)": v["energy_mwh"], "最大复核峰值 (kW/m²)": v["max_peak_flux_kw_m2"],
+        "可行吸收能量 (MWh)": v["feasible_absorbed_energy_mwh"],
+        "均匀度不合格 (min)": v["hours_uniformity_failed"] * 60,
         "超限时长 (min)": v["time_over_limit_min"], "平均调整镜数": v["mean_heliostats_moved"],
         "引擎延迟 P50 (s)": v.get("engine_latency_p50_s", "—"), "引擎延迟 P95 (s)": v.get("engine_latency_p95_s", "—"),
         "回退 / 不可执行次数": str({STATE_ZH.get(a, a): b for a, b in v.get("plan_states", {}).items()})}
@@ -444,11 +464,17 @@ def _ops_replay(case) -> None:
 
 
 def _ops_single(case) -> None:
+    _section_form("uniformity", fields=["enabled", "mode", "max_cv", "weight", "panels", "z_range", "min_load_mw"])
+    case, case_error = _case()
     case_ok = case is not None
+    if case_error:
+        st.error(case_error)
     c1, c2, c3 = st.columns(3)
-    date = c1.date_input("日期", value=pd.Timestamp("2025-06-21").date(), key="s_date")
-    tm = c2.time_input("当地时间", value=pd.Timestamp("13:40").time(), key="s_time", step=60)
-    method = c3.selectbox("方法", ["greedy", "kfactor", "center", "milp"], key="s_method")
+    default_time = pd.Timestamp(case.realtime.start if case is not None else "2025-06-21 13:40")
+    case_key = case.name if case is not None else "invalid"
+    date = c1.date_input("日期", value=default_time.date(), key=f"s_date:{case_key}")
+    tm = c2.time_input("当地时间", value=default_time.time(), key=f"s_time:{case_key}", step=60)
+    method = c3.selectbox("方法", ["greedy", "kfactor", "center", "milp"], key=f"s_method:{case_key}")
     st.markdown("**数据导入**（实测 DNI、预报 DNI、上一轮已执行瞄准点）")
     u1, u2, u3 = st.columns(3)
     up_now = u1.file_uploader("当前 DNI（CSV x,y,dni）", type=["csv"], key="s_now")
@@ -485,19 +511,34 @@ def _ops_single(case) -> None:
     s, snap, fld = res["summary"], res["snapshot"], res["field"]
     executed = st.session_state.get("single_executed") == str(res["run_dir"])
     state = "ready" if executed else ("infeasible" if s["status"] == "infeasible" else "pending")
+    uniformity_met = s["aps"].get("uniformity_met", True)
+    if not uniformity_met:
+        state = "infeasible"
     chk = s["flux_check"]
+    cv_values = [s.get("cv_2d"), s.get("cv_circumferential"), s.get("cv_height")]
+    cv_text = " / ".join(f"{value:.3f}" if isinstance(value, (int, float)) and np.isfinite(value) else "—"
+                         for value in cv_values)
     _status_header([
-        ("时间", s["time"][:19].replace("T", " ")), ("数据来源", "实测上传" if up_now else "晴空模型"),
+        ("时间", s["time"][:19].replace("T", " ")),
+        ("数据来源", "实测上传" if up_now else (str(case.weather.file) if case.weather.source == "file" else "晴空模型")),
         ("当前策略", s["aps"].get("method", method)), ("指令状态", STATE_ZH[state]),
         ("复核状态", STATE_ZH.get(s["status"], s["status"])),
         ("截获功率", f"{s['intercepted_power_mw']:.3f} MW"), ("吸收功率", f"{s['absorbed_power_mw']:.3f} MW"),
         ("最高通量（复核）", f"{chk['peak_flux_kw_m2']:.1f} kW/m²，{chk['hotspot']['panel']} 号管屏"),
         ("距上限余量", f"{chk['margin_to_limit_kw_m2']:.1f} kW/m²"), ("散焦镜数", f"{s['n_defocused']} 面"),
+        ("二维 / 周向 / 高度 CV", cv_text),
+        ("考核区 CV", str(s.get("aps", {}).get("cv_2d_H", "—"))),
+        ("均匀度目标", (f"CV ≤ {case.uniformity.max_cv:.3f}" if case.uniformity.mode == "cv_limit"
+                        else f"λ = {case.uniformity.weight:.3g}") if case.uniformity.enabled else "功率优先"),
+        ("均匀度状态", s.get("aps", {}).get("uniformity_status", "未启用")),
+        ("求解质量", "候选集全局最优" if s.get("aps", {}).get("global_optimality_proven") else "已复核可行解，未证明全局最优"),
     ])
-    if s["status"] == "infeasible":
+    if s["status"] == "infeasible" and chk["status"] == "over_limit":
         st.error(f"复核不通过：热点超限 {chk['exceedance_kw_m2']:.1f} kW/m²，位置 方位 {chk['hotspot']['azimuth_deg']}°、"
                  f"高度 {chk['hotspot']['z_m']} m。控制端应进入保守策略。")
-    if not executed and s["status"] != "infeasible":
+    elif not uniformity_met or s["status"] == "uniformity_infeasible":
+        st.warning("该方案通过通量复核，但未达到设定的均匀度或最低负荷目标。")
+    if not executed and s["status"] != "infeasible" and uniformity_met:
         if st.button("确认执行（记录为上一轮回执）"):
             st.session_state["single_executed"] = str(res["run_dir"])
             st.rerun()
@@ -526,6 +567,7 @@ def page_planning(case) -> None:
                 st.session_state["case_dict"].setdefault("field", {})["layout_file"] = str(_save_upload(up))
             for sec in ("site", "receiver", "heliostat", "field", "shading", "atmosphere", "sun"):
                 _section_form(sec, expanded=sec in ("receiver", "field"))
+            case, _ = _case()
         with c2:
             if case is not None:
                 try:
@@ -545,6 +587,7 @@ def page_planning(case) -> None:
                 st.session_state["case_dict"]["weather"] = {"source": "file", "file": str(_save_upload(wup))}
             _section_form("weather", expanded=True)
             _section_form("annual", expanded=True)
+            case, _ = _case()
             st.caption("代表太阳位置：常用 20 / 30 / 40 个，或填写任意数量；也可按高度角×方位角分箱，或逐小时遍历。")
         with c2:
             check = st.checkbox("计算采样误差（20/30/40 个代表点及分箱，相对逐小时）", key="bins_check")
@@ -561,6 +604,7 @@ def page_planning(case) -> None:
             _section_form("layout_opt", expanded=True)
             _section_form("aps")
             _section_form("uniformity")
+            case, _ = _case()
         with c2:
             st.markdown("**全年能量（当前镜场）**")
             a1, a2 = st.columns(2)
@@ -580,8 +624,13 @@ def page_planning(case) -> None:
             _job_error("opt")
             if "res_opt" in st.session_state:
                 s = st.session_state["res_opt"]["summary"]
-                st.success(f"完成：状态 {s['status']}，{s['n_heliostats']} 面镜，受限全年能量 "
-                           f"{s['annual_energy_mwh_with_aps']} MWh；到 ④ 比较与应用")
+                score = s.get("annual_energy_mwh_with_aps")
+                score_label = "可行 APS 年吸收能量" if score is not None else "搜索目标年吸收能量"
+                score = score if score is not None else s.get("annual_energy_mwh_search_objective")
+                quality = "全局最优已证明" if s.get("global_optimality_proven") else "启发式搜索，可行性已复核"
+                st.success(f"完成：{s['status']}，{s['n_heliostats']} 面镜，{score_label} {score} MWh，{quality}")
+                if s.get("operational_status") == "no_feasible_annual_states":
+                    st.warning("入围布局没有通过全部年度工况的安全与均匀度约束，可比较原始吸热量，但不能作为可行运行方案应用。")
                 if s.get("capacity"):
                     st.warning(s["capacity"]["message"])
     with tabs[3]:
@@ -595,10 +644,12 @@ def _planning_compare(case) -> None:
         return
     r = res["result"]
     rank = r.ranking.copy()
-    show_cols = [c for c in ["final_rank", "search_rank", "rank_change", "n_heliostats", "energy_search_center_mwh",
+    show_cols = [c for c in ["final_rank", "search_rank", "rank_change", "n_heliostats",
+                             "energy_search_center_absorbed_mwh", "energy_search_objective_mwh",
                              "energy_review_center_mwh", "energy_hourly_center_mwh", "search_sampling_error_pct",
-                             "energy_constrained_aps_mwh", "aps_max_peak_kw_m2", "aps_states_not_ok"] if c in rank]
-    st.markdown(f"**候选方案**（复核：{r.summary()['review_sampling']}，受限 APS 按 DNI 分档）")
+                             "energy_constrained_aps_mwh", "energy_raw_aps_absorbed_mwh", "aps_max_cv_2d",
+                             "aps_max_peak_kw_m2", "aps_hours_uniformity_failed", "aps_states_not_ok"] if c in rank]
+    st.markdown(f"**候选方案**（搜索目标：{r.best.search_aiming}；复核：{r.summary()['review_sampling']}）")
     ev = st.dataframe(rank[show_cols], on_select="rerun", selection_mode="single-row", key="cand_table", hide_index=True)
     rows = getattr(getattr(ev, "selection", None), "rows", None) or [0]
     pick = int(rank.loc[rows[0], "search_rank"]) - 1
@@ -767,7 +818,7 @@ def main() -> None:
             st.session_state["loaded_upload"] = (up.name, up.size)
             _load_into_state(yaml.safe_load(up.getvalue().decode("utf-8")), UPLOADS)
             st.rerun()
-        if st.button("恢复示例算例"):
+        if st.button("恢复阿克塞演示算例"):
             _load_into_state(yaml.safe_load(DEFAULT_CASE.read_text(encoding="utf-8")), DEFAULT_CASE.parent)
             st.rerun()
         case, err = _case()

@@ -157,7 +157,9 @@ class UniformitySpec:
     """Uniform heating of the preheater region H (absorbed flux, area-weighted)."""
 
     enabled: bool = False
+    mode: str = "cv_limit"  # "cv_limit": maximise power under max_cv; "weighted": fixed P - weight * A_H * std_H(q)
     max_cv: float = 0.5  # epsilon: allowed 2-D coefficient of variation over H
+    weight: float = 0.2  # dimensionless uniformity penalty weight for mode="weighted"
     panels: list[int] | None = None  # 1-based panel numbers forming H (None = all panels)
     z_range: list[float] | None = None  # [z_min, z_max] of H in m (None = full height)
     min_load_mw: float = 0.0  # minimum absorbed power on H; below it the receiver is shut down
@@ -220,6 +222,7 @@ class LayoutOpt:
     bounds: dict[str, list[float]] = dc_field(default_factory=dict)  # optimised generator params
     fixed: dict[str, Any] = dc_field(default_factory=dict)  # other generator params
     search_sampling: str = "sun_bins"  # annual sampling during the search: sun_bins | sun_grid | hourly
+    search_aiming: str = "auto"  # "auto": greedy when uniformity is enabled, otherwise center; or center | greedy | kfactor
     n_sun_bins: int = 30  # representative sun positions for the search (20 / 30 / 40 / any)
     review_sampling: str = "sun_bins"  # sampling for the review of the best layouts
     review_n_sun_bins: int = 40
@@ -344,6 +347,10 @@ def _validate(case: Case) -> None:
                                                  or any(not v > 0 for v in rec.limit_height_profile)):
         raise ValueError("receiver.limit_height_profile needs positive values")
     u = case.uniformity
+    if u.mode not in ("cv_limit", "weighted"):
+        raise ValueError("uniformity.mode must be cv_limit|weighted")
+    if u.weight < 0:
+        raise ValueError("uniformity.weight must be >= 0")
     if u.panels is not None and any(not 1 <= p <= rec.n_panels for p in u.panels):
         raise ValueError(f"uniformity.panels must be panel numbers 1..{rec.n_panels}")
     if not u.max_cv > 0:
@@ -356,6 +363,8 @@ def _validate(case: Case) -> None:
     for name in ("search_sampling", "review_sampling"):
         if getattr(case.layout_opt, name) not in ("sun_bins", "sun_grid", "hourly"):
             raise ValueError(f"layout_opt.{name} must be sun_bins|sun_grid|hourly")
+    if case.layout_opt.search_aiming not in ("auto", "center", "greedy", "kfactor"):
+        raise ValueError("layout_opt.search_aiming must be auto|center|greedy|kfactor")
     if case.mcrt.tracking_mode not in ("per_ray", "per_heliostat"):
         raise ValueError("mcrt.tracking_mode must be per_ray|per_heliostat")
     if case.realtime.scenario not in ("clouds", "moving_edge", "sudden_clear"):

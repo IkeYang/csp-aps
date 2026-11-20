@@ -9,6 +9,7 @@ Each runner returns ``{"summary": dict, "files": {label: path}, "run_dir": Path,
 from __future__ import annotations
 
 import json
+import shutil
 import time as _time
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from . import __version__, sun
-from .aps import build_problem, optimize_aims, solve
+from .aps import build_problem, optimize_aims, solve, solve_greedy
 from .clouds import load_dni_map
 from .config import Case
 from .engine import APSEngine, request_from_dict, response_to_dict
@@ -33,7 +34,7 @@ from .realtime import run_realtime
 from .receiver import build_grid, surface_point
 from .shading import compare_screening
 from .simulate import LOSSES, annual, evaluate, sun_state
-from .uniformity import edge_band_bound, sweep, uniformity_metrics
+from .uniformity import edge_band_bound, region_of_grid, sweep, uniformity_metrics
 
 Progress = Callable[[str], None]
 
@@ -73,7 +74,20 @@ def out_dir(base: str | Path, case: Case, task: str = "run") -> Path:
         k += 1
         out = root / f"{task}_{stamp}-{k}"
     out.mkdir(parents=True)
-    (out / "inputs_case.yaml").write_text(case.to_yaml(), encoding="utf-8")
+    snapshot = case.copy()
+    snapshot.base_dir = out
+    for section, attr in (("weather", "file"), ("field", "layout_file")):
+        value = getattr(getattr(case, section), attr)
+        if not value:
+            continue
+        source = case.resolve(value)
+        if source.is_file():
+            dest = out / f"input_{section}_{source.name}"
+            shutil.copy2(source, dest)
+            setattr(getattr(snapshot, section), attr, dest.name)
+        else:
+            setattr(getattr(snapshot, section), attr, str(source.resolve()))
+    (out / "inputs_case.yaml").write_text(snapshot.to_yaml(), encoding="utf-8")
     return out
 
 
@@ -173,6 +187,8 @@ def task_aim(
     chk_con = res.check if res is not None and res.check is not None else snap.verify(case.receiver)
     status = res.status if res is not None else {"ok": "ok", "margin_reduced": "margin_reduced",
                                                  "over_limit": "infeasible"}[chk_con.status]
+    if res is not None and case.uniformity.enabled and not res.info.get("uniformity_met", True):
+        status = "uniformity_infeasible"
     stamp = f"{ts:%Y%m%d_%H%M}_{method}"
     files = {
         "summary_json": out / f"{tag}_{stamp}.json",
@@ -303,14 +319,18 @@ def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None
                 exclusion=case.field.exclusion_radius, title=f"Optimised layout, N = {fld.n} [{res.status}]")
     plot_history(res.history, files["history_png"])
     new_case = case.copy()
-    new_case.field.layout_file = str(files["layout_csv"].resolve())
+    new_case.field.layout_file = files["layout_csv"].name
     new_case.field.generator = None
     new_case.name = f"{case.name}_optimized"
+    new_case.base_dir = out
+    copied_weather = out / f"input_weather_{Path(case.weather.file).name}" if case.weather.file else None
+    if copied_weather is not None and copied_weather.exists():
+        new_case.weather.file = copied_weather.name
     files["case_yaml"].write_text(new_case.to_yaml(), encoding="utf-8")
     summary = res.summary()
     summary["search_settings"] = {k: getattr(case.layout_opt, k) for k in (
         "generator", "n_heliostats", "bounds", "fixed", "search_sampling", "n_sun_bins", "review_sampling",
-        "review_n_sun_bins", "review_dni_bands", "maxiter", "popsize", "seed", "polish_rounds", "refine_top",
+        "search_aiming", "review_n_sun_bins", "review_dni_bands", "maxiter", "popsize", "seed", "polish_rounds", "refine_top",
         "swap_rounds", "swap_fraction")}
     _json(files["summary_json"], summary)
     finish(out, "layout_opt", summary, t0=t0)
@@ -325,15 +345,27 @@ def task_uniformity(case: Case, base: str | Path, time, eps_values=None, exact: 
     fld = build_field(case)
     ts, el, az, dni = sun_state(case, time)
     grid = build_grid(case.receiver)
-    prob = build_problem(case, fld, el, az, dni, grid=grid)
-    base_res = solve(prob, "greedy")
-    snap0 = evaluate(case, fld, el, az, dni, aim=base_res.aim, active=base_res.active, grid=grid)
-    m0 = uniformity_metrics(snap0.absorbed_flux, grid.to_map(snap0.region))
+    baseline_case = case.copy()
+    baseline_case.uniformity.enabled = False
+    prob = build_problem(baseline_case, fld, el, az, dni, grid=grid)
+    objective_prob = prob
+    base_choice, base_info = solve_greedy(prob, case.aps)
+    base_aim = prob.aims(base_choice)
+    snap0 = evaluate(baseline_case, fld, el, az, dni, aim=base_aim, active=base_choice >= 0, grid=grid)
+    h_mask = region_of_grid(case, grid, case.uniformity)
+    m0 = uniformity_metrics(snap0.absorbed_flux, grid.to_map(h_mask))
     if eps_values is None:
         top = max(m0["cv_2d"], 0.05)
         eps_values = [round(top * f, 3) for f in (1.0, 0.95, 0.9, 0.8, 0.7, 0.6)]
-    curve = sweep(prob, base_res.choice, eps_values, exact=exact)
-    bound = edge_band_bound(prob, power_floor_fraction * base_res.power_w, band_fraction)
+    curve = sweep(objective_prob, base_choice, eps_values, spec=case.uniformity, exact=exact)
+    rec = case.receiver
+    full_region = case.uniformity.panels is None and case.uniformity.z_range is None
+    alpha_uniform = rec.panel_absorptivity is None or np.allclose(rec.panel_absorptivity, rec.panel_absorptivity[0])
+    if full_region and alpha_uniform:
+        bound = edge_band_bound(prob, power_floor_fraction * prob.total_power(base_choice), band_fraction)
+    else:
+        bound = {"feasible": None, "status": "not_applicable",
+                 "reason": "edge-band bound is derived for the full receiver and uniform absorptivity"}
     for row in curve:
         if row["epsilon"] < bound.get("cv_2d_lower_bound", -1):
             row["proof"] = f"unreachable at >= {power_floor_fraction:.1%} of the greedy power (edge-band bound)"
@@ -342,7 +374,9 @@ def task_uniformity(case: Case, base: str | Path, time, eps_values=None, exact: 
     pd.DataFrame(curve).to_csv(files["curve_csv"], index=False)
     plot_uniformity_curve(curve, files["curve_png"])
     summary = {"time": ts.isoformat(), "region_H": {"panels": case.uniformity.panels, "z_range": case.uniformity.z_range},
-               "greedy_baseline": {"power_intercepted_mw": base_res.power_w / 1e6, **m0},
+               "greedy_baseline": {"power_intercepted_mw": prob.total_power(base_choice) / 1e6,
+                                   "power_absorbed_mw": snap0.p_absorbed / 1e6,
+                                   "solver": base_info, **m0},
                "curve": curve, "edge_band_bound": bound}
     _json(files["summary_json"], summary)
     finish(out, "uniformity", summary, {"time": str(time), "eps": list(eps_values), "exact": exact}, t0)

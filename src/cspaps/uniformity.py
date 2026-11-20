@@ -97,15 +97,19 @@ class _State:
         return self.std() / mean if mean > 0 else float("inf")
 
 
-def _local_search(prob, state: _State, mu: float, passes: int, absorb_power: np.ndarray, order) -> None:
-    """Coordinate moves maximising P_abs - mu * A_H * std_H(q), keeping the flux limits."""
+def _local_search(prob, state: _State, mu: float, passes: int, absorb_power: np.ndarray, order,
+                  prev_aim_xyz: np.ndarray | None = None, prev_active: np.ndarray | None = None) -> None:
+    """Coordinate moves maximising absorbed power minus the uniformity penalty."""
     limit = prob.limit
+    p_ref = absorb_power[:, prob.center_k]
     for _ in range(passes):
         moved = 0
         for i in order:
             if not prob.available[i]:
                 continue
             idx = prob.cells[i]
+            if idx.size == 0:
+                continue
             old = state.choice[i]
             Fc = prob.rs.resp[i] * np.float32(prob.dni_con[i])  # (K, S) constraint basis
             Fq = prob.rs.resp[i] * np.float32(prob.dni_obj[i]) * state.alpha[idx][None, :]  # absorbed
@@ -118,7 +122,9 @@ def _local_search(prob, state: _State, mu: float, passes: int, absorb_power: np.
             new_con = base_con[None, :] + Kc
             touch = Kc > 1e-3 * np.maximum(Kc.max(axis=1, keepdims=True), 1e-30)
             feasible = np.all((new_con <= limit[idx][None, :] * (1 + 1e-9)) | ~touch, axis=1)
-            feasible[-1] = True
+            feasible[-1] = prob.case.aps.allow_defocus or old < 0
+            if prob.reach is not None:
+                feasible[:-1] &= prob.reach[i]
             new_q = base_q[None, :] + Kq
             old_q_h = state.q[idx][hm]
             d1 = state.area * (new_q[:, hm].sum(axis=1) - old_q_h.sum())
@@ -127,10 +133,14 @@ def _local_search(prob, state: _State, mu: float, passes: int, absorb_power: np.
             std_n = np.sqrt(np.maximum(s2n / state.a_h - (s1n / state.a_h) ** 2, 0.0))
             p_new = np.append(absorb_power[i], 0.0)
             score = p_new - mu * state.a_h * std_n
+            if prev_aim_xyz is not None and prev_active is not None:
+                move = np.linalg.norm(prob.aim_xyz[i] - prev_aim_xyz[i][None, :], axis=1)
+                score[:-1] -= prob.case.aps.move_penalty_per_m * p_ref[i] * move * bool(prev_active[i])
             score[~feasible] = -np.inf
             best = int(np.argmax(score))
             cur = state.prob.k if old < 0 else old
-            if best != cur and score[best] > score[cur] + 1e-9 * max(abs(score[cur]), 1.0):
+            tolerance = 1e-9 * max(abs(score[cur]), 1.0) if np.isfinite(score[cur]) else 0.0
+            if best != cur and np.isfinite(score[best]) and score[best] > score[cur] + tolerance:
                 new_c = -1 if best == prob.k else best
                 state.flux_con[idx] = new_con[best]
                 state.q[idx] = new_q[best]
@@ -142,19 +152,21 @@ def _local_search(prob, state: _State, mu: float, passes: int, absorb_power: np.
 
 
 def solve_uniform(prob, base_choice: np.ndarray, spec: UniformitySpec | None = None,
-                  max_cv: float | None = None) -> UniformResult:
+                  max_cv: float | None = None, prev_aim_xyz: np.ndarray | None = None,
+                  prev_active: np.ndarray | None = None) -> UniformResult:
     """Maximise absorbed power with CV_2D(H) <= max_cv, starting from a flux-feasible plan."""
     t0 = _time.perf_counter()
     spec = spec or prob.case.uniformity
     eps = spec.max_cv if max_cv is None else max_cv
     h_mask = region_of_grid(prob.case, prob.grid, spec)
-    alpha_k = _candidate_alpha(prob)
-    absorb_power = prob.power * alpha_k  # (N, K) absorbed power if aimed at k
+    if not h_mask.any():
+        raise ValueError("uniformity region H contains no receiver grid cells")
+    absorb_power = prob.absorbed_power
     order = np.argsort(-prob.sigma[:, prob.center_k], kind="stable")
 
     def run(mu: float, start: np.ndarray) -> _State:
         st = _State(prob, h_mask, start)
-        _local_search(prob, st, mu, spec.passes, absorb_power, order)
+        _local_search(prob, st, mu, spec.passes, absorb_power, order, prev_aim_xyz, prev_active)
         return st
 
     hist = []
@@ -166,51 +178,61 @@ def solve_uniform(prob, base_choice: np.ndarray, spec: UniformitySpec | None = N
         hist.append({"mu": mu, "cv_2d": st.cv(), "power_abs_mw": _p_abs(st, absorb_power) / 1e6})
         return st
 
-    st0 = run_rec(0.0, base_choice)
-    if st0.cv() <= eps:
-        best, mu_best = st0, 0.0
+    weighted = spec.mode == "weighted" and max_cv is None
+    if weighted:
+        mu_best = float(spec.weight)
+        best = run_rec(mu_best, base_choice)
     else:
-        # bracket: the weight that makes std as costly as the total power per unit std
-        hi = 1.0 / max(min(st0.cv(), 1e6), 1e-6)
-        st_hi = run_rec(hi, st0.choice)
-        k = 0
-        while st_hi.cv() > eps and k < 8:
-            hi *= 4.0
-            st_hi = run_rec(hi, st_hi.choice)
-            k += 1
-        best, mu_best = (st_hi, hi) if st_hi.cv() <= eps else (None, hi)
-        lo = 0.0
-        if best is not None:
-            for _ in range(spec.mu_iters):
-                mid = 0.5 * (lo + hi)
-                st = run_rec(mid, st0.choice)
-                if st.cv() <= eps:
-                    if _p_abs(st, absorb_power) >= _p_abs(best, absorb_power):
-                        best, mu_best = st, mid
-                    hi = mid
-                else:
-                    lo = mid
+        st0 = run_rec(0.0, base_choice)
+        if st0.cv() <= eps:
+            best, mu_best = st0, 0.0
         else:
-            # not reached: return the most uniform plan that still delivers power
-            powered = [st for st in tried if st.s1 > 0]
-            best = min(powered, key=lambda st: st.cv()) if powered else st0
+            # bracket: the weight that makes std as costly as the total power per unit std
+            hi = 1.0 / max(min(st0.cv(), 1e6), 1e-6)
+            st_hi = run_rec(hi, st0.choice)
+            k = 0
+            while st_hi.cv() > eps and k < 8:
+                hi *= 4.0
+                st_hi = run_rec(hi, st_hi.choice)
+                k += 1
+            best, mu_best = (st_hi, hi) if st_hi.cv() <= eps else (None, hi)
+            lo = 0.0
+            if best is not None:
+                for _ in range(spec.mu_iters):
+                    mid = 0.5 * (lo + hi)
+                    st = run_rec(mid, st0.choice)
+                    if st.cv() <= eps:
+                        if _p_abs(st, absorb_power) >= _p_abs(best, absorb_power):
+                            best, mu_best = st, mid
+                        hi = mid
+                    else:
+                        lo = mid
+            else:
+                # not reached: return the most uniform powered plan
+                powered = [st for st in tried if st.s1 > 0]
+                best = min(powered, key=lambda st: st.cv()) if powered else st0
     p_abs = _p_abs(best, absorb_power)
     p_h = best.s1
-    status = "feasible" if best.cv() <= eps else "not_reached"
-    if p_h < spec.min_load_mw * 1e6:
+    min_required_w = max(spec.min_load_mw * 1e6, 1e-6)
+    if p_h < min_required_w:
         status = "below_min_load"
+    elif weighted:
+        status = "weighted"
+    else:
+        status = "feasible" if best.cv() <= eps else "not_reached"
     return UniformResult(best.choice, p_abs, p_h, best.cv(), mu_best, status, hist, _time.perf_counter() - t0)
-
-
-def _candidate_alpha(prob) -> np.ndarray:
-    from .receiver import absorptivity_at
-
-    return absorptivity_at(prob.case.receiver, prob.cand_az)
 
 
 def _p_abs(state: _State, absorb_power: np.ndarray) -> float:
     on = state.choice >= 0
     return float(absorb_power[np.flatnonzero(on), state.choice[on]].sum())
+
+
+def _candidate_alpha(prob) -> np.ndarray:
+    """Per-candidate panel absorptivity, retained for external analysis callers."""
+    from .receiver import absorptivity_at
+
+    return absorptivity_at(prob.case.receiver, prob.cand_az)
 
 
 def sweep(prob, base_choice: np.ndarray, eps_values, spec: UniformitySpec | None = None,
@@ -311,8 +333,7 @@ def exact_benchmark(prob, eps: float, spec: UniformitySpec | None = None, time_l
     h_mask = region_of_grid(prob.case, prob.grid, spec)
     rs = prob.rs
     area = rs.grid.cell_area
-    alpha_k = _candidate_alpha(prob)
-    absorb = prob.power * alpha_k
+    absorb = prob.absorbed_power
     m = Model()
     m.hideOutput()
     m.setParam("limits/time", time_limit_s)

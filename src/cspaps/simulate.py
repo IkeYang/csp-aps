@@ -244,6 +244,10 @@ class AnnualResult:
         e = self.energy_mwh
         ts = self.timeseries
         over = ts.loc[ts["over_limit"], "weight_h"].sum() if "over_limit" in ts else float("nan")
+        feasible = ts["operational_feasible"] if "operational_feasible" in ts else pd.Series(False, index=ts.index)
+        feasible_energy = float((ts.loc[feasible, "p_absorbed_mw"] * ts.loc[feasible, "weight_h"]).sum()) if len(ts) else 0.0
+        uniformity_failed = float(ts.loc[~ts["uniformity_feasible"], "weight_h"].sum()) if "uniformity_feasible" in ts else 0.0
+        flux_failed = float(ts.loc[~ts["flux_feasible"], "weight_h"].sum()) if "flux_feasible" in ts else float(over)
         return {
             "method": self.method,
             "aiming": self.aiming,
@@ -259,6 +263,10 @@ class AnnualResult:
             "max_peak_to_limit": round(float(ts["peak_to_limit"].max()), 4) if len(ts) else 0.0,
             "hours_over_flux_limit": round(float(over), 1),
             "absorbed_energy_mwh": round(float((ts["p_absorbed_mw"] * ts["weight_h"]).sum()), 2) if len(ts) else 0.0,
+            "feasible_absorbed_energy_mwh": round(feasible_energy, 2),
+            "hours_uniformity_failed": round(uniformity_failed, 2),
+            "hours_flux_or_verification_failed": round(flux_failed, 2),
+            "feasible_sun_states": int(feasible.sum()),
             "peak_basis": "verified fine grid" if self.aiming != "center" else "coarse grid",
             "runtime_s": round(self.runtime_s, 2),
         }
@@ -272,6 +280,8 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
         peak = snap.flux.max() / 1e3
         ratio = float((snap.flux.ravel() / grid.limit).max())
         status = ""
+        uniformity_status = "not_checked"
+        cv_2d = cv_circ = cv_height = power_h_mw = float("nan")
     else:
         from .aps import optimize_aims  # local import: aps depends on this module
 
@@ -283,13 +293,38 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
         else:
             peak, ratio = snap.flux.max() / 1e3, float((snap.flux.ravel() / grid.limit).max())
         status = res.status
+        uniformity_status = res.info.get("uniformity_status", "disabled") if case.uniformity.enabled else "disabled"
+        cv_2d = res.info.get("cv_2d_H", float("nan"))
+        cv_circ = res.info.get("cv_circ_H", float("nan"))
+        cv_height = res.info.get("cv_height_H", float("nan"))
+        power_h_mw = res.info.get("power_H_mw", float("nan"))
     flux_on = with_flux or aiming != "center"
+    over_limit = bool(flux_on and ratio > 1.0 + 1e-9)
+    flux_feasible = (status in ("ok", "margin_reduced") if aiming != "center" else (with_flux and not over_limit))
+    if aiming == "center" and case.uniformity.enabled and with_flux:
+        mask = region_of_grid(case, grid, case.uniformity)
+        metrics = uniformity_metrics(snap.absorbed_flux, grid.to_map(mask))
+        cv_2d = metrics["cv_2d"]
+        cv_circ = metrics["cv_circ"]
+        cv_height = metrics["cv_height"]
+        power_h_mw = float(snap.absorbed_flux.ravel()[mask].sum() * grid.cell_area / 1e6)
+        uniformity_status = "feasible" if case.uniformity.mode == "weighted" or cv_2d <= case.uniformity.max_cv else "not_reached"
+    uniformity_feasible = (not case.uniformity.enabled or
+                           uniformity_status in ("feasible", "weighted"))
+    min_load_ok = (not case.uniformity.enabled or power_h_mw >= case.uniformity.min_load_mw - 1e-9)
+    uniformity_feasible = uniformity_feasible and min_load_ok
+    operational_feasible = flux_feasible and uniformity_feasible
     row = {
         "time": ts, "sun_elevation_deg": el, "sun_azimuth_deg": az,
         "dni_w_m2": dni_v, "p_receiver_mw": snap.p_receiver / 1e6, "p_absorbed_mw": snap.p_absorbed / 1e6,
         "optical_efficiency": snap.p_receiver / snap.power["sun"].sum() if snap.power["sun"].sum() > 0 else 0.0,
-        "peak_flux_kw_m2": peak, "peak_to_limit": ratio, "over_limit": bool(flux_on and ratio > 1.0 + 1e-9),
+        "peak_flux_kw_m2": peak, "peak_to_limit": ratio, "over_limit": over_limit,
         "n_defocused": int((~snap.active).sum()), "aps_status": status,
+        "flux_feasible": bool(flux_feasible), "uniformity_status": uniformity_status,
+        "uniformity_cv_2d": cv_2d, "uniformity_cv_circ": cv_circ, "uniformity_cv_height": cv_height,
+        "uniformity_power_h_mw": power_h_mw, "uniformity_feasible": bool(uniformity_feasible),
+        "operational_feasible": bool(operational_feasible),
+        "feasible_absorbed_mw": snap.p_absorbed / 1e6 if operational_feasible else 0.0,
     }
     return {k: snap.power[k] for k in STAGES}, row
 

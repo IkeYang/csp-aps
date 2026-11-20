@@ -39,8 +39,9 @@ from . import optics, shading, sun
 from .aps import AimProblem, ResponseSet, build_response, make_problem, solve_greedy, solve_kfactor
 from .config import Case
 from .field import Field
-from .receiver import build_grid, default_aim, surface_point
+from .receiver import build_grid, default_aim, region_mask, surface_point
 from .simulate import sun_state
+from .uniformity import uniformity_metrics
 from .verify import FluxCheck, verify_beams
 
 
@@ -94,6 +95,7 @@ class ControlResponse:
     n_moved: int
     response_reused: bool
     timings: dict
+    uniformity: dict = dc_field(default_factory=dict)
 
     def summary(self) -> dict:
         return {
@@ -104,6 +106,7 @@ class ControlResponse:
             "power_absorbed_mw": round(self.power_absorbed_w / 1e6, 4),
             "n_defocused": int((~self.active).sum()), "n_moved": self.n_moved,
             "response_reused": self.response_reused,
+            "uniformity": self.uniformity,
             "timings_s": {k: round(v, 4) for k, v in self.timings.items()},
             "flux_check": _check_with_ids(self.check, self.ids),
         }
@@ -173,7 +176,34 @@ class APSEngine:
         idx = np.flatnonzero(on)
         chk = verify_beams(self.case.receiver, aim_xyz[idx], t[idx], sigma[idx], unit[idx] * dni_con[idx], margin,
                            max_cells=self.case.aps.verify_max_cells).remap(idx)
-        return chk, {"unit": unit, "icpt": icpt, "aim_xyz": aim_xyz}
+        return chk, {"unit": unit, "icpt": icpt, "aim_xyz": aim_xyz, "t": t, "sigma": sigma}
+
+    def _uniformity_summary(self, beams, active, dni_obj) -> dict:
+        case = self.case
+        beam_flux = optics.footprints(self.grid, beams["aim_xyz"][active], beams["t"][active],
+                                      beams["sigma"][active], (beams["unit"] * dni_obj)[active])
+        total_flux = beam_flux.sum(axis=0)
+        q_abs = total_flux * self.grid.alpha
+        mask = region_mask(case.receiver, case.uniformity, self.grid.cell_az, self.grid.cell_z)
+        metrics = uniformity_metrics(self.grid.to_map(q_abs), self.grid.to_map(mask))
+        power_h = float(q_abs[mask].sum() * self.grid.cell_area)
+        load_ok = power_h >= max(case.uniformity.min_load_mw * 1e6, 1e-6)
+        cv_ok = (case.uniformity.mode == "weighted" or
+                 (np.isfinite(metrics["cv_2d"]) and metrics["cv_2d"] <= case.uniformity.max_cv))
+        met = load_ok and cv_ok
+        return {
+            "mode": case.uniformity.mode,
+            "status": "weighted" if met and case.uniformity.mode == "weighted" else
+                      "feasible" if met else "below_min_load" if not load_ok else "not_reached",
+            "target_cv": case.uniformity.max_cv if case.uniformity.mode == "cv_limit" else None,
+            "weight": case.uniformity.weight if case.uniformity.mode == "weighted" else None,
+            "cv_2d": float(metrics["cv_2d"]) if np.isfinite(metrics["cv_2d"]) else None,
+            "cv_circ": float(metrics["cv_circ"]) if np.isfinite(metrics["cv_circ"]) else None,
+            "cv_height": float(metrics["cv_height"]) if np.isfinite(metrics["cv_height"]) else None,
+            "absorbed_power_h_mw": power_h / 1e6,
+            "region_area_m2": float(self.grid.cell_area * mask.sum()),
+            "met": bool(met),
+        }
 
     # ------------------------------------------------------------------ main
     def step(self, req: ControlRequest) -> ControlResponse:
@@ -252,6 +282,7 @@ class APSEngine:
         # 4: solve (warm when a previous plan exists)
         t0 = _time.perf_counter()
         deadline = t0 + es.timeout_s
+        prev_xyz = surface_point(case.receiver, prev[0], prev[1]) if prev is not None else None
         init = priority = None
         if prev is not None and self.method == "greedy":
             init = self._choice_from_plan(rs, prev[0], prev[1], prev[2])
@@ -262,9 +293,25 @@ class APSEngine:
             choice, _ = solve_kfactor(prob)
             info = {}
         else:
-            prev_xyz = surface_point(case.receiver, prev[0], prev[1]) if prev is not None else None
             choice, info = solve_greedy(prob, case.aps, prev_xyz, prev[2] if prev is not None else None,
                                         init=init, priority=priority, deadline=deadline)
+        uniformity_result = None
+        if case.uniformity.enabled and self.method in ("greedy", "kfactor"):
+            from .uniformity import solve_uniform
+
+            uniformity_result = solve_uniform(prob, choice, case.uniformity,
+                                               prev_aim_xyz=prev_xyz,
+                                               prev_active=prev[2] if prev is not None else None)
+            choice = uniformity_result.choice
+            if uniformity_result.status == "below_min_load":
+                choice = np.full(n, -1, dtype=int)
+                reasons.append("uniformity_below_min_load")
+                state = "infeasible"
+            if uniformity_result.status == "not_reached":
+                reasons.append("uniformity_not_reached")
+                state = "infeasible"
+            elif uniformity_result.status != "below_min_load":
+                state = "ready"
         if info.get("timed_out"):
             reasons.append("solve_timeout")
         tm["solve_s"] = _time.perf_counter() - t0
@@ -277,15 +324,22 @@ class APSEngine:
         rounds = 0
         while not chk.ok and chk.hotspots and rounds < case.aps.verify_max_rounds:
             rs.add_points([h[0] for h in chk.hotspots], [h[1] for h in chk.hotspots])
-            choice, _ = solve_greedy(prob, case.aps, init=choice)
+            choice, _ = solve_greedy(prob, case.aps, prev_xyz, prev[2] if prev is not None else None, init=choice)
+            if case.uniformity.enabled and self.method in ("greedy", "kfactor"):
+                from .uniformity import solve_uniform
+
+                uniformity_result = solve_uniform(prob, choice, case.uniformity,
+                                                   prev_aim_xyz=prev_xyz,
+                                                   prev_active=prev[2] if prev is not None else None)
+                choice = uniformity_result.choice
+                if uniformity_result.status == "below_min_load":
+                    choice = np.full(n, -1, dtype=int)
             aim_az, aim_z = prob.aims(choice)
             active = choice >= 0
             chk, beams = self._check(el, az, aim_az, aim_z, active, dni_con, prob.margin)
             rounds += 1
-        state = "ready"
-        defocus_reason = ["" if a else "flux limit" for a in active]
-        for i in np.flatnonzero(~avail):
-            defocus_reason[i] = "unavailable"
+        if uniformity_result is None:
+            state = "ready"
         if not chk.ok:
             reasons.append(f"check_{chk.status}")
             fb = self._fallback(el, az, prev, choice, prob, dni_con, chk)
@@ -293,18 +347,50 @@ class APSEngine:
                 aim_az, aim_z, active, chk, beams, why = fb
                 state = "fallback"
                 reasons.append(why)
-                defocus_reason = [r if not a else "" for r, a in zip(defocus_reason, active)]
-                defocus_reason = [r or ("" if a else "fallback") for r, a in zip(defocus_reason, active)]
             if not chk.ok and chk.status == "over_limit":
                 state = "infeasible"
-        elif stale or "forecast_does_not_cover_window" in reasons or "solve_timeout" in reasons:
+        elif (stale or "forecast_does_not_cover_window" in reasons or "solve_timeout" in reasons) and state != "infeasible":
             state = "fallback"  # verified, but built on conservative inputs
         tm["verify_s"] = _time.perf_counter() - t0
 
         # 6: output
         t0 = _time.perf_counter()
         p_int = float(np.sum(dni_obj * beams["unit"] * beams["icpt"] * active))
-        alpha = case.receiver.absorptivity
+        if np.allclose(self.grid.alpha, self.grid.alpha[0]):
+            p_abs = p_int * float(self.grid.alpha[0])
+        else:
+            beam_flux = optics.footprints(self.grid, beams["aim_xyz"][active], beams["t"][active],
+                                          beams["sigma"][active], (beams["unit"] * dni_obj)[active])
+            p_abs = float(np.sum(beam_flux.sum(axis=0) * self.grid.alpha) * self.grid.cell_area)
+        uniformity_summary = {}
+        if case.uniformity.enabled:
+            uniformity_summary = self._uniformity_summary(beams, active, dni_obj)
+            if not uniformity_summary["met"]:
+                fallback_ok = False
+                if prev is not None:
+                    previous_az, previous_z = prev[0], prev[1]
+                    previous_active = np.asarray(prev[2], dtype=bool) & avail
+                    prev_check, prev_beams = self._check(el, az, previous_az, previous_z,
+                                                         previous_active, dni_con, prob.margin)
+                    prev_uniformity = self._uniformity_summary(prev_beams, previous_active, dni_obj)
+                    if prev_check.status == "ok" and prev_uniformity["met"]:
+                        aim_az, aim_z, active, chk, beams = (previous_az, previous_z, previous_active,
+                                                             prev_check, prev_beams)
+                        uniformity_summary = prev_uniformity
+                        state = "fallback"
+                        reasons.append("uniformity_fallback_hold_previous")
+                        fallback_ok = True
+                if not fallback_ok:
+                    aim_az, aim_z = prob.aims(choice)
+                    active = np.zeros(n, dtype=bool)
+                    chk, beams = self._check(el, az, aim_az, aim_z, active, dni_con, prob.margin)
+                    uniformity_summary = self._uniformity_summary(beams, active, dni_obj)
+                    state = "infeasible"
+                    reasons.append("uniformity_not_achievable_safe_plan_defocused")
+            if not uniformity_summary["met"]:
+                reasons.append("uniformity_not_met_after_final_plan")
+        defocus_reason = ["" if a else ("unavailable" if not avail[i] else "uniformity or flux fallback")
+                          for i, a in enumerate(active)]
         n_moved = 0
         if prev is not None:
             d_az = np.radians((aim_az - prev[0] + 180.0) % 360.0 - 180.0) * case.receiver.radius
@@ -314,7 +400,8 @@ class APSEngine:
         self._last_dni = dni_obj
         resp = ControlResponse(
             self._plan_id, now, valid_from, valid_until, state, reasons, self.fld.ids.copy(), aim_az, aim_z,
-            beams["aim_xyz"], active, defocus_reason, chk, basis, p_int, p_int * alpha, n_moved, reused, tm,
+            beams["aim_xyz"], active, defocus_reason, chk, basis, p_int, p_abs, n_moved, reused, tm,
+            uniformity_summary,
         )
         tm["output_s"] = _time.perf_counter() - t0
         tm["total_s"] = _time.perf_counter() - t_start

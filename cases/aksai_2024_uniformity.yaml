@@ -1,0 +1,174 @@
+# 阿克塞县城点位气象算例。DNI 为 NASA POWER 2024 年逐小时 ALLSKY_SFC_SW_DNI。
+# 气象点 39.6317829 N, 94.3388628 E；设备和镜场沿用虚构示例，不代表阿克塞电站设计。
+# NASA POWER hourly Wh/m^2 values are treated as hourly-average W/m^2 and converted from UTC to CST interval midpoints.
+# Source: https://power.larc.nasa.gov/api/temporal/hourly/point
+# 坐标系：x = 东，y = 北，z = 上，单位 m，原点在塔底。方位角按罗盘：北 = 0°，东 = 90°。
+# 每个参数都可以省略（使用默认值），拼错的参数名会直接报错。
+name: aksai_2024_uniformity
+
+site:
+  latitude: 39.6317829  # 阿克塞县城附近 (°N)
+  longitude: 94.3388628 # 阿克塞县城附近 (°E)
+  elevation_m: 1680     # Open-Meteo 地形高程 (m)
+  timezone: Asia/Shanghai
+
+receiver:               # 外置圆柱集热器，竖直轴，装在塔顶
+  center: [0, 0, 100]   # 圆柱中心点 (m)
+  diameter: 7.0
+  height: 8.0
+  max_flux_kw_m2: 1000  # 允许最大通量密度
+  n_azimuth: 72         # 通量图周向网格数（5°）
+  n_height: 32          # 通量图高度方向网格数
+  tower_diameter: 8.0   # 塔身直径（计算塔影）；0 = 不算塔影
+  absorptivity: 0.95    # 吸收率：吸收功率 = 截获功率 × 吸收率
+  flux_limit_basis: incident   # 限值口径：incident（入射通量）| absorbed（吸收通量）
+  n_panels: 12          # 管屏数（等分圆周），1 号管屏从下面的方位开始顺时针
+  panel_start_azimuth_deg: -15
+  # panel_max_flux_kw_m2: [1000, 1000, ...]   # 各管屏允许通量，缺省 = max_flux_kw_m2
+  # panel_flux_bias: [1.0, ...]               # 运行反馈：各管屏 实测/模型 通量比
+  # limit_height_profile: [0.9, 1.0, 1.0, 0.9] # 允许通量随高度（由下至上）的系数
+
+heliostat:
+  width: 8.0
+  height: 8.0
+  pivot_height: 5.0          # 镜面旋转中心离地高度
+  reflectivity: 0.94
+  cleanliness: 0.97
+  slope_error_mrad: 1.5      # 镜面斜率误差 (1σ，每轴)
+  tracking_error_mrad: 1.0   # 跟踪误差 (镜面法向 1σ，每轴)
+  focusing: slant_range      # slant_range（按斜距聚焦）| flat（平面镜）| 焦距数值 (m)
+  specular_error_mrad: 0.0   # 镜面散射误差（反射光线，1σ 每轴）
+
+sun:
+  shape: gaussian       # gaussian（用 sigma_mrad）| pillbox（太阳圆盘，用 half_angle_mrad）
+  sigma_mrad: 2.51
+  half_angle_mrad: 4.65
+  dni_model: meinel     # 晴空 DNI 模型：meinel | constant
+  dni_constant_w_m2: 900
+
+atmosphere:
+  model: vittitoe_biggs_clear   # vittitoe_biggs_clear（能见度~23km）| vittitoe_biggs_hazy（~5km）| beer_lambert
+  extinction_per_km: 0.1        # beer_lambert 时的消光系数 (1/km)
+
+weather:
+  source: file          # NASA POWER 2024 DNI，逐小时，北京时间区间中点
+  file: aksai_2024_dni.csv
+
+shading:
+  enabled: true
+  n_points: 8           # 每面镜子 8×8 个采样点
+  tower_shadow: true
+
+field:
+  # 二选一：layout_file: my_layout.csv（列 x,y[,z]，相对本文件路径）或 generator
+  generator:
+    type: radial_staggered   # radial_staggered | biomimetic
+    r_min: 50                # 最内圈半径 (m)
+    r_max: 500               # 最外圈半径 (m)
+    spacing_factor: 1.1      # 防碰撞直径 DM = 镜面对角线 × 此系数
+    radial_spacing: 0.866    # 径向排距（DM 的倍数，≥0.866）
+    radial_growth: 0.3       # 排距随 (r - r_min)/塔高 增大的系数
+    azimuthal_spacing: 1.2   # 周向最小间距（DM 的倍数，≥1）
+  boundary:                  # 场地边界多边形 [[x, y], ...]，北侧更大
+    - [-420, -300]
+    - [420, -300]
+    - [420, 480]
+    - [-420, 480]
+  exclusion_radius: 50       # 塔周围禁排半径 (m)
+
+aps:                         # 内层：瞄准点优化
+  method: greedy             # center | kfactor | greedy | milp（仅小规模）
+  safety_margin: 0.05        # 通量控制在 (1 - 裕度) × 上限以内
+  n_height_levels: 9         # 每面镜子的候选瞄准高度数
+  height_span: 0.9           # 候选高度覆盖集热器高度的比例
+  azimuth_offsets_deg: [-4, 0, 4]  # 候选周向偏移（集热器方位角）
+  passes: 3                  # 贪心构造后的改进轮数
+  tie_tolerance: 0.005       # 功率差在此比例内视为相同，选通量更低的点（更均匀）
+  move_penalty_per_m: 0.0    # 实时运行：瞄准点每移动 1 m 扣除的功率比例（平滑）
+  allow_defocus: true        # 无可行瞄准点时让镜子散焦待机
+  milp_time_limit_s: 60
+  verify: true               # 每个解都在自适应细网格上用完整光斑复核，超限热点加入约束重解
+  verify_max_rounds: 4
+  auto_grid: true            # 求解网格按最窄光斑自动加密
+
+uniformity:                  # 预热器均匀受热（吸收通量、面积加权）
+  enabled: true              # 在 APS 目标中加入吸热器均匀度约束
+  max_cv: 0.54               # 留出网格离散误差裕度，细网格复核目标 CV <= 0.55
+  panels: null               # 考核管屏 H（1 起编号的列表），null = 全部
+  z_range: null              # 考核高度范围 [z1, z2]，null = 全高
+  min_load_mw: 0.0           # 预热器最低有效负荷；达不到则按停机记录
+
+engine:                      # 在线控制引擎（每个控制周期调用一次）
+  period_s: 60               # 控制周期 = 一个方案保持的时间
+  command_latency_s: 5       # 从请求到方案生效的时间
+  max_dni_age_s: 90          # DNI 数据超过此年龄视为过期
+  forecast_margin: 0.05      # 预报 DNI 上浮裕度
+  no_forecast_policy: clear_sky   # 无预报时约束用的 DNI：clear_sky（保守）| current
+  stale_policy: clear_sky    # 数据过期/丢失时：clear_sky | last
+  response_refresh_deg: 0.3  # 太阳移动超过此角度重建光斑缓存
+  max_slew_deg_s: 0.0        # 镜面转速（可达性筛选），0 = 不限
+  timeout_s: 20
+  fallback: hold_or_defocus  # 复核失败：沿用上一轮（若通过复核）否则散焦主要贡献镜
+
+realtime:                    # 云影下的实时 APS 仿真
+  start: "2025-06-21 12:30"
+  duration_min: 20
+  step_s: 60                 # 刷新周期
+  forecast_horizon_s: 120    # 预报时长：约束按此时段内的最大 DNI 计算
+  forecast_step_s: 15        # 预报快照间隔
+  scenario: clouds           # clouds（随机云）| moving_edge（云边扫过）| sudden_clear（云突然移开）
+  dni_delay_s: 0             # 实测 DNI 到达控制端的延迟
+  dni_dropout_s: null        # [起, 止] 秒：这段时间收不到 DNI 数据
+  strategies: [center, aps_reactive, aps_predictive]
+  random_clouds:             # 随机云影（也可用 clouds: 列表逐个给出）
+    n: 4
+    seed: 3
+    radius_m: [120, 250]
+    transmittance: [0.05, 0.3]
+    speed_m_s: 10
+    direction_deg: 70        # 云影移动方向（罗盘方位）
+    edge_m: 40
+
+annual:
+  method: sun_bins           # sun_bins（代表太阳位置）| sun_grid（高度角×方位角分箱）| representative_days | hourly
+  n_sun_bins: 30             # 代表太阳位置数（20 / 30 / 40 或任意）
+  dni_bands: 1               # 每个代表点再按 DNI 分档（受限 APS 时建议 3）
+  grid_elevation_step_deg: 10
+  grid_azimuth_step_deg: 20
+  workers: -1                # 并行进程数，-1 = 全部 CPU
+  year: 2024
+  day_of_month: 15
+  time_step_min: 60
+  min_sun_elevation_deg: 5
+  aiming: center             # center（快）| greedy / kfactor（每个时刻做 APS）
+
+layout_opt:                  # 外层：镜场布置优化
+  generator: radial_staggered
+  n_heliostats: 1200         # 固定镜子数，选全年能量最高的位置
+  bounds:                    # 被优化的布置参数及范围
+    radial_spacing: [0.866, 1.6]
+    radial_growth: [0.0, 1.5]
+    azimuthal_spacing: [1.0, 2.0]
+  fixed:                     # 不参与优化的布置参数
+    spacing_factor: 1.1
+  search_sampling: sun_bins  # 搜索阶段采样：sun_bins | sun_grid | hourly
+  n_sun_bins: 30             # 搜索阶段代表点数
+  review_sampling: sun_bins  # 复核阶段采样
+  review_n_sun_bins: 40      # 复核阶段代表点数
+  review_dni_bands: 3        # 复核时每个代表点按 DNI 分档（受限 APS 不能合并强弱工况）
+  review_check_hourly: true  # 复核时与逐时全年对比采样误差
+  swap_rounds: 2             # 换位微调：低收益镜位换成未用候选位，按 APS 全年能量取舍
+  swap_fraction: 0.03
+  shading_points: 5
+  maxiter: 6
+  popsize: 5
+  seed: 1
+  workers: -1                # 并行进程数，-1 = 全部 CPU
+  polish_rounds: 4           # 全局搜索后的局部微调轮数
+  refine_top: 3              # 前几名方案做受限全年复核
+
+mcrt:
+  rays_per_heliostat: 2000
+  seed: 0
+  n_seeds: 3                 # 重复次数：给出功率和峰值的统计不确定度
+  tracking_mode: per_ray     # per_ray（统计，同 HFLCAL）| per_heliostat（逐镜固定偏置）

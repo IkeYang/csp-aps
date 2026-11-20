@@ -274,8 +274,27 @@ class AimProblem:
 
     @property
     def power(self) -> np.ndarray:
-        """(N, K) objective power on the receiver, W."""
+        """(N, K) intercepted incident power on the receiver, W."""
         return self.rs.unit_power * (self.dni_obj * self.available)[:, None]
+
+    @property
+    def absorbed_power(self) -> np.ndarray:
+        """Candidate absorbed power integrated over receiver cells, W."""
+        scale = (self.dni_obj * self.available)[:, None]
+        alpha = self.rs.grid.alpha
+        if alpha.size and np.allclose(alpha, alpha[0]):
+            return self.power * float(alpha[0])
+        result = np.zeros((self.n, self.k), dtype=float)
+        n_grid = self.rs.n_grid
+        area = self.rs.grid.cell_area
+        for i, idx in enumerate(self.rs.cells):
+            on_grid = idx < n_grid
+            if not on_grid.any():
+                continue
+            grid_idx = idx[on_grid]
+            flux = self.rs.resp[i][:, on_grid] * scale[i]
+            result[i] = area * (flux * alpha[grid_idx][None, :]).sum(axis=1)
+        return result
 
     @property
     def limit(self) -> np.ndarray:
@@ -357,7 +376,7 @@ class AimResult:
     method: str
     aim: tuple[np.ndarray, np.ndarray]  # (azimuth_deg, z) per heliostat
     active: np.ndarray  # (N,) bool
-    power_w: float  # objective power on the receiver
+    power_w: float  # intercepted incident power on the receiver, W
     peak_ratio: float  # verified peak flux / allowed flux incl. margin (<= 1: margin kept)
     solve_time_s: float
     choice: np.ndarray | None = None
@@ -459,14 +478,15 @@ def solve_greedy(
     """
     n = prob.n
     limit = prob.limit
-    p_ref = prob.power[:, prob.center_k]
+    objective_power = prob.absorbed_power
+    p_ref = objective_power[:, prob.center_k]
     if prev_aim_xyz is not None and spec.move_penalty_per_m > 0:
         move = np.linalg.norm(prob.aim_xyz - prev_aim_xyz[:, None, :], axis=-1)  # (N, K)
         if prev_active is not None:
             move = move * np.asarray(prev_active)[:, None]
-        score_all = prob.power - spec.move_penalty_per_m * p_ref[:, None] * move
+        score_all = objective_power - spec.move_penalty_per_m * p_ref[:, None] * move
     else:
-        score_all = prob.power
+        score_all = objective_power
     tol = spec.tie_tolerance
     avail = prob.available
     order = np.argsort(-prob.sigma[:, prob.center_k], kind="stable")  # image-size priority
@@ -597,7 +617,7 @@ def solve_milp(prob: AimProblem, spec: APSSpec, relax: bool = False, max_nnz: in
     if prob.reach is not None:
         ub_x = ub_x * prob.reach.ravel()
     res = milp(
-        c=-prob.power.ravel(),
+        c=-prob.absorbed_power.ravel(),
         integrality=np.zeros(n * k) if relax else np.ones(n * k),
         bounds=Bounds(np.zeros(n * k), ub_x),
         constraints=[LinearConstraint(a_one, lb_one, ub_one),
@@ -616,7 +636,7 @@ def solve_milp(prob: AimProblem, spec: APSSpec, relax: bool = False, max_nnz: in
 
 
 def lp_upper_bound(prob: AimProblem, spec: APSSpec | None = None) -> float:
-    """Upper bound (W) on the power any aim assignment can achieve under the flux limit
+    """Upper bound (W) on absorbed power for any aim assignment under the flux limit
     at the current constraint points (valid for this candidate set and response model)."""
     spec = spec or prob.case.aps
     _, info = solve_milp(prob, spec, relax=True)
@@ -673,11 +693,9 @@ def solve(
         info["hotspot_points_added"] = added
     uni = prob.case.uniformity
     if uni.enabled and method in ("greedy", "kfactor", "milp"):
-        from .uniformity import solve_uniform
+        from .uniformity import region_of_grid, solve_uniform, uniformity_metrics
 
-        ures = solve_uniform(prob, choice, uni)
-        info.update({"uniformity_status": ures.status, "cv_2d_H": round(ures.cv_2d, 4),
-                     "uniformity_weight": ures.mu, "power_H_mw": round(ures.power_h_w / 1e6, 4)})
+        ures = solve_uniform(prob, choice, uni, prev_aim_xyz=prev_xyz, prev_active=prev_active)
         choice = ures.choice
         if ures.status == "below_min_load":
             choice = np.full(prob.n, -1)  # preheater cannot reach its minimum load: receiver off
@@ -686,16 +704,44 @@ def solve(
             r2 = 0
             while not check.ok and check.hotspots and r2 < spec.verify_max_rounds:
                 prob.rs.add_points([h[0] for h in check.hotspots], [h[1] for h in check.hotspots])
-                choice = solve_uniform(prob, solve_greedy(prob, spec, init=choice)[0], uni).choice
+                repair, _ = solve_greedy(prob, spec, prev_xyz, prev_active, init=choice)
+                ures = solve_uniform(prob, repair, uni, prev_aim_xyz=prev_xyz, prev_active=prev_active)
+                choice = ures.choice
                 check = prob.verify(choice)
                 r2 += 1
+        h_mask = region_of_grid(prob.case, prob.grid, uni)
+        absorbed = prob.flux(choice, basis="objective")[:prob.rs.n_grid] * prob.rs.grid.alpha[:prob.rs.n_grid]
+        h_power = float(absorbed[h_mask].sum() * prob.rs.grid.cell_area)
+        metrics = uniformity_metrics(prob.rs.grid.to_map(absorbed), prob.rs.grid.to_map(h_mask))
+        if h_power < max(uni.min_load_mw * 1e6, 1e-6):
+            uni_status = "below_min_load"
+        elif uni.mode == "weighted":
+            uni_status = "weighted"
+        else:
+            uni_status = "feasible" if metrics["cv_2d"] <= uni.max_cv + 1e-9 else "not_reached"
+        info.update({"uniformity_status": uni_status, "uniformity_mode": uni.mode,
+                     "uniformity_target_cv": uni.max_cv if uni.mode == "cv_limit" else None,
+                     "uniformity_weight": uni.weight if uni.mode == "weighted" else ures.mu,
+                     "cv_2d_H": round(metrics["cv_2d"], 4) if np.isfinite(metrics["cv_2d"]) else None,
+                     "cv_circ_H": round(metrics["cv_circ"], 4) if np.isfinite(metrics["cv_circ"]) else None,
+                     "cv_height_H": round(metrics["cv_height"], 4) if np.isfinite(metrics["cv_height"]) else None,
+                     "power_H_mw": round(h_power / 1e6, 4),
+                     "uniformity_met": uni_status in ("feasible", "weighted"),
+                     "uniformity_search_status": ures.status,
+                     "uniformity_search_s": round(ures.solve_time_s, 4)})
+    info["global_optimality_proven"] = bool(
+        method == "milp" and info.get("milp_status") == 0 and not uni.enabled)
+    info["solution_class"] = "global_optimum_on_candidate_set" if info["global_optimality_proven"] else "verified_feasible_heuristic"
     if spec.verify:
         status = _STATUS[check.status]
         peak_ratio = check.peak_ratio / max(check.allowed_ratio, 1e-12)
     else:
         status = "unverified"
         peak_ratio = _peak_ratio(prob, choice)
-    return AimResult(method, prob.aims(choice), choice >= 0, prob.total_power(choice), peak_ratio,
+    active_choice = choice >= 0
+    info["objective_absorbed_power_w"] = float(
+        prob.absorbed_power[np.flatnonzero(active_choice), choice[active_choice]].sum())
+    return AimResult(method, prob.aims(choice), active_choice, prob.total_power(choice), peak_ratio,
                      _time.perf_counter() - t0, choice, info, status, check)
 
 
