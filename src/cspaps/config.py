@@ -150,6 +150,11 @@ class APSSpec:
     max_solver_cells: int = 40_000
     verify_max_rounds: int = 4  # add hotspots as constraints and re-solve at most this often
     verify_max_cells: int = 400_000  # cap of the verification grid size
+    # Optimality certificate of single-instant plans (Lagrangian + Frank-Wolfe upper bound,
+    # relaxation-guided rounding). Not used inside annual / layout loops.
+    certify: bool = True
+    certify_time_s: float = 15.0  # time budget of the upper-bound iterations
+    certify_rounds: int = 4  # randomised roundings of the relaxed solution
 
 
 @dataclass
@@ -238,6 +243,7 @@ class LayoutOpt:
     workers: int = 1  # parallel processes for the global search (-1 = all CPUs)
     polish_rounds: int = 4  # local pattern-search rounds after the global search
     refine_top: int = 3  # re-rank the best layouts with APS-aware annual energy
+    upper_bound: bool = True  # certify: upper bound on the annual energy of any layout (packing bound)
 
 
 @dataclass

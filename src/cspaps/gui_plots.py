@@ -15,9 +15,15 @@ FLUX_SCALE = [[0.0, "rgb(10,7,32)"], [0.111, "#1b0c41"], [0.222, "#4a0c6b"], [0.
               [0.889, "#f7d13d"], [1.0, "#fcffa4"]]
 
 
+FONT = "Inter, 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif"
+INK, MUTED, TEAL, AMBER, NAVY, RED = "#16232b", "#5d6d74", "#14806f", "#e09b2d", "#0f2a3a", "#c2453a"
+
+
 def _base_layout(fig, title: str, height: int = 520):
-    fig.update_layout(title=dict(text=title, font=dict(size=14), y=0.98), height=height,
-                      margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
+    fig.update_layout(title=dict(text=title, font=dict(size=14, color=INK), y=0.98, x=0.01), height=height,
+                      margin=dict(l=10, r=10, t=40 if title else 16, b=10), template="plotly_white",
+                      font=dict(family=FONT, size=12, color=INK),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#fbfcfc",
                       legend=dict(orientation="h", yanchor="top", y=-0.16, x=0, font=dict(size=11)))
     return fig
 
@@ -140,3 +146,151 @@ def uniformity_curves(curves: dict[str, list[dict]]):
     fig.update_xaxes(title="考核区二维热流变异系数（CV）")
     fig.update_yaxes(title="满足该 CV 目标时的吸收功率（MWₜₕ）")
     return _base_layout(fig, "吸热功率与热流均匀度", 360)
+
+
+# --------------------------------------------------------------------------- certificates & overview
+
+def plant_scene(case: Case, xyz: np.ndarray, values=None, label: str = "", height: int = 460):
+    """3-D view of the plant: heliostats, tower and the receiver cylinder."""
+    rec = case.receiver
+    cx, cy, cz = rec.center
+    fig = go.Figure()
+    marker = dict(size=2.6, color=values if values is not None else TEAL, colorscale="Viridis",
+                  showscale=values is not None, colorbar=dict(title=label, thickness=10, len=0.6))
+    fig.add_trace(go.Scatter3d(x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers", marker=marker,
+                               name="定日镜", hovertemplate="x %{x:.0f} m, y %{y:.0f} m<extra></extra>"))
+    th = np.linspace(0, 2 * np.pi, 40)
+    zt = np.array([0.0, cz - 0.5 * rec.height])
+    tr = rec.tower_radius
+    fig.add_trace(go.Surface(x=cx + tr * np.outer(np.sin(th), np.ones(2)), y=cy + tr * np.outer(np.cos(th), np.ones(2)),
+                             z=np.outer(np.ones_like(th), zt), showscale=False, colorscale=[[0, "#9aa7ad"], [1, "#9aa7ad"]],
+                             hoverinfo="skip", name="塔"))
+    zr = np.array([cz - 0.5 * rec.height, cz + 0.5 * rec.height])
+    fig.add_trace(go.Surface(x=cx + rec.radius * np.outer(np.sin(th), np.ones(2)),
+                             y=cy + rec.radius * np.outer(np.cos(th), np.ones(2)), z=np.outer(np.ones_like(th), zr),
+                             showscale=False, colorscale=[[0, AMBER], [1, AMBER]], hoverinfo="skip", name="吸热器"))
+    span = float(np.ptp(xyz[:, :2], axis=0).max()) if len(xyz) else 400.0
+    fig.update_layout(scene=dict(xaxis_title="东 x (m)", yaxis_title="北 y (m)", zaxis_title="z (m)",
+                                 aspectmode="manual", aspectratio=dict(x=1, y=1, z=max(0.25, 1.6 * cz / max(span, 1.0))),
+                                 camera=dict(eye=dict(x=-1.25, y=-1.55, z=0.75))),
+                      showlegend=False)
+    return _base_layout(fig, "", height)
+
+
+def receiver_3d(case: Case, grid: ReceiverGrid, flux_w_m2: np.ndarray, height: int = 420):
+    """Receiver cylinder coloured by incident flux (kW/m2)."""
+    rec = case.receiver
+    cx, cy, _ = rec.center
+    kw = np.asarray(flux_w_m2).reshape(grid.shape) / 1e3
+    az = np.radians(np.concatenate([grid.azimuth_deg, grid.azimuth_deg[:1] + 360.0]))
+    kw = np.hstack([kw, kw[:, :1]])
+    zz, aa = np.meshgrid(grid.z, az, indexing="ij")
+    fig = go.Figure(go.Surface(x=cx + rec.radius * np.sin(aa), y=cy + rec.radius * np.cos(aa), z=zz, surfacecolor=kw,
+                               colorscale=FLUX_SCALE, cmin=0, colorbar=dict(title="kW/m²", thickness=10),
+                               hovertemplate="%{surfacecolor:.0f} kW/m²<extra></extra>"))
+    fig.update_layout(scene=dict(xaxis_title="东 x", yaxis_title="北 y", zaxis_title="z (m)", aspectmode="data",
+                                 camera=dict(eye=dict(x=0.9, y=-1.7, z=0.35))))
+    return _base_layout(fig, "", height)
+
+
+def pareto_chart(rows: list[dict], selected: float | None = None, height: int = 380):
+    """Absorbed power vs CV_2D for the weights lambda (each point a certified plan)."""
+    fig = go.Figure()
+    cv = [r["cv_2d"] for r in rows]
+    pw = [r["power_abs_mw"] for r in rows]
+    lam = [r["lambda"] for r in rows]
+    gaps = [r.get("gap") for r in rows]
+    text = [f"λ = {l:g}" for l in lam]
+    hover = [f"λ = {l:g}<br>二维 CV {c:.3f}<br>吸收功率 {p:.3f} MW" + (f"<br>最优性差距 ≤ {g:.2%}" if g is not None else "")
+             for l, c, p, g in zip(lam, cv, pw, gaps)]
+    fig.add_trace(go.Scatter(x=cv, y=pw, mode="lines+markers+text", text=text, textposition="top right",
+                             line=dict(color=TEAL, width=2), marker=dict(size=9, color=TEAL, line=dict(color="white", width=1)),
+                             hovertext=hover, hoverinfo="text", name="已复核方案"))
+    if selected is not None and selected in lam:
+        j = lam.index(selected)
+        fig.add_trace(go.Scatter(x=[cv[j]], y=[pw[j]], mode="markers", marker=dict(size=16, color="rgba(0,0,0,0)",
+                                 line=dict(color=AMBER, width=3)), name="当前权重", hoverinfo="skip"))
+    fig.update_xaxes(title="考核区二维热流变异系数 CV（越小越均匀）", autorange="reversed")
+    fig.update_yaxes(title="吸收功率 (MWₜₕ)")
+    fig.update_layout(showlegend=False)
+    return _base_layout(fig, "", height)
+
+
+def bound_chart(history: list[dict], found_mw: float | None, height: int = 300):
+    """Upper bound vs iteration with the found objective."""
+    fig = go.Figure()
+    it = [h["iteration"] for h in history]
+    ub = [h["upper_bound_mw"] for h in history]
+    fig.add_trace(go.Scatter(x=it, y=ub, mode="lines", line=dict(color=NAVY, width=2), name="可证上界",
+                             hovertemplate="迭代 %{x}<br>上界 %{y:.4f} MW<extra></extra>"))
+    if found_mw is not None:
+        fig.add_hline(y=found_mw, line=dict(color=TEAL, width=2, dash="dash"),
+                      annotation_text=f"本方案 {found_mw:.4f} MW", annotation_position="bottom right")
+    fig.update_xaxes(title="对偶迭代次数")
+    fig.update_yaxes(title="目标函数 (MW)")
+    return _base_layout(fig, "", height)
+
+
+def potential_map_chart(case: Case, pmap, xyz: np.ndarray | None = None, values=None, label: str = "",
+                        title: str = "", height: int = 560):
+    """Annual energy of a lone heliostat over the site, with the layout on top."""
+    rec, spec = case.receiver, case.field
+    fig = go.Figure(go.Heatmap(x=pmap.x, y=pmap.y, z=np.where(pmap.inside, pmap.energy_mwh, np.nan),
+                               colorscale=[[0, "#f3f6f4"], [0.5, "#a9d6c6"], [1, "#1d6f62"]],
+                               colorbar=dict(title=dict(text="潜力<br>MWh/年", side="top"), thickness=10, x=1.0),
+                               hovertemplate="x %{x:.0f} m, y %{y:.0f} m<br>单镜年吸收潜力 %{z:.1f} MWh<extra></extra>",
+                               name="单镜年潜力"))
+    if spec.boundary is not None:
+        b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
+        fig.add_trace(go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", line=dict(color=INK, dash="dash", width=1),
+                                 name="场地边界", hoverinfo="skip"))
+    if spec.exclusion_radius > 0:
+        th = np.linspace(0, 2 * np.pi, 180)
+        fig.add_trace(go.Scatter(x=rec.center[0] + spec.exclusion_radius * np.sin(th),
+                                 y=rec.center[1] + spec.exclusion_radius * np.cos(th), mode="lines",
+                                 line=dict(color=RED, dash="dot", width=1), name="禁排区", hoverinfo="skip"))
+    if xyz is not None and len(xyz):
+        marker = dict(size=float(np.clip(110.0 / np.sqrt(len(xyz)), 3, 8)), line=dict(width=0.5, color="white"))
+        if values is not None:
+            marker.update(color=values, colorscale="YlOrBr", showscale=True,
+                          colorbar=dict(title=dict(text=label.replace("年均", "年均<br>"), side="top"), thickness=10, x=1.13))
+        else:
+            marker.update(color=AMBER)
+        fig.add_trace(go.Scattergl(x=xyz[:, 0], y=xyz[:, 1], mode="markers", marker=marker, name="定日镜",
+                                   hovertemplate="x %{x:.1f} m, y %{y:.1f} m<extra></extra>"))
+    fig.add_trace(go.Scatter(x=[rec.center[0]], y=[rec.center[1]], mode="markers", name="塔",
+                             marker=dict(symbol="triangle-up", size=14, color=RED), hoverinfo="skip"))
+    fig.update_xaxes(title="东向 x (m)", scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title="北向 y (m)")
+    return _base_layout(fig, title, height)
+
+
+def loss_waterfall(power_mw: dict, height: int = 330):
+    """Power chain from the sun to the receiver as a waterfall (MW)."""
+    names = {"sun": "镜面入射", "cosine": "余弦", "reflectivity": "反射/清洁", "shading": "阴影",
+             "blocking": "遮挡", "attenuation": "大气衰减", "intercept": "截断"}
+    keys = list(power_mw)
+    vals = [power_mw[keys[0]]] + [power_mw[k] - power_mw[p] for p, k in zip(keys[:-1], keys[1:])] + [power_mw[keys[-1]]]
+    fig = go.Figure(go.Waterfall(x=[names.get(keys[0], keys[0])] + [names.get(k, k) for k in keys[1:]] + ["到达吸热器"],
+                                 measure=["absolute"] + ["relative"] * (len(keys) - 1) + ["total"], y=vals,
+                                 decreasing=dict(marker=dict(color="#d98c7f")), totals=dict(marker=dict(color=TEAL)),
+                                 increasing=dict(marker=dict(color=TEAL)),
+                                 text=[f"{v:+.2f}" if i not in (0, len(vals) - 1) else f"{v:.2f}" for i, v in enumerate(vals)],
+                                 textposition="outside", hovertemplate="%{x}: %{y:.3f} MW<extra></extra>"))
+    fig.update_yaxes(title="功率 (MW)")
+    return _base_layout(fig, "", height)
+
+
+def history_chart(history, height: int = 300):
+    """Layout search: energy of every evaluated parameter vector and the running best."""
+    import pandas as pd
+
+    h = history.sort_values("evaluation") if isinstance(history, pd.DataFrame) else pd.DataFrame(history)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=h["evaluation"], y=h["energy_mwh"], mode="markers", marker=dict(size=6, color="#9fb7b0"),
+                             name="每次布局评价", hovertemplate="第 %{x} 次: %{y:.0f} MWh<extra></extra>"))
+    fig.add_trace(go.Scatter(x=h["evaluation"], y=h["energy_mwh"].cummax(), mode="lines", line=dict(color=TEAL, width=2),
+                             name="迄今最优"))
+    fig.update_xaxes(title="布局评价次数")
+    fig.update_yaxes(title="年吸收热量 (MWhₜₕ)")
+    return _base_layout(fig, "", height)

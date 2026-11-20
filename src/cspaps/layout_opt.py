@@ -182,6 +182,8 @@ class LayoutOptResult:
     review_samples: sun.Samples | None = None
     capacity: dict = dc_field(default_factory=dict)
     candidates: list[LayoutEval] = dc_field(default_factory=list, repr=False)  # reviewed layouts, search order
+    bound: dict = dc_field(default_factory=dict)  # certificate: upper bound on any layout's annual energy
+    potential: object | None = dc_field(default=None, repr=False)  # certify.PotentialMap of the site
 
     @property
     def field(self) -> Field:
@@ -218,8 +220,28 @@ class LayoutOptResult:
             "swaps": self.swaps,
             "validation": self.validation,
             "capacity": self.capacity,
+            "upper_bound": self.bound,
+            "existence": self.existence(),
             "runtime_s": round(self.runtime_s, 1),
         }
+
+    def existence(self) -> dict:
+        """What is proven about problem 2 for this site and N."""
+        b = self.bound or {}
+        cap = b.get("packing_capacity_bound")
+        n_req = self.validation.get("n_required")
+        if cap is not None and n_req and n_req > cap:
+            return {"optimum_exists": False,
+                    "statement": f"no layout exists: at most {cap} heliostats fit in the site with the minimum spacing "
+                                 "(Fejes Toth packing bound)"}
+        if self.validation.get("status") == "ok":
+            return {"optimum_exists": True,
+                    "statement": "a feasible layout was found; the set of feasible layouts is closed and bounded and "
+                                 "the annual energy is continuous in the positions, so a best layout exists",
+                    "found_mwh": b.get("found_energy_mwh"), "upper_bound_mwh": b.get("upper_bound_mwh"),
+                    "gap": b.get("gap")}
+        return {"optimum_exists": None, "statement": "no feasible layout with N heliostats was found and the packing "
+                                                     "bound does not exclude one"}
 
 
 def optimize_layout(
@@ -449,5 +471,21 @@ def optimize_layout(
                                f"{kind} generator; {validation['shortfall']} short of {spec.n_heliostats}"}
     if cancelled:
         validation["cancelled"] = True
+    bound, pmap = {}, None
+    if spec.upper_bound and spec.n_heliostats:
+        from .certify import layout_upper_bound, potential_map
+
+        say("certificate: lone-heliostat potential map and packing bound")
+        bound_samples = review_aps if use_aps else review_center
+        pmap = potential_map(case, bound_samples)
+        e_center = annual(case, Field(best.xyz), samples=bound_samples, aiming="center", with_flux=False,
+                          shading_points=spec.shading_points).summary()["absorbed_energy_mwh"]
+        bound = layout_upper_bound(case, spec.n_heliostats, dm, samples=bound_samples, pmap=pmap,
+                                   layout_xyz=best.xyz, found_energy_mwh=e_center)
+        bound["sampling"] = {"method": bound_samples.label, "n_states": len(bound_samples)}
+        bound["found_energy_basis"] = "centre aiming, shading and blocking, no flux limit (theoretical)"
+        if best.aps_energy_mwh is not None and use_aps and bound.get("upper_bound_mwh"):
+            bound["found_aps_feasible_mwh"] = float(best.aps_energy_mwh)
+            bound["gap_aps_feasible"] = max(0.0, 1.0 - best.aps_energy_mwh / bound["upper_bound_mwh"])
     return LayoutOptResult(best, history, ranking, samples, _time.perf_counter() - t0, validation, swaps,
-                           review_aps if use_aps else review_center, capacity, evals)
+                           review_aps if use_aps else review_center, capacity, evals, bound, pmap)

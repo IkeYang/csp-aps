@@ -693,7 +693,7 @@ def solve(
         info["hotspot_points_added"] = added
     uni = prob.case.uniformity
     if uni.enabled and method in ("greedy", "kfactor", "milp"):
-        from .uniformity import region_of_grid, solve_uniform, uniformity_metrics
+        from .uniformity import solve_uniform
 
         ures = solve_uniform(prob, choice, uni, prev_aim_xyz=prev_xyz, prev_active=prev_active)
         choice = ures.choice
@@ -709,30 +709,49 @@ def solve(
                 choice = ures.choice
                 check = prob.verify(choice)
                 r2 += 1
-        h_mask = region_of_grid(prob.case, prob.grid, uni)
-        absorbed = prob.flux(choice, basis="objective")[:prob.rs.n_grid] * prob.rs.grid.alpha[:prob.rs.n_grid]
-        h_power = float(absorbed[h_mask].sum() * prob.rs.grid.cell_area)
-        metrics = uniformity_metrics(prob.rs.grid.to_map(absorbed), prob.rs.grid.to_map(h_mask))
-        if h_power < max(uni.min_load_mw * 1e6, 1e-6):
-            uni_status = "below_min_load"
-        elif uni.mode == "weighted":
-            uni_status = "weighted"
-        else:
-            uni_status = "feasible" if metrics["cv_2d"] <= uni.max_cv + 1e-9 else "not_reached"
-        info.update({"uniformity_status": uni_status, "uniformity_mode": uni.mode,
-                     "uniformity_target_cv": uni.max_cv if uni.mode == "cv_limit" else None,
-                     "uniformity_weight": uni.weight if uni.mode == "weighted" else ures.mu,
-                     "cv_2d_H": round(metrics["cv_2d"], 4) if np.isfinite(metrics["cv_2d"]) else None,
-                     "cv_circ_H": round(metrics["cv_circ"], 4) if np.isfinite(metrics["cv_circ"]) else None,
-                     "cv_height_H": round(metrics["cv_height"], 4) if np.isfinite(metrics["cv_height"]) else None,
-                     "power_H_mw": round(h_power / 1e6, 4),
-                     "uniformity_met": uni_status in ("feasible", "weighted"),
-                     "uniformity_search_status": ures.status,
-                     "uniformity_search_s": round(ures.solve_time_s, 4)})
-    info["global_optimality_proven"] = bool(
-        method == "milp" and info.get("milp_status") == 0 and not uni.enabled)
-    info["solution_class"] = "global_optimum_on_candidate_set" if info["global_optimality_proven"] else "verified_feasible_heuristic"
-    if spec.verify:
+        info.update(uniformity_info(prob, choice, uni, ures))
+    return finalize(prob, method, choice, info, check, spec, t0)
+
+
+def uniformity_info(prob: AimProblem, choice: np.ndarray, uni, ures=None) -> dict:
+    """Uniformity metrics and status of a plan on the solver grid (region H, absorbed flux)."""
+    from .uniformity import region_of_grid, uniformity_metrics
+
+    h_mask = region_of_grid(prob.case, prob.grid, uni)
+    absorbed = prob.flux(choice, basis="objective")[:prob.rs.n_grid] * prob.rs.grid.alpha[:prob.rs.n_grid]
+    h_power = float(absorbed[h_mask].sum() * prob.rs.grid.cell_area)
+    metrics = uniformity_metrics(prob.rs.grid.to_map(absorbed), prob.rs.grid.to_map(h_mask))
+    if h_power < max(uni.min_load_mw * 1e6, 1e-6):
+        uni_status = "below_min_load"
+    elif uni.mode == "weighted":
+        uni_status = "weighted"
+    else:
+        uni_status = "feasible" if metrics["cv_2d"] <= uni.max_cv + 1e-9 else "not_reached"
+
+    def r4(v):
+        return round(v, 4) if np.isfinite(v) else None
+
+    out = {"uniformity_status": uni_status, "uniformity_mode": uni.mode,
+           "uniformity_target_cv": uni.max_cv if uni.mode == "cv_limit" else None,
+           "uniformity_weight": uni.weight if uni.mode == "weighted" else (ures.mu if ures is not None else None),
+           "cv_2d_H": r4(metrics["cv_2d"]), "cv_circ_H": r4(metrics["cv_circ"]),
+           "cv_height_H": r4(metrics["cv_height"]), "power_H_mw": round(h_power / 1e6, 4),
+           "uniformity_met": uni_status in ("feasible", "weighted")}
+    if ures is not None:
+        out.update({"uniformity_search_status": ures.status, "uniformity_search_s": round(ures.solve_time_s, 4)})
+    return out
+
+
+def finalize(prob: AimProblem, method: str, choice: np.ndarray, info: dict, check: FluxCheck | None,
+             spec: APSSpec, t0: float) -> AimResult:
+    """AimResult with status from the verified check (or the coarse peak when verification is off)."""
+    uni = prob.case.uniformity
+    info.setdefault("global_optimality_proven", bool(
+        method == "milp" and info.get("milp_status") == 0 and not uni.enabled))
+    if "solution_class" not in info:
+        info["solution_class"] = ("global_optimum_on_candidate_set" if info["global_optimality_proven"]
+                                  else "verified_feasible_heuristic")
+    if spec.verify and check is not None:
         status = _STATUS[check.status]
         peak_ratio = check.peak_ratio / max(check.allowed_ratio, 1e-12)
     else:

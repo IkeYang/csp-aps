@@ -57,6 +57,8 @@ def region_of_grid(case: Case, grid: ReceiverGrid, spec: UniformitySpec | None =
 
 # --------------------------------------------------------------------------- constrained APS
 
+WEIGHTED_MAX_PASSES = 25  # weighted mode: coordinate passes until no move (cap)
+
 @dataclass
 class UniformResult:
     choice: np.ndarray
@@ -164,16 +166,17 @@ def solve_uniform(prob, base_choice: np.ndarray, spec: UniformitySpec | None = N
     absorb_power = prob.absorbed_power
     order = np.argsort(-prob.sigma[:, prob.center_k], kind="stable")
 
-    def run(mu: float, start: np.ndarray) -> _State:
+    def run(mu: float, start: np.ndarray, passes: int | None = None) -> _State:
         st = _State(prob, h_mask, start)
-        _local_search(prob, st, mu, spec.passes, absorb_power, order, prev_aim_xyz, prev_active)
+        _local_search(prob, st, mu, spec.passes if passes is None else passes, absorb_power, order,
+                      prev_aim_xyz, prev_active)
         return st
 
     hist = []
     tried: list[_State] = []
 
-    def run_rec(mu: float, start: np.ndarray) -> _State:
-        st = run(mu, start)
+    def run_rec(mu: float, start: np.ndarray, passes: int | None = None) -> _State:
+        st = run(mu, start, passes)
         tried.append(st)
         hist.append({"mu": mu, "cv_2d": st.cv(), "power_abs_mw": _p_abs(st, absorb_power) / 1e6})
         return st
@@ -181,7 +184,8 @@ def solve_uniform(prob, base_choice: np.ndarray, spec: UniformitySpec | None = N
     weighted = spec.mode == "weighted" and max_cv is None
     if weighted:
         mu_best = float(spec.weight)
-        best = run_rec(mu_best, base_choice)
+        # a single fixed weight: run the coordinate search to a local optimum (it stops early)
+        best = run_rec(mu_best, base_choice, max(spec.passes, WEIGHTED_MAX_PASSES))
     else:
         st0 = run_rec(0.0, base_choice)
         if st0.cv() <= eps:

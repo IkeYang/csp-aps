@@ -64,6 +64,12 @@ def test_cli_tools(case_file, tmp_path):
     assert main(["soltrace-export", str(case_file), "--time", "2025-06-21 13:00", "--rays", "100", "--seeds", "1",
                  "--out", str(out)]) == 0
     assert main(["annual", str(case_file), "--method", "sun_bins", "--out", str(out)]) == 0
+    assert main(["aps", str(case_file), "--time", "2025-06-21 13:00", "--weight", "0.3", "--out", str(out)]) == 0
+    data = json.loads(next(_run_dir(out, "aps").glob("aps_*_greedy.json")).read_text())
+    assert data["certificate"]["status"] == "certified" and data["existence"]["optimum_exists"]
+    assert main(["pareto", str(case_file), "--time", "2025-06-21 13:00", "--lambdas", "0", "1", "--out", str(out)]) == 0
+    curve = json.loads((_run_dir(out, "pareto") / "pareto.json").read_text())["curve"]
+    assert curve[1]["cv_2d"] <= curve[0]["cv_2d"] and all(r["gap"] is not None for r in curve)
 
 
 def test_gui_walkthrough(monkeypatch):
@@ -79,21 +85,25 @@ def test_gui_walkthrough(monkeypatch):
     at.session_state["base_dir"] = str(ROOT)
     at.session_state["ver"] = 1
     at.run()
-    assert not at.exception
-    at.button(key="btn_rt").click().run()  # replay in the operations workspace
+    assert not at.exception  # overview page
+    at.radio(key="page").set_value("云影回放").run()
+    at.button(key="btn_rt").click().run()
     assert not at.exception and not at.error
     cards = " ".join(m.value for m in at.markdown)
     for label in ("指令状态", "最高通量（复核）", "距上限余量", "散焦镜数", "数据新鲜度"):
         assert label in cards
-    at.radio(key="page").set_value("布局规划").run()
+    at.radio(key="page").set_value("布局优化").run()
     at.button(key="btn_opt").click().run()
+    assert not at.exception
+    res = at.session_state["res_opt"]
+    ub = res["summary"]["upper_bound"]
+    assert ub["upper_bound_mwh"] >= ub["found_energy_mwh"] > 0 and res["summary"]["existence"]["optimum_exists"]
     at.button(key="apply_layout").click().run()
     chk = at.session_state["apply_check"]
     assert chk["导出镜数"] == chk["重新载入镜数"] == 120 and chk["编号与坐标逐项一致"]
-    at.radio(key="page").set_value("光学校验").run()
-    assert not at.exception
-    at.radio(key="page").set_value("运行记录").run()
-    assert not at.exception
+    for page in ("光学校验", "运行记录", "方法与理论", "参数设置", "总览"):
+        at.radio(key="page").set_value(page).run()
+        assert not at.exception, page
 
 
 def test_single_result_keeps_completed_objective(monkeypatch, tmp_path):
@@ -109,14 +119,21 @@ def test_single_result_keeps_completed_objective(monkeypatch, tmp_path):
     at.session_state["base_dir"] = str(ROOT)
     at.session_state["ver"] = 1
     at.run()
-    at.radio(key="ops_mode").set_value("单时刻（导入实测 / 预报 DNI）").run()
+    at.radio(key="page").set_value("瞄准优化").run()
     at.button(key="btn_single").click().run()
     assert not at.exception and not at.error
-    at.number_input(key="1:uniformity.weight").set_value(2.0).run()
+    cert = at.session_state["res_single"]["summary"]["certificate"]
+    assert cert["status"] == "certified" and cert["upper_bound_mw"] >= cert["objective_found_mw"]
+    at.slider(key="1:uniformity.weight").set_value(2.0).run()
     assert at.session_state["case_dict"]["uniformity"]["weight"] == 2.0
     assert any("均匀度目标 λ = 0.3" in c.value for c in at.caption)
-    at.radio(key="single_goal:1").set_value("cv_limit").run()
-    at.number_input(key="1:uniformity.max_cv").set_value(0.001).run()
+    at.text_input(key="pareto_lams").set_value("0, 0.5").run()
+    at.button(key="btn_pareto").click().run()
+    assert not at.exception
+    curve = at.session_state["res_pareto"]["summary"]["curve"]
+    assert [r["lambda"] for r in curve] == [0.0, 0.5] and curve[1]["cv_2d"] <= curve[0]["cv_2d"]
+    at.radio(key="aps_goal:1").set_value("cv_limit").run()
+    at.number_input(key="1:uniformity.max_cv").set_value(0.01).run()
     at.button(key="btn_single").click().run()
     assert not at.exception
     assert at.session_state["res_single"]["summary"]["status"] == "uniformity_infeasible"

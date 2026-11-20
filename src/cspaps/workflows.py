@@ -20,6 +20,7 @@ import pandas as pd
 
 from . import __version__, sun
 from .aps import build_problem, optimize_aims, solve, solve_greedy
+from .certify import improve_and_certify
 from .clouds import load_dni_map
 from .config import Case
 from .engine import APSEngine, request_from_dict, response_to_dict
@@ -164,24 +165,44 @@ def task_aim(
     forecast_dni_map: str | Path | None = None,
     prev_aims: str | Path | None = None,
     tag: str = "aps",
+    certify: bool | None = None,
+    progress: Progress | None = None,
+    dni_source: str = "site",
 ) -> dict:
-    """Single instant: optimise aim points and evaluate them (status = verified flux check)."""
+    """Single instant: optimise aim points and evaluate them (status = verified flux check).
+
+    With ``certify`` (default ``aps.certify``) the plan is improved by relaxation
+    rounding and an upper bound on the optimum is attached (``summary["certificate"]``).
+    """
     t_start = _time.perf_counter()
     out = out_dir(base, case, tag)
     fld = build_field(case)
     method = method or case.aps.method
     ts, el, az, dni_model = sun_state(case, time)
     dni_v = load_dni_map(dni_map, fld.xyz) if dni_map else (dni_model if dni is None else float(dni))
+    if dni_source == "cloud" and not dni_map:
+        from .clouds import cloud_dni_snapshot
+
+        dni_v = cloud_dni_snapshot(case, fld, ts, float(np.mean(dni_v)))
     dni_con = load_dni_map(forecast_dni_map, fld.xyz) if forecast_dni_map else None
     prev, prev_active = read_aims_csv(prev_aims, fld) if prev_aims else (None, None)
     grid = build_grid(case.receiver)
+    cert = None
+    do_certify = case.aps.certify if certify is None else certify
     if method == "center":
         from .receiver import default_aim
 
         aim, active, res = default_aim(case.receiver, fld.xyz), np.ones(fld.n, bool), None
     else:
-        res = optimize_aims(case, fld, el, az, dni_v, dni_constraint=dni_con, method=method, grid=grid,
-                            prev=prev, prev_active=prev_active)
+        t_solve = _time.perf_counter()
+        prob = build_problem(case, fld, el, az, dni_v, dni_con, grid=grid)
+        res = solve(prob, method, case.aps, prev, prev_active)
+        if do_certify and method in ("greedy", "kfactor", "milp") and fld.n:
+            if progress:
+                progress("certifying: upper bound and relaxation rounding")
+            res, cert = improve_and_certify(prob, res, case.aps, rounds=case.aps.certify_rounds,
+                                            time_limit_s=case.aps.certify_time_s, prev=prev, prev_active=prev_active)
+        res.solve_time_s = _time.perf_counter() - t_solve
         aim, active = res.aim, res.active
     snap = evaluate(case, fld, el, az, dni_v, aim=aim, active=active, grid=grid, time=ts)
     chk_con = res.check if res is not None and res.check is not None else snap.verify(case.receiver)
@@ -206,6 +227,12 @@ def task_aim(
     summary = {"status": status, "aps": res.summary() if res is not None else {"method": "center"},
                "flux_check": check_summary, **snap.summary(), **_dropped_note(fld)}
     summary["aps"].pop("flux_check", None)
+    summary["aps"].pop("certificate", None)
+    if cert is not None:
+        summary["certificate"] = {k: v for k, v in cert.items() if k != "history"}
+        summary["existence"] = existence_statement_aps(case, cert)
+        files["bound_csv"] = out / f"{tag}_{stamp}_bound_history.csv"
+        pd.DataFrame(cert["history"]).to_csv(files["bound_csv"], index=False)
     _json(files["summary_json"], summary)
     plot_flux_map(snap.flux, grid, case.receiver, files["flux_png"], aims=aim, hotspot=chk_con,
                   title=f"{ts:%Y-%m-%d %H:%M}  {method}  [{status}]  verified peak {chk_con.peak_flux_kw_m2:.0f} kW/m², "
@@ -214,9 +241,68 @@ def task_aim(
                 label="Optical efficiency", boundary=case.field.boundary,
                 title=f"Heliostat optical efficiency, {ts:%Y-%m-%d %H:%M}")
     finish(out, tag, summary, {"time": str(time), "method": method, "dni": dni, "dni_map": dni_map,
-                               "forecast_dni_map": forecast_dni_map, "prev_aims": prev_aims}, t_start)
+                               "forecast_dni_map": forecast_dni_map, "prev_aims": prev_aims,
+                               "dni_source": dni_source, "certify": cert is not None}, t_start)
     return {"summary": _clean(summary), "files": files, "snapshot": snap, "aim_result": res, "field": fld,
-            "check": chk_con, "run_dir": out}
+            "check": chk_con, "run_dir": out, "certificate": cert}
+
+
+def existence_statement_aps(case: Case, cert: dict) -> dict:
+    """Plain statement of what is proven about problem 1 for this instant."""
+    mode = cert["mode"]
+    if cert["status"] == "certified_infeasible":
+        return {"optimum_exists": False, "statement": "no plan meets the CV target and the minimum load "
+                "under the flux limits (the Lagrangian bound is negative)"}
+    statement = ("finite candidate set and the all-defocused plan meets every flux limit, so an optimum exists"
+                 if mode in ("power", "weighted") else
+                 "finite candidate set; an optimum exists because a plan meeting the CV target was found")
+    if mode == "cv_limit" and cert.get("objective_found_mw") is None:
+        return {"optimum_exists": None, "statement": "no plan meeting the CV target was found; the bound did not "
+                "prove infeasibility either"}
+    return {"optimum_exists": True, "statement": statement,
+            "found_mw": cert.get("objective_found_mw"), "upper_bound_mw": cert.get("upper_bound_mw"),
+            "gap": cert.get("gap")}
+
+
+def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str | Path | None = None,
+                certify: bool = True, progress: Progress | None = None, dni_source: str = "site") -> dict:
+    """Power vs uniformity trade-off over the weight lambda at one instant (fixed field and DNI)."""
+    from .certify import pareto_front
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "pareto")
+    fld = build_field(case)
+    ts, el, az, dni_model = sun_state(case, time)
+    dni_v = load_dni_map(dni_map, fld.xyz) if dni_map else dni_model
+    if dni_source == "cloud" and not dni_map:
+        from .clouds import cloud_dni_snapshot
+
+        dni_v = cloud_dni_snapshot(case, fld, ts, float(dni_model))
+    grid = build_grid(case.receiver)
+    base_case = case.copy()
+    base_case.uniformity.enabled = False
+    prob = build_problem(base_case, fld, el, az, dni_v, grid=grid)
+    base_choice, _ = solve_greedy(prob, case.aps)
+    prob.rs.case = case
+    lambdas = list(lambdas) if lambdas is not None else [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+    rows = []
+    for j, lam in enumerate(sorted(lambdas)):
+        if progress:
+            progress(f"weight {j + 1}/{len(lambdas)}: lambda = {lam:g}")
+        rows += pareto_front(prob, [lam], base_choice if not rows else rows[-1]["choice"], case.uniformity,
+                             certify=certify)
+        prob.rs.case = case
+    for r in rows:
+        r.pop("choice", None)
+    files = {"summary_json": out / "pareto.json", "curve_csv": out / "pareto_curve.csv"}
+    pd.DataFrame(rows).to_csv(files["curve_csv"], index=False)
+    summary = {"time": ts.isoformat(), "dni_mean_w_m2": float(np.mean(dni_v)), "n_heliostats": fld.n,
+               "region_H": {"panels": case.uniformity.panels, "z_range": case.uniformity.z_range},
+               "curve": rows}
+    _json(files["summary_json"], summary)
+    finish(out, "pareto", summary, {"time": str(time), "lambdas": lambdas, "dni_map": dni_map,
+                                    "dni_source": dni_source}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out}
 
 
 def task_realtime(case: Case, base: str | Path, progress: Progress | None = None) -> dict:
@@ -318,6 +404,10 @@ def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None
                 label="Annual optical efficiency", boundary=case.field.boundary,
                 exclusion=case.field.exclusion_radius, title=f"Optimised layout, N = {fld.n} [{res.status}]")
     plot_history(res.history, files["history_png"])
+    if res.potential is not None:
+        files["potential_npz"] = out / "site_potential.npz"
+        np.savez_compressed(files["potential_npz"], x=res.potential.x, y=res.potential.y,
+                            energy_mwh=res.potential.energy_mwh, cell_m=res.potential.cell_m)
     new_case = case.copy()
     new_case.field.layout_file = files["layout_csv"].name
     new_case.field.generator = None

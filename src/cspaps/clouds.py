@@ -122,6 +122,13 @@ def cloud_field(case: Case, fld: Field, t0: pd.Timestamp) -> CloudField:
     return CloudField(clouds, t0)
 
 
+def cloud_dni_snapshot(case: Case, fld: Field, t, dni_clear: float) -> np.ndarray:
+    """Per-heliostat DNI at time t under the case's cloud scenario (clouds half-way through the replay window)."""
+    t = pd.Timestamp(t)
+    cf = cloud_field(case, fld, t - pd.Timedelta(seconds=0.5 * case.realtime.duration_min * 60.0))
+    return cf.dni(fld.xyz[:, :2], t, dni_clear)
+
+
 def load_dni_map(path, xy: np.ndarray) -> np.ndarray:
     """Per-heliostat DNI from a CSV of measurements with columns x,y,dni (linear, nearest outside)."""
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator

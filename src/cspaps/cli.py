@@ -54,6 +54,18 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--dni-map", default=None, help="CSV x,y,dni: measured DNI at the heliostats")
         sp.add_argument("--forecast-dni-map", default=None, help="CSV x,y,dni: highest DNI expected before the next update")
         sp.add_argument("--prev-aims", default=None, help="aims CSV of the last executed plan (matched by id)")
+        if name == "aps":
+            sp.add_argument("--no-certify", action="store_true",
+                            help="skip the optimality certificate (upper bound and relaxation rounding)")
+            sp.add_argument("--weight", type=float, default=None,
+                            help="uniformity weight lambda: maximise P_abs - lambda * A_H * std_H (enables uniformity)")
+            sp.add_argument("--max-cv", type=float, default=None,
+                            help="maximise P_abs subject to CV_2D <= this value (enables uniformity)")
+    sp = add("pareto", "power vs uniformity trade-off over the weight lambda (with optimality gaps)")
+    sp.add_argument("--time", required=True)
+    sp.add_argument("--lambdas", type=float, nargs="*", default=None)
+    sp.add_argument("--dni-map", default=None)
+    sp.add_argument("--no-certify", action="store_true")
     add("realtime", "replay real-time APS under cloud shadows (scenario from the case)")
     sp = add("annual", "annual energy on the receiver")
     sp.add_argument("--method", choices=["sun_bins", "sun_grid", "representative_days", "hourly"], default=None)
@@ -90,7 +102,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "gui":
         app = Path(__file__).with_name("gui_app.py")
-        cmd = [sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port), "--"]
+        cmd = [sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
+               "--theme.base", "light", "--theme.primaryColor", "#14806f", "--theme.backgroundColor", "#f4f6f6",
+               "--theme.secondaryBackgroundColor", "#eef2f1", "--theme.textColor", "#16232b",
+               "--browser.gatherUsageStats", "false", "--"]
         if args.case:
             cmd += ["--case", str(Path(args.case).resolve())]
         return subprocess.call(cmd)
@@ -103,8 +118,19 @@ def main(argv: list[str] | None = None) -> int:
         res = wf.task_layout(case, out)
     elif args.command in ("snapshot", "aps"):
         method = args.method or ("center" if args.command == "snapshot" else case.aps.method)
+        certify = None
+        if args.command == "aps":
+            if args.weight is not None:
+                case.uniformity.enabled, case.uniformity.mode, case.uniformity.weight = True, "weighted", args.weight
+            if args.max_cv is not None:
+                case.uniformity.enabled, case.uniformity.mode, case.uniformity.max_cv = True, "cv_limit", args.max_cv
+            certify = False if args.no_certify else None
         res = wf.task_aim(case, out, args.time, method=method, dni=args.dni, dni_map=args.dni_map,
-                          forecast_dni_map=args.forecast_dni_map, prev_aims=args.prev_aims, tag=args.command)
+                          forecast_dni_map=args.forecast_dni_map, prev_aims=args.prev_aims, tag=args.command,
+                          certify=certify, progress=_progress)
+    elif args.command == "pareto":
+        res = wf.task_pareto(case, out, args.time, lambdas=args.lambdas, dni_map=args.dni_map,
+                             certify=not args.no_certify, progress=_progress)
     elif args.command == "realtime":
         res = wf.task_realtime(case, out, progress=_progress)
     elif args.command == "annual":

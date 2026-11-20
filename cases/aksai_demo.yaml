@@ -129,29 +129,30 @@ annual:
 
 layout_opt:
   generator: radial_staggered
-  n_heliostats: 40
+  n_heliostats: 473
   bounds:
-    radial_spacing: [0.866, 1.25]
-    radial_growth: [0.0, 0.6]
-    azimuthal_spacing: [1.0, 1.5]
+    radial_spacing: [0.866, 1.4]
+    radial_growth: [0.0, 1.0]
+    azimuthal_spacing: [1.0, 1.8]
   fixed:
     spacing_factor: 1.1
   search_sampling: sun_bins
-  search_aiming: auto
-  n_sun_bins: 4
+  search_aiming: center
+  n_sun_bins: 12
   review_sampling: sun_bins
-  review_n_sun_bins: 3
-  review_dni_bands: 2
+  review_n_sun_bins: 6
+  review_dni_bands: 1
   review_check_hourly: false
-  maxiter: 1
-  popsize: 2
+  maxiter: 4
+  popsize: 4
   seed: 7
   workers: 1
-  polish_rounds: 1
+  polish_rounds: 2
   refine_top: 2
   swap_rounds: 1
   swap_fraction: 0.02
   shading_points: 4
+  upper_bound: true
 
 mcrt:
   rays_per_heliostat: 300
