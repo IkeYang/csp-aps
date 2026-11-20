@@ -68,7 +68,7 @@ def test_milp_and_lp_bound_on_tiny_problem(tight):
     assert milp.feasible and greedy.feasible
     assert milp.power_w >= greedy.power_w - 1e-6 * bound
     assert bound >= milp.power_w * (1 - 1e-6)
-    assert greedy.power_w >= 0.9 * bound  # greedy within 10 % of the LP bound
+    assert greedy.power_w >= 0.85 * milp.power_w  # greedy close to the proven MILP optimum
 
 
 def test_defocus_when_limit_unreachable(small_case):

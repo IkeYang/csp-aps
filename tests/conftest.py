@@ -19,6 +19,7 @@ def small_case_dict() -> dict:
             "exclusion_radius": 40,
         },
         "shading": {"n_points": 6},
+        "aps": {"auto_grid": False},  # keep the tests fast; verification still guards feasibility
         "annual": {"time_step_min": 120, "n_sun_bins": 12},
         "realtime": {"start": "2025-06-21 12:30", "duration_min": 3, "step_s": 60,
                      "random_clouds": {"n": 2, "seed": 1, "radius_m": [40, 60], "speed_m_s": 6}},

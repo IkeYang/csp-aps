@@ -2,14 +2,19 @@
 
 光热塔式电站（圆柱外置集热器）**镜场自动布置**与**实时瞄准点策略（APS）**优化软件。自用、非商业。
 
-输入镜场最大范围、集热器尺寸和中心点坐标、定日镜尺寸，软件计算各项光学损失，给出：
+已按导师评审稿（2026-11-20，基线 0d9292d）逐条落实，对应关系见 [docs/REVIEW_RESPONSE.md](docs/REVIEW_RESPONSE.md)；模型细节见 [docs/MODEL.md](docs/MODEL.md)。
 
-- **内层 APS（实时控制引擎）**：在当前太阳位置和每面镜子的实际 DNI（含云影）下，算出每面镜子在圆柱集热器上的瞄准点，使接收功率最大，同时不超过通量上限、受热尽量均匀。秒级求解，支持 DNI 预报、瞄准点平滑和散焦。
-- **外层布置优化（离线规划引擎）**：在场地边界内用参数化布局（径向交错 / 仿生螺旋）生成候选位置，按全年能量选出指定数量的镜子，用差分进化做全局寻优，最后对前几名方案用完整 APS 精算全年能量。
-- **全年能量**：用 20–40 个代表太阳位置做加权积分（误差 < 0.5%），也可以逐时或用代表日计算。
-- **MCRT 离线校验**：独立的蒙特卡洛光线追迹，用来检验解析模型的精度。
+## 能做什么
 
-模型细节见 [docs/MODEL.md](docs/MODEL.md)。
+| 模块 | 内容 |
+| --- | --- |
+| 在线 APS 控制引擎 | 每个控制周期输入时刻、逐镜实测 DNI、带有效时刻的预报快照、镜子可用状态、上一轮执行回执，输出每面镜子的瞄准坐标、散焦状态、方案有效时段和复核结果。<br>• 按管屏的通量上限<br>• 安全裕度、预报裕度<br>• 数据过期 / 缺失时回退<br>• 瞄准点平滑、可达性筛选<br>• 光斑响应缓存与热启动（热路径约 0.4 s / 1500 面镜） |
+| 可行性复核 | 每个方案都在自适应细网格上用完整光斑复核：超限热点自动加入约束重解，仍不行就明确给出"不可执行"状态及热点位置、所在管屏、超限量、主要贡献镜 |
+| 均匀受热 | 预热器考核区的二维 / 周向 / 高度 CV；在 CV ≤ ε 约束下最大化吸收功率；ε 扫描曲线；上下边缘功率上界（证明某些目标不可达）；小规模问题可用 SCIP 求精确最优 |
+| 云影回放 | 随机云、云边扫过、云突然移开、DNI 延迟 / 丢失。对比不做 APS、只用当前 DNI、带预报三种策略：能量、超限时长（按区间统计）、端到端延迟 P50/P95、回退次数 |
+| 全年能量 | 20 / 30 / 40 个 DNI 加权代表太阳位置（误差 < 0.5%）、高度角 × 方位角分箱、逐时；受限 APS 时按 DNI 分档；可读 EPW/CSV 气象文件；多进程并行 |
+| 外层布置优化 | 径向交错 / 仿生螺旋参数化布局 → 差分进化 + 局部微调 → 前几名方案用受限 APS 复核并重新排名 → 换位微调 → 镜数、边界、禁排区、最小镜距最终校验（布不满时报告缺额） |
+| 光学校验 | 内部 MCRT：独立误差项、多随机种子的统计不确定度、光线数收敛表。SolTrace 对标：导出同场算例和 PySolTrace 驱动脚本。遮挡筛选：与暴力求交逐镜比对 |
 
 ## 安装
 
@@ -18,190 +23,100 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[gui]"
+pip install -e ".[gui,exact]"
 ```
 
-开发（含测试）用 `pip install -e ".[dev]"`。
+`gui` 安装 Streamlit 和 plotly；`exact` 安装 SCIP（用于小规模精确基准，可选）。开发和测试用 `pip install -e ".[dev]"`。
 
 ## 使用
 
 ### 图形界面
 
 ```bash
-cspaps gui
+cspaps gui [cases/example.yaml]
 ```
 
-浏览器会自动打开本地页面，各标签页的内容：
-
-| 标签页 | 内容 |
+| 工作区 | 内容 |
 | --- | --- |
-| 参数设置 | 全部输入参数；可上传镜场坐标 CSV、气象文件；可载入或保存算例 YAML |
-| 镜场布置 | 生成镜场布置图 |
-| 瞄准优化 APS | 选择日期、时刻和方法，算出瞄准点、效率分解、通量图；可上传实测 DNI 分布 |
-| 云影实时仿真 | 移动云影下三种策略的对比 |
-| 全年能量 | 全年能量与年均效率 |
-| 布置优化 | 外层优化；可一键把优化结果设为当前镜场 |
-| MCRT 校验 | 解析模型与光线追迹的对比 |
-| 代表太阳位置 | 全年代表太阳位置及其误差 |
-
-所有结果都可以在页面上下载，同时保存在 `results/gui/`。
+| 运行调度 | 首屏状态卡：时间戳、数据来源与新鲜度、策略、截获 / 吸收功率、最高通量及所在管屏、距上限余量、散焦镜数、指令状态（待复核 / 不可执行 / 已回退 / 已执行），窄窗下自动换行。<br>• 镜场 DNI 图、接收器展开图、时间轴在同一页，拖动时间轴同步更新<br>• 点击镜子看 ID、DNI、原瞄准点、计划瞄准点、散焦原因<br>• 点击接收器看该点的限值和主要贡献镜<br>• 可回放，也可导入实测 / 预报 DNI 和上一轮瞄准点 |
+| 布局规划 | 依次为：① 场地与设备（场地图标注边界、禁排区、塔位、镜位）② 气象与采样 ③ 计算（可看进度、可取消）④ 方案对比：同一表格比较各方案的镜数、全年能量、峰值、采样误差、复核方式；应用前预览，应用后自动核对镜数、编号和坐标；导出布局与参数；对比两个方案的功率–均匀度曲线 |
+| 光学校验 | 解析 / 追迹 / 差值三图（同一网格、同一色标），附引擎、光线数、种子和统计不确定度；SolTrace 对标导出；遮挡筛选复核 |
+| 全部参数 / 运行记录 | 全部参数表单与 YAML 编辑；每次运行的独立记录，可回看结果，也可载入当时的输入 |
 
 ### 命令行
 
 ```bash
-cspaps layout          cases/example.yaml                              # 生成镜场
-cspaps snapshot        cases/example.yaml --time "2025-06-21 13:40"    # 单一时刻：效率分解 + 通量图（中心瞄准）
-cspaps aps             cases/example.yaml --time "2025-06-21 13:40"    # 单一时刻：APS 瞄准点
-cspaps realtime        cases/example.yaml                              # 云影下的实时 APS 仿真
-cspaps annual          cases/example.yaml [--method hourly] [--aiming greedy]
-cspaps optimize-layout cases/example.yaml                              # 镜场布置优化
-cspaps validate        cases/example.yaml --time "2025-06-21 13:40" --rays 3000   # MCRT 校验
-cspaps sunbins         cases/example.yaml --check                      # 代表太阳位置及其误差
+cspaps layout          CASE                          # 生成镜场
+cspaps snapshot        CASE --time "2025-06-21 13:40"  # 单时刻，中心瞄准
+cspaps aps             CASE --time ... [--dni-map now.csv --forecast-dni-map max.csv --prev-aims last.csv]
+cspaps realtime        CASE                          # 云影回放（场景、延迟、丢失在 YAML 中设置）
+cspaps annual          CASE [--method sun_bins|sun_grid|hourly|representative_days] [--aiming center|greedy]
+cspaps optimize-layout CASE                          # 布置优化 + 受限复核
+cspaps uniformity      CASE --time ... [--eps 0.7 0.6 0.5] [--exact]
+cspaps validate        CASE --time ... [--rays 3000 --seeds 3 --convergence 500 1000 2000]
+cspaps soltrace-export CASE --time ...               # SolTrace 对标算例与驱动脚本
+cspaps shading-check   CASE                          # 遮挡筛选与暴力求交对比
+cspaps sunbins         CASE --check                  # 代表点误差：20/30/40 个及分箱，相对逐时
+cspaps engine          CASE                          # 在线引擎：标准输入 / 输出的 JSON 行服务
 ```
 
-时间按算例中的 `site.timezone` 解释为当地时间。结果写在 `results/<算例名>/`，包括 JSON 汇总、CSV 明细和 PNG 图。
-
-### 输入
-
-所有参数都在一个 YAML 文件里，`cases/example.yaml` 有全部参数和中文注释（虚构的测试参数，不对应任何真实电站）。拼错的参数名会直接报错，不会被悄悄忽略。
-
-| 段 | 内容 |
-| --- | --- |
-| `site` | 经纬度、海拔、时区 |
-| `receiver` | 圆柱集热器中心点、直径、高度、允许最大通量、通量网格、塔身直径 |
-| `heliostat` | 镜子尺寸、旋转中心高度、反射率、清洁度、斜率误差、跟踪误差、聚焦方式 |
-| `sun` / `atmosphere` / `weather` | 太阳形状、晴空 DNI 模型；大气衰减模型；气象文件（EPW 或 CSV） |
-| `shading` | 阴影遮挡的采样精度、塔影 |
-| `field` | 场地边界多边形、禁排半径、布置生成器参数，或直接给镜场坐标 CSV |
-| `aps` | 求解方法、安全裕度、候选瞄准点、移动惩罚、散焦 |
-| `realtime` | 实时仿真时段、刷新周期、预报时长、云影 |
-| `annual` | 全年计算方式、代表太阳位置数 |
-| `layout_opt` | 镜子数量、被优化的参数及范围、进化代数、并行进程数 |
-| `mcrt` | 光线数 |
-
-外部数据文件：
-
-| 文件 | 格式 | 用途 |
-| --- | --- | --- |
-| 镜场坐标 | CSV，表头 `x,y` 或 `x,y,z` | `field.layout_file` |
-| 气象数据 | EPW，或 CSV 表头 `time,dni`（当地时间） | `weather.file`，用于全年计算 |
-| 实测 / 预报 DNI 分布 | CSV，表头 `x,y,dni` | `aps --dni-map` / `--forecast-dni-map`，插值到每面镜子 |
-| 瞄准点 | `aps` 命令输出的 `*_aims.csv` | 下一周期的 `--prev-aims`（平滑移动） |
+- 每次运行写入 `results/<算例>/<任务>_<时间>/`，其中保存当时的输入（`inputs_case.yaml`）、`run.json` 和全部结果。
+- 结果"不可执行"或布局校验不通过时，命令行退出码为 2。
 
 ### 接入电站控制循环
 
-每个刷新周期调用一次：
-
-```bash
-cspaps aps plant.yaml --time "2025-06-21 13:40" \
-    --dni-map dni_now.csv --forecast-dni-map dni_max_next_2min.csv --prev-aims last_aims.csv
-```
-
-输出 `*_aims.csv`，每面镜子一行：`id, x, y, z, active, aim_azimuth_deg, aim_z, aim_x, aim_y`，以及各项效率、DNI 和功率。其中 `aim_x, aim_y, aim_z` 是瞄准点在集热器表面上的三维坐标，`active = 0` 表示散焦。
-
-也可以在 Python 里直接调用：
+**Python 接口**：
 
 ```python
 from cspaps import load_case
 from cspaps.field import build_field
-from cspaps.aps import optimize_aims
+from cspaps.engine import APSEngine, ControlRequest, ForecastSnapshot, Receipt
 
 case = load_case("plant.yaml")
-field = build_field(case)
-res = optimize_aims(case, field, sun_elevation, sun_azimuth,
-                    dni=dni_per_heliostat,                 # 当前 DNI（每面镜子）
-                    dni_constraint=dni_forecast_max,       # 预报时段内的最大 DNI
-                    prev=last.aim, prev_active=last.active)
-aim_azimuth, aim_z = res.aim                               # 集热器方位角 (°) 与高度 (m)
+engine = APSEngine(case, build_field(case))
+resp = engine.step(ControlRequest(
+    time=now, dni=dni_per_heliostat, dni_time=t_meas,
+    forecasts=[ForecastSnapshot(t, dni_t) for t, dni_t in forecast],
+    available=in_service, receipt=Receipt(last.plan_id, last.aim_azimuth, last.aim_z, last.active)))
+resp.state            # "ready" | "fallback" | "infeasible"
+resp.to_frame()       # id, active, aim_azimuth_deg, aim_z, aim_x, aim_y, defocus_reason
 ```
+
+**JSON 行服务**：`cspaps engine plant.yaml`。每行一个请求，DNI 可以用列表（按镜场顺序）或 `{"镜子ID": dni}`。场站的安全联锁独立于 APS，保持不变。
+
+### 输入
+
+全部参数都在一个 YAML 文件里，`cases/example.yaml` 列出了每个参数并附中文注释（虚构的测试参数）。拼错的参数名会直接报错。
+
+| 段 | 内容 |
+| --- | --- |
+| `site` / `sun` / `atmosphere` / `weather` | 站址、太阳形状与晴空 DNI、大气衰减、气象文件 |
+| `receiver` | 圆柱集热器；管屏数、各管屏允许通量、吸收率、限值口径（入射 / 吸收）、实测 / 模型偏差系数、高度分布系数 |
+| `heliostat` | 尺寸、反射率、清洁度、坡度误差、跟踪误差、镜面散射、聚焦方式 |
+| `field` | 场地边界、禁排半径、布置生成器，或镜场坐标 CSV（`id,x,y,z`） |
+| `aps` / `uniformity` / `engine` | 瞄准求解与复核；预热器考核区、ε、最低负荷；在线引擎周期、延迟、数据年龄、预报裕度、回退策略、转速 |
+| `realtime` | 回放场景、时长、步长、预报、DNI 延迟 / 丢失 |
+| `annual` / `layout_opt` | 全年采样（代表点数、分箱、DNI 分档、并行）；布置优化（镜数、参数范围、搜索与复核采样、换位、校验） |
+| `mcrt` | 光线数、种子数、跟踪误差模式 |
 
 ## 示例结果
 
-以下结果来自 `cases/example.yaml`，是虚构的测试参数：北纬 40°，海拔 1200 m，晴空 DNI；集热器直径 7 m、高 8 m，中心高 100 m，通量上限 1000 kW/m²；1532 面 8×8 m 定日镜。在 4 核机器上运行。
-
-### 内层 APS：单一时刻（夏至 13:40）
-
-| 方法 | 集热器功率 (MW) | 峰值通量 (kW/m²) | 周向不均匀度 (CV) | 求解时间 |
-| --- | --- | --- | --- | --- |
-| 全部瞄准中心 | 69.13 | 1191（超限） | 0.197 | — |
-| k 因子法 | 68.98 | 949 | 0.197 | 0.3 s |
-| 贪心法（默认） | 69.03 | 882 | 0.144 | 1.1 s |
-
-求解前需要预计算候选点的光斑，约 1.8 s。贪心法只损失 0.15% 的功率，就把峰值从 1191 降到 882 kW/m²（允许值为 950，即上限扣除 5% 安全裕度），周向也更均匀。
-
-### 云影下的实时运行（20 分钟，每 60 s 刷新，4 朵随机云）
-
-| 策略 | 20 分钟能量 (MWh) | 最大峰值通量 (kW/m²) | 超限时长 | 平均每次调整的镜子数 | 平均求解时间 |
-| --- | --- | --- | --- | --- | --- |
-| 不做 APS | 23.19 | 1198 | 21 分钟 | 0 | — |
-| APS，只用当前 DNI | 23.15 | 1061 | 1 分钟 | 242 | 3.0 s |
-| APS + DNI 预报 | 23.15 | 879 | 0 | 152 | 3.0 s |
-
-只用当前 DNI 的 APS 在云移走、DNI 回升的那一刻会超通量；加入预报后不再超限，能量不变，调整的镜子还更少。
-
-### 全年能量
-
-30 个代表太阳位置，计算约 3.5 s：
-
-| 损失环节 | 余弦 | 反射率×清洁度 | 阴影 | 遮挡 | 大气衰减 | 截断 | 总光学效率 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 年均效率 | 0.773 | 0.912 | 0.970 | 0.994 | 0.961 | 0.956 | 0.624 |
-
-| 计算方式 | 年能量 (MWh) | 超通量小时 |
-| --- | --- | --- |
-| 逐时全年（基准，约 3.5 分钟） | 206,420 | — |
-| 30 个代表太阳位置，中心瞄准 | 207,252（+0.40%） | 2537 |
-| 30 个代表太阳位置，每个时刻做 APS（97 s） | 206,923 | 0 |
-
-### 外层布置优化（固定 1200 面镜子）
-
-- 差分进化 6 代，加 4 轮局部微调，共 134 次布局评价，用时 136 s（4 进程）。
-- 优化后全年能量 173,850 MWh（中心瞄准），比示例原布置参数（同样选 1200 面）的 171,185 MWh 高 1.6%。
-- 用 APS 精算的全年能量为 173,494 MWh。
-- 输出的 `case_optimized.yaml` 可以直接作为新算例使用。
-
-### MCRT 校验（每面镜子 3000 条光线，约 5–10 s）
-
-| 时刻 | 接收功率差 | 截断效率差 | 遮挡效率差 | 峰值通量（解析 / MCRT） | 通量图相关系数 |
-| --- | --- | --- | --- | --- | --- |
-| 夏至 13:40，中心瞄准 | −0.95% | −0.008 | −0.001 | 1191 / 1208 | 0.999 |
-| 春分 10:00，APS 瞄准 | −0.65% | −0.005 | −0.001 | 708 / 758 | 0.998 |
-
-余弦、反射和衰减与 MCRT 完全一致。解析模型的截断效率略偏保守（低 0.5–0.8%），这是 HFLCAL 圆高斯近似带来的。
+RESULTS_PLACEHOLDER
 
 ## 开发
 
 ```bash
 pip install -e ".[dev]"
-pytest -q
+pytest -q        # 约 5 分钟
 ```
 
-测试的重点：
-- 解析解对比（截断效率、平行镜阴影、塔影）；
-- 能量守恒；
-- MCRT 一致性；
-- APS 约束满足，以及与 MILP 精确解、LP 上界的对比；
-- 命令行和图形界面的端到端运行。
+测试覆盖：
 
-代码结构：
+- 导师给的回归算例（`tests/test_p0_regressions.py`）；
+- 解析解对比、能量守恒；
+- 暴力求交与 MCRT 一致性；
+- MILP 与 SCIP 精确基准；
+- 在线引擎（缓存、过期数据、预报覆盖、可用状态、可达性、JSON 服务）与回放场景；
+- 命令行与图形界面的端到端测试（`CSPAPS_GUI_SYNC=1` 时后台任务同步执行）。
 
-```
-src/cspaps/
-  config.py      算例 YAML -> dataclass（含校验）
-  sun.py         太阳位置、DNI、气象文件、全年采样与代表太阳位置
-  receiver.py    圆柱面网格与瞄准点几何
-  field.py       镜场生成（径向交错 / 仿生螺旋）、边界、CSV
-  optics.py      余弦、大气衰减、HFLCAL 光斑、截断效率、通量叠加
-  shading.py     阴影、遮挡、塔影
-  simulate.py    单时刻功率链、全年能量
-  aps.py         内层：瞄准点优化（center / kfactor / greedy / milp）
-  clouds.py      云影与实测 DNI 分布
-  realtime.py    实时控制循环仿真
-  layout_opt.py  外层：镜场布置优化
-  mcrt.py        蒙特卡洛光线追迹校验
-  workflows.py   各任务的计算与输出（命令行和图形界面共用）
-  plotting.py    图
-  cli.py         命令行
-  gui_app.py     图形界面
-docs/MODEL.md    模型与算法说明
-```
+代码结构见 `CLAUDE.md`。

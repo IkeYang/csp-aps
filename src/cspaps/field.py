@@ -17,10 +17,27 @@ from .shading import PairCache
 GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))  # 2 pi / phi^2
 
 
+# Boundary / exclusion checks accept points this close outside (m), so that
+# heliostats placed exactly on a boundary survive CSV round trips.
+BOUNDARY_TOL_M = 1e-3
+
+
 @dataclass
 class Field:
     xyz: np.ndarray  # (N, 3) heliostat pivot positions, m
+    ids: np.ndarray | None = None  # (N,) heliostat IDs (default 1..N), kept through CSV round trips
+    dropped: list[dict] = dc_field(default_factory=list, repr=False)  # heliostats removed by site checks
     _pairs: PairCache | None = dc_field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        self.xyz = np.asarray(self.xyz, dtype=float).reshape(-1, 3)
+        if self.ids is None:
+            self.ids = np.arange(1, self.xyz.shape[0] + 1)
+        self.ids = np.asarray(self.ids, dtype=np.int64)
+        if self.ids.shape[0] != self.xyz.shape[0]:
+            raise ValueError("Field: ids and xyz have different lengths")
+        if np.unique(self.ids).size != self.ids.size:
+            raise ValueError("Field: heliostat IDs must be unique")
 
     @property
     def n(self) -> int:
@@ -33,15 +50,39 @@ class Field:
         return self._pairs
 
     def subset(self, mask_or_idx) -> "Field":
-        return Field(self.xyz[mask_or_idx])
+        return Field(self.xyz[mask_or_idx], self.ids[mask_or_idx])
+
+    def index_of(self, ids) -> np.ndarray:
+        """Positions of the given heliostat IDs (raises on unknown IDs)."""
+        lookup = {int(h): i for i, h in enumerate(self.ids)}
+        try:
+            return np.array([lookup[int(h)] for h in np.atleast_1d(ids)], dtype=np.int64)
+        except KeyError as exc:
+            raise KeyError(f"unknown heliostat ID {exc.args[0]}") from None
 
 
-def points_in_polygon(xy: np.ndarray, polygon) -> np.ndarray:
-    """Boolean mask of points (N, 2) lying inside a closed polygon [[x, y], ...]."""
+def points_in_polygon(xy: np.ndarray, polygon, tol: float = 0.0) -> np.ndarray:
+    """Points (N, 2) inside a closed polygon [[x, y], ...], or within ``tol`` m of its edges."""
     poly = np.asarray(polygon, dtype=float)
     if poly.ndim != 2 or poly.shape[0] < 3 or poly.shape[1] != 2:
         raise ValueError("boundary must be a list of at least 3 [x, y] points")
-    return MplPath(poly).contains_points(xy)
+    xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+    inside = MplPath(poly).contains_points(xy)
+    if tol > 0 and len(xy):
+        inside |= distance_to_polygon(xy, poly) <= tol
+    return inside
+
+
+def distance_to_polygon(xy: np.ndarray, polygon) -> np.ndarray:
+    """Distance of each point to the polygon outline, m."""
+    poly = np.asarray(polygon, dtype=float)
+    a = poly
+    b = np.roll(poly, -1, axis=0)
+    ab = b - a
+    ap = xy[:, None, :] - a[None, :, :]
+    t = np.clip(np.sum(ap * ab, axis=-1) / np.maximum(np.sum(ab * ab, axis=-1), 1e-30), 0.0, 1.0)
+    d = ap - t[..., None] * ab
+    return np.sqrt(np.sum(d * d, axis=-1)).min(axis=1)
 
 
 def radial_staggered(
@@ -158,7 +199,7 @@ def generate(case: Case, kind: str, params: dict[str, Any]) -> np.ndarray:
     params.setdefault("r_min", max(case.field.exclusion_radius, rec.radius + case.heliostat.diagonal))
     xy = GENERATORS[kind](case.heliostat, (rec.center[0], rec.center[1]), rec.center[2], **params)
     xyz = np.column_stack([xy, np.full(len(xy), case.heliostat.pivot_height)])
-    return clip_to_site(case, xyz)
+    return xyz[site_mask(case, xyz)[0]]
 
 
 def default_r_max(case: Case) -> float:
@@ -170,39 +211,76 @@ def default_r_max(case: Case) -> float:
     return 8.0 * rec.center[2]
 
 
-def clip_to_site(case: Case, xyz: np.ndarray) -> np.ndarray:
+def site_mask(case: Case, xyz: np.ndarray, tol: float = BOUNDARY_TOL_M) -> tuple[np.ndarray, list[str]]:
+    """(keep mask, reason per point) for the site boundary and the exclusion zone (shared by all paths)."""
     spec, rec = case.field, case.receiver
     keep = np.ones(len(xyz), dtype=bool)
+    reason = [""] * len(xyz)
     if spec.boundary is not None and len(xyz):
-        keep &= points_in_polygon(xyz[:, :2], spec.boundary)
-    if spec.exclusion_radius > 0:
+        inside = points_in_polygon(xyz[:, :2], spec.boundary, tol)
+        for i in np.flatnonzero(~inside):
+            reason[i] = "outside site boundary"
+        keep &= inside
+    if spec.exclusion_radius > 0 and len(xyz):
         r = np.hypot(xyz[:, 0] - rec.center[0], xyz[:, 1] - rec.center[1])
-        keep &= r >= spec.exclusion_radius
-    return xyz[keep]
+        ok = r >= spec.exclusion_radius - tol
+        for i in np.flatnonzero(~ok):
+            reason[i] = reason[i] or f"inside exclusion radius ({r[i]:.4f} m < {spec.exclusion_radius} m)"
+        keep &= ok
+    return keep, reason
+
+
+def clip_to_site(case: Case, xyz: np.ndarray) -> np.ndarray:
+    return xyz[site_mask(case, xyz)[0]]
+
+
+def read_layout(path: str | Path, pivot_height: float) -> tuple[np.ndarray, np.ndarray | None]:
+    """(xyz, ids or None) from a layout CSV with columns [id,]x,y[,z]."""
+    import pandas as pd
+
+    df = pd.read_csv(path)
+    if not {"x", "y"} <= set(df.columns):
+        raise ValueError(f"{path}: CSV needs a header with columns x,y[,z] (optionally id)")
+    z = df["z"].to_numpy(float) if "z" in df else np.full(len(df), pivot_height)
+    xyz = np.column_stack([df["x"].to_numpy(float), df["y"].to_numpy(float), z])
+    ids = df["id"].to_numpy(np.int64) if "id" in df else None
+    return xyz, ids
 
 
 def load_layout_csv(path: str | Path, pivot_height: float) -> np.ndarray:
-    data = np.genfromtxt(path, delimiter=",", names=True)
-    names = data.dtype.names or ()
-    if not {"x", "y"} <= set(names):
-        raise ValueError(f"{path}: CSV needs a header with columns x,y[,z]")
-    x = np.atleast_1d(data["x"])
-    y = np.atleast_1d(data["y"])
-    z = np.atleast_1d(data["z"]) if "z" in names else np.full(x.shape, pivot_height)
-    return np.column_stack([x, y, z]).astype(float)
+    return read_layout(path, pivot_height)[0]
 
 
 def save_layout_csv(field: Field, path: str | Path) -> None:
-    np.savetxt(path, field.xyz, delimiter=",", header="x,y,z", comments="", fmt="%.3f")
+    """id,x,y,z with micrometre precision (positions survive a round trip unchanged)."""
+    import pandas as pd
+
+    pd.DataFrame({"id": field.ids, "x": field.xyz[:, 0], "y": field.xyz[:, 1], "z": field.xyz[:, 2]}
+                 ).to_csv(path, index=False, float_format="%.6f")
 
 
 def build_field(case: Case) -> Field:
+    """Field from the case; heliostats removed by the site checks are listed in ``Field.dropped``."""
     spec = case.field
     if spec.layout_file:
-        xyz = load_layout_csv(case.resolve(spec.layout_file), case.heliostat.pivot_height)
-        return Field(clip_to_site(case, xyz))
-    if spec.generator:
+        xyz, ids = read_layout(case.resolve(spec.layout_file), case.heliostat.pivot_height)
+        ids = np.arange(1, len(xyz) + 1) if ids is None else ids
+    elif spec.generator:
         gen = dict(spec.generator)
         kind = gen.pop("type", "radial_staggered")
-        return Field(generate(case, kind, gen))
-    raise ValueError("field: give either 'layout_file' or 'generator'")
+        if kind not in GENERATORS:
+            raise ValueError(f"Unknown layout generator '{kind}' (use {sorted(GENERATORS)})")
+        rec = case.receiver
+        gen.setdefault("r_max", default_r_max(case))
+        gen.setdefault("r_min", max(spec.exclusion_radius, rec.radius + case.heliostat.diagonal))
+        xy = GENERATORS[kind](case.heliostat, (rec.center[0], rec.center[1]), rec.center[2], **gen)
+        xyz = np.column_stack([xy, np.full(len(xy), case.heliostat.pivot_height)])
+        keep, _ = site_mask(case, xyz)
+        xyz = xyz[keep]  # generated points outside the site are simply not part of the layout
+        ids = np.arange(1, len(xyz) + 1)
+    else:
+        raise ValueError("field: give either 'layout_file' or 'generator'")
+    keep, reason = site_mask(case, xyz)
+    dropped = [{"id": int(ids[i]), "x": float(xyz[i, 0]), "y": float(xyz[i, 1]), "reason": reason[i]}
+               for i in np.flatnonzero(~keep)]
+    return Field(xyz[keep], ids[keep], dropped)

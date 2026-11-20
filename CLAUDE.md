@@ -1,9 +1,13 @@
 # Notes for working on this repo
 
-- Python package `cspaps` in `src/`, tests in `tests/`. Install with `pip install -e ".[dev]"`; run `pytest -q` (~1 min) before committing.
+- Python package `cspaps` in `src/`, tests in `tests/`. Install with `pip install -e ".[dev]"`; run `pytest -q` (~5 min) before committing.
 - Coordinates: x = East, y = North, z = Up (m), origin at the tower base. Azimuths are compass (N = 0, E = 90, clockwise). Keep this convention in every module.
 - All user inputs live in a case YAML (`cases/*.yaml`) parsed by `config.py`. New inputs = a new dataclass field with a default (the GUI form picks it up automatically; add a Chinese label in `gui_app.LABELS`). Unknown keys must keep raising errors.
-- Layers: `optics`/`shading`/`sun` (physics) -> `simulate.evaluate` (one sun state, power chain `STAGES`) -> `aps` (inner loop), `realtime`, `annual`, `layout_opt` (outer loop), `mcrt` (validation only) -> `workflows` (files + plots) -> `cli` and `gui_app`.
-- Efficiencies come from `optics.intercept_fraction` (grid-independent); flux maps are for distribution / peak flux and the APS constraint.
-- Physics changes need a test against an analytic result, a conservation check or MCRT, not just a smoke test.
-- Model documentation: `docs/MODEL.md` (Chinese). README and docs are in Chinese (the user's language); code, comments and docstrings in English.
+- Layers: `optics`/`shading`/`sun`/`receiver` (physics, panel limits) -> `simulate.evaluate` (one sun state, power chain `STAGES`) -> `aps` (ResponseSet + AimProblem, solvers, verification loop), `uniformity`, `engine` (online cycle), `realtime` (replay), `annual`, `layout_opt` -> `mcrt`/`soltrace` (validation only) -> `workflows` (run folders, files, plots) -> `cli` and `gui_app`.
+- Flux limits: always compare modelled incident flux with `receiver.incident_limit_w_m2` (panel limits, height profile, absorbed basis, bias). Feasibility statements must come from `verify.verify_beams` (fine grid, full beams), never from the coarse map alone.
+- Efficiencies come from `optics.intercept_fraction` (grid-independent); flux maps are for distribution / peak flux.
+- Replay time base: sample-and-hold intervals (`realtime.replay_times`); never count samples x step.
+- Layout CSVs carry heliostat IDs and micrometre precision; site checks use `field.site_mask` (1 mm tolerance) everywhere and report dropped heliostats.
+- Physics changes need a test against an analytic result, a conservation check, brute force or MCRT, not just a smoke test. The advisor's acceptance cases live in `tests/test_p0_regressions.py` and friends.
+- GUI tests run with `CSPAPS_GUI_SYNC=1` (background jobs run synchronously).
+- Docs: `docs/MODEL.md` (model), `docs/REVIEW_RESPONSE.md` (advisor review items -> implementation). README and docs are in Chinese (the user's language); code, comments and docstrings in English.

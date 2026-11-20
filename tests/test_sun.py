@@ -69,3 +69,22 @@ def test_weather_csv(tmp_path, small_case):
     s = sun.hourly_samples(small_case)
     assert np.all(s.dni == 700.0)
     assert s.weight_h[0] == pytest.approx(1.0)
+
+
+def test_sun_grid_and_dni_bands_preserve_energy(small_case):
+    hourly = sun.hourly_samples(small_case)
+    grid = sun.sun_grid(hourly, 15.0, 30.0)
+    banded = sun.sun_bins(hourly, 10, dni_bands=3)
+    for s in (grid, banded):
+        assert s.dni_hours == pytest.approx(hourly.dni_hours, rel=1e-9)
+        assert s.members.sum() == len(hourly)
+    assert len(banded) > 10  # bins split into DNI bands
+
+
+def test_dni_bands_avoid_merging_strong_and_weak_states(small_case):
+    """Advisor: two equal-length states at one sun position, 300 and 1200 W/m2 -> keep them apart."""
+    s = sun.Samples(np.array([45.0, 45.0]), np.array([180.0, 180.0]), np.array([300.0, 1200.0]), np.array([1.0, 1.0]))
+    merged = sun.sun_bins(s, 1)
+    split = sun.sun_bins(s, 1, dni_bands=2)
+    assert len(merged) == 1 and len(split) == 2
+    assert sorted(split.dni.tolist()) == [300.0, 1200.0]

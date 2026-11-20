@@ -184,3 +184,53 @@ def shading_blocking(
     with np.errstate(invalid="ignore", divide="ignore"):
         eta_block = np.where(eta_shade > 0, eta_comb / eta_shade, 1.0)
     return {"shading": eta_shade, "blocking": eta_block, "combined": eta_comb}
+
+
+def shading_blocking_bruteforce(
+    xyz: np.ndarray,
+    normals: np.ndarray,
+    sun_vec: np.ndarray,
+    t: np.ndarray,
+    helio: Heliostat,
+    rec: Receiver | None,
+    n_points: int = 8,
+    tower_shadow: bool = True,
+) -> dict[str, np.ndarray]:
+    """Reference: every ordered pair is tested (no radius search, no corridor filter)."""
+    n = xyz.shape[0]
+    e_w, e_h = mirror_frames(normals)
+    offsets = grid_offsets(n_points)
+    pts = mirror_points(xyz, e_w, e_h, helio, offsets)
+    i_all, j_all = np.nonzero(~np.eye(n, dtype=bool))
+    shaded = _hit_mask(pts, i_all, j_all, sun_vec, xyz, normals, e_w, e_h, helio, n)
+    if tower_shadow and rec is not None and rec.tower_radius > 0:
+        shaded |= ray_hits_tower(pts, sun_vec[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+    blocked = _hit_mask(pts, i_all, j_all, t, xyz, normals, e_w, e_h, helio, n)
+    p = offsets.shape[0]
+    eta_shade = 1.0 - shaded.sum(axis=1) / p
+    eta_comb = 1.0 - (shaded | blocked).sum(axis=1) / p
+    with np.errstate(invalid="ignore", divide="ignore"):
+        eta_block = np.where(eta_shade > 0, eta_comb / eta_shade, 1.0)
+    return {"shading": eta_shade, "blocking": eta_block, "combined": eta_comb}
+
+
+def compare_screening(xyz, normals, sun_vec, t, helio, rec, n_points=8, tower_shadow=True) -> dict:
+    """Corridor screening vs brute force: missed shading/blocking and timing."""
+    import time as _t
+
+    t0 = _t.perf_counter()
+    fast = shading_blocking(xyz, normals, sun_vec, t, helio, rec, PairCache(xyz), n_points, tower_shadow)
+    t_fast = _t.perf_counter() - t0
+    t0 = _t.perf_counter()
+    ref = shading_blocking_bruteforce(xyz, normals, sun_vec, t, helio, rec, n_points, tower_shadow)
+    t_ref = _t.perf_counter() - t0
+    diff = fast["combined"] - ref["combined"]
+    return {
+        "n_heliostats": int(xyz.shape[0]),
+        "max_abs_diff_combined": float(np.abs(diff).max()) if diff.size else 0.0,
+        "n_heliostats_differing": int(np.sum(np.abs(diff) > 1e-12)),
+        "missed_loss_total": float(np.clip(diff, 0, None).sum()),  # > 0: screening missed shading/blocking
+        "field_loss_screened": float((1 - fast["combined"]).mean()),
+        "field_loss_reference": float((1 - ref["combined"]).mean()),
+        "time_screened_s": t_fast, "time_bruteforce_s": t_ref,
+    }

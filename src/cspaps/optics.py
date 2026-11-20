@@ -4,7 +4,7 @@ Flux model (HFLCAL, Schwarzboezl et al. 2009): the reflected beam of each
 heliostat is a circular Gaussian in the image plane (normal to the central
 ray, through the aim point) with standard deviation
 
-    sigma = D * sqrt(sigma_sun^2 + (2 sigma_slope)^2 + (2 sigma_track)^2 + sigma_ast^2)
+    sigma = D * sqrt(sigma_sun^2 + (2 sigma_slope)^2 + (2 sigma_track)^2 + sigma_spec^2 + sigma_ast^2)
 
 where D is the slant range. Each receiver surface point is projected along
 the central ray onto the image plane, and the image-plane flux is multiplied
@@ -82,6 +82,7 @@ def beam_sigma(slant_range: np.ndarray, cos_inc: np.ndarray, helio: Heliostat, s
         (sun.effective_sigma_mrad * 1e-3) ** 2
         + (2e-3 * helio.slope_error_mrad) ** 2
         + (2e-3 * helio.tracking_error_mrad) ** 2
+        + (1e-3 * helio.specular_error_mrad) ** 2
         + sigma_ast**2
     )
     return d * np.sqrt(s2)
@@ -104,6 +105,7 @@ def intercept_fraction(
     t: np.ndarray,
     sigma: np.ndarray,
     n_quad: int = 48,
+    z_range: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """Fraction of each Gaussian beam that hits the cylinder's lateral surface.
 
@@ -113,7 +115,9 @@ def intercept_fraction(
     maps to a segment u = const, v in [v_bot(U), v_top(U)]. The intercept is
         integral pdf(u) * (cdf(v_top) - cdf(v_bot)) dU,
     evaluated with Gauss-Legendre nodes restricted to +-8 sigma around the
-    beam centre so that narrow beams are always resolved.
+    beam centre so that narrow beams are always resolved. ``z_range`` limits
+    the target to a horizontal band of the surface (the band is convex and
+    directly visible, so the same formula applies).
     """
     shape = aim_xyz.shape[:-1]
     aim_xyz = aim_xyz.reshape(-1, 3)
@@ -124,7 +128,8 @@ def intercept_fraction(
         return np.zeros(shape)
     e_u, e_v = image_plane_basis(t)
     R = rec.radius
-    c_bot = np.array([rec.center[0], rec.center[1], rec.center[2] - 0.5 * rec.height])
+    z_lo, z_hi = z_range if z_range is not None else (rec.center[2] - 0.5 * rec.height, rec.center[2] + 0.5 * rec.height)
+    c_bot = np.array([rec.center[0], rec.center[1], z_lo])
     h = -t.copy()
     h[:, 2] = 0.0
     h /= np.linalg.norm(h, axis=1, keepdims=True)  # horizontal, axis -> heliostat
@@ -140,7 +145,7 @@ def intercept_fraction(
     r = p_bot - aim_xyz[:, None, :]
     u = U - a_u[:, None]
     v_bot = np.einsum("nqk,nk->nq", r, e_v)
-    v_top = v_bot + rec.height * e_v[:, 2:3]
+    v_top = v_bot + (z_hi - z_lo) * e_v[:, 2:3]
     s = sigma[:, None]
     pdf = np.exp(-0.5 * (u / s) ** 2) / (np.sqrt(2 * np.pi) * s)
     band = np.abs(ndtr(v_top / s) - ndtr(v_bot / s))
@@ -160,12 +165,24 @@ def footprints(
     aim points (R, 3), ray directions heliostat->aim (R, 3), beam sigma (R,)
     in m, beam power arriving at the image plane (R,) in W.
     """
+    return footprints_at(grid.points, grid.normals, aim_xyz, t, sigma, power)
+
+
+def footprints_at(
+    points: np.ndarray,
+    normals: np.ndarray,
+    aim_xyz: np.ndarray,
+    t: np.ndarray,
+    sigma: np.ndarray,
+    power: np.ndarray,
+) -> np.ndarray:
+    """Flux (W/m2) of each beam at arbitrary surface points (P, 3) with outward normals, (R, P)."""
     e_u, e_v = image_plane_basis(t)
-    # Projections as matrix products (BLAS) instead of forming (R, M, 3) offsets.
-    pts = grid.points
-    u = e_u @ pts.T - np.sum(aim_xyz * e_u, axis=1)[:, None]  # (R, M)
+    # Projections as matrix products (BLAS) instead of forming (R, P, 3) offsets.
+    pts = points
+    u = e_u @ pts.T - np.sum(aim_xyz * e_u, axis=1)[:, None]  # (R, P)
     v = e_v @ pts.T - np.sum(aim_xyz * e_v, axis=1)[:, None]
-    cos_s = np.clip(-(t @ grid.normals.T), 0.0, None)
+    cos_s = np.clip(-(t @ normals.T), 0.0, None)
     inv2s2 = (0.5 / sigma**2)[:, None]
     q = (u * u + v * v) * inv2s2
     out = np.exp(-q.astype(np.float32)).astype(np.float64)

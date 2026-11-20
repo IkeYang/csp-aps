@@ -57,7 +57,7 @@ def test_build_field_applies_boundary(small_case):
     small_case.field.boundary = [[-200, 0], [200, 0], [200, 200], [-200, 200]]
     north = build_field(small_case)
     assert 0 < north.n < full.n
-    assert np.all(north.xyz[:, 1] >= 0)
+    assert np.all(north.xyz[:, 1] >= -1e-3)  # boundary tolerance: points on the edge are kept
     assert np.all(north.xyz[:, 2] == small_case.heliostat.pivot_height)
 
 

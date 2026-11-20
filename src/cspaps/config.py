@@ -31,10 +31,19 @@ class Receiver:
     center: tuple[float, float, float]  # centre of the cylinder (on its axis), m
     diameter: float  # m
     height: float  # m
-    max_flux_kw_m2: float = 1000.0  # allowable peak flux density
+    max_flux_kw_m2: float = 1000.0  # allowable peak flux density (default for every panel)
     n_azimuth: int = 72  # flux-map cells around the circumference
     n_height: int = 32  # flux-map cells along the height
     tower_diameter: float | None = None  # for the tower shadow; None = receiver diameter, 0 = off
+    absorptivity: float = 0.95  # absorbed / incident flux
+    flux_limit_basis: str = "incident"  # the flux limits apply to "incident" or "absorbed" flux
+    # Tube panels: n_panels equal azimuth sectors, panel 1 starts at panel_start_azimuth_deg
+    n_panels: int = 1
+    panel_start_azimuth_deg: float = 0.0
+    panel_max_flux_kw_m2: list[float] | None = None  # per panel limit (None = max_flux_kw_m2)
+    panel_absorptivity: list[float] | None = None  # per panel (None = absorptivity)
+    panel_flux_bias: list[float] | None = None  # measured / modelled flux per panel (feedback, 1 = trust model)
+    limit_height_profile: list[float] | None = None  # relative allowed flux, bottom -> top, interpolated
 
     @property
     def radius(self) -> float:
@@ -63,6 +72,7 @@ class Heliostat:
     cleanliness: float = 0.97
     slope_error_mrad: float = 1.5  # surface normal error, 1 sigma per axis
     tracking_error_mrad: float = 1.0  # normal pointing error, 1 sigma per axis
+    specular_error_mrad: float = 0.0  # specularity: scatter of the reflected ray, 1 sigma per axis
     # "slant_range" = canted/focused at the slant range to the receiver,
     # "flat" = flat mirror, or a number = fixed focal length in metres.
     focusing: str | float = "slant_range"
@@ -135,6 +145,42 @@ class APSSpec:
     move_penalty_per_m: float = 0.0  # real-time smoothing: power fraction lost per m of aim shift
     allow_defocus: bool = True  # put heliostats on standby when no feasible aim exists
     milp_time_limit_s: float = 60.0
+    verify: bool = True  # re-check every solution on an adaptive fine grid with full beams
+    auto_grid: bool = True  # refine the solver grid so that cells are <= sigma_min / 1.5 (capped)
+    max_solver_cells: int = 40_000
+    verify_max_rounds: int = 4  # add hotspots as constraints and re-solve at most this often
+    verify_max_cells: int = 400_000  # cap of the verification grid size
+
+
+@dataclass
+class UniformitySpec:
+    """Uniform heating of the preheater region H (absorbed flux, area-weighted)."""
+
+    enabled: bool = False
+    max_cv: float = 0.5  # epsilon: allowed 2-D coefficient of variation over H
+    panels: list[int] | None = None  # 1-based panel numbers forming H (None = all panels)
+    z_range: list[float] | None = None  # [z_min, z_max] of H in m (None = full height)
+    min_load_mw: float = 0.0  # minimum absorbed power on H; below it the receiver is shut down
+    mu_iters: int = 12  # bisection steps on the uniformity weight
+    passes: int = 3  # local-search passes per weight
+
+
+@dataclass
+class EngineSpec:
+    """Online control engine (one APS solve per control cycle)."""
+
+    period_s: float = 60.0  # control cycle: a plan is held for this long
+    command_latency_s: float = 5.0  # from the request time until the plan is in effect
+    max_dni_age_s: float = 90.0  # older DNI measurements count as stale
+    forecast_margin: float = 0.05  # uplift on forecast DNI for forecast error
+    no_forecast_policy: str = "clear_sky"  # constraint DNI without forecasts: "clear_sky" | "current"
+    stale_policy: str = "clear_sky"  # constraint DNI when the measurement is stale/missing: "clear_sky" | "last"
+    response_refresh_deg: float = 0.3  # rebuild the cached responses after this sun movement
+    reshade_below_elevation_deg: float = 90.0  # recompute shading in the final check below this sun elevation (90 = always)
+    max_slew_deg_s: float = 0.0  # heliostat normal slew rate for the reachability filter (0 = off)
+    timeout_s: float = 20.0  # solve budget per cycle
+    priority_dni_change: float = 0.05  # warm start re-optimises heliostats whose DNI changed more
+    fallback: str = "hold_or_defocus"  # when the check fails: "hold_or_defocus" | "defocus" | "none"
 
 
 @dataclass
@@ -142,16 +188,24 @@ class Realtime:
     start: str = "2025-06-21 12:00"
     duration_min: float = 20.0
     step_s: float = 60.0
-    forecast_horizon_s: float = 120.0  # constraint uses the max DNI expected over this horizon
+    forecast_horizon_s: float = 120.0  # predictive strategy: forecast window after the command takes effect
+    forecast_step_s: float = 15.0  # spacing of the forecast snapshots
     clouds: list[dict[str, Any]] | None = None  # explicit cloud list
     random_clouds: dict[str, Any] | None = None  # random cloud generator settings
+    scenario: str = "clouds"  # "clouds" | "moving_edge" | "sudden_clear"
+    dni_delay_s: float = 0.0  # measured DNI reaches the controller this late
+    dni_dropout_s: list[float] | None = None  # [start, end] s after start: no DNI data arrives
     strategies: list[str] = dc_field(default_factory=lambda: ["center", "aps_reactive", "aps_predictive"])
 
 
 @dataclass
 class AnnualSpec:
-    method: str = "sun_bins"  # "sun_bins" | "representative_days" | "hourly"
+    method: str = "sun_bins"  # "sun_bins" | "sun_grid" | "representative_days" | "hourly"
     n_sun_bins: int = 30
+    dni_bands: int = 1  # split every representative state into this many DNI bands
+    grid_elevation_step_deg: float = 10.0  # sun_grid bin size
+    grid_azimuth_step_deg: float = 20.0
+    workers: int = 1  # parallel processes for annual runs (-1 = all CPUs)
     year: int = 2025
     day_of_month: int = 15  # representative_days: one day per month
     time_step_min: float = 60.0
@@ -165,7 +219,15 @@ class LayoutOpt:
     n_heliostats: int | None = None  # keep the best N candidates (None = keep all)
     bounds: dict[str, list[float]] = dc_field(default_factory=dict)  # optimised generator params
     fixed: dict[str, Any] = dc_field(default_factory=dict)  # other generator params
-    n_sun_bins: int = 20
+    search_sampling: str = "sun_bins"  # annual sampling during the search: sun_bins | sun_grid | hourly
+    n_sun_bins: int = 30  # representative sun positions for the search (20 / 30 / 40 / any)
+    review_sampling: str = "sun_bins"  # sampling for the review of the best layouts
+    review_n_sun_bins: int = 40
+    review_dni_bands: int = 3  # DNI bands per state in the constrained (APS) review
+    review_check_hourly: bool = True  # also report the sampling error against the hourly year
+    min_spacing_factor: float | None = None  # final check: min distance >= factor x diagonal (None = spacing_factor)
+    swap_rounds: int = 2  # swap low-yield heliostats for unused candidates, accepted on APS annual energy
+    swap_fraction: float = 0.03
     shading_points: int = 5
     maxiter: int = 8
     popsize: int = 6
@@ -179,6 +241,8 @@ class LayoutOpt:
 class MCRTSpec:
     rays_per_heliostat: int = 1000
     seed: int = 0
+    n_seeds: int = 3  # repeat with independent seeds -> statistical uncertainty of power and peak
+    tracking_mode: str = "per_ray"  # "per_ray" (statistical, like HFLCAL) | "per_heliostat" (fixed bias per mirror)
 
 
 @dataclass
@@ -193,6 +257,8 @@ class Case:
     shading: Shading = dc_field(default_factory=Shading)
     field: FieldSpec = dc_field(default_factory=FieldSpec)
     aps: APSSpec = dc_field(default_factory=APSSpec)
+    uniformity: UniformitySpec = dc_field(default_factory=UniformitySpec)
+    engine: EngineSpec = dc_field(default_factory=EngineSpec)
     realtime: Realtime = dc_field(default_factory=Realtime)
     annual: AnnualSpec = dc_field(default_factory=AnnualSpec)
     layout_opt: LayoutOpt = dc_field(default_factory=LayoutOpt)
@@ -228,6 +294,8 @@ _SECTIONS = {
     "shading": Shading,
     "field": FieldSpec,
     "aps": APSSpec,
+    "uniformity": UniformitySpec,
+    "engine": EngineSpec,
     "realtime": Realtime,
     "annual": AnnualSpec,
     "layout_opt": LayoutOpt,
@@ -259,12 +327,45 @@ def _validate(case: Case) -> None:
             raise ValueError(f"{name} must be > 0 (got {value})")
     if not 0 < hel.reflectivity <= 1 or not 0 < hel.cleanliness <= 1:
         raise ValueError("heliostat.reflectivity and cleanliness must be in (0, 1]")
+    if rec.n_panels < 1:
+        raise ValueError("receiver.n_panels must be >= 1")
+    for name in ("panel_max_flux_kw_m2", "panel_absorptivity", "panel_flux_bias"):
+        values = getattr(rec, name)
+        if values is not None:
+            if len(values) != rec.n_panels:
+                raise ValueError(f"receiver.{name} needs {rec.n_panels} values (one per panel), got {len(values)}")
+            if any(not v > 0 for v in values):
+                raise ValueError(f"receiver.{name} values must be > 0")
+    if rec.flux_limit_basis not in ("incident", "absorbed"):
+        raise ValueError("receiver.flux_limit_basis must be 'incident' or 'absorbed'")
+    if not 0 < rec.absorptivity <= 1:
+        raise ValueError("receiver.absorptivity must be in (0, 1]")
+    if rec.limit_height_profile is not None and (len(rec.limit_height_profile) < 1
+                                                 or any(not v > 0 for v in rec.limit_height_profile)):
+        raise ValueError("receiver.limit_height_profile needs positive values")
+    u = case.uniformity
+    if u.panels is not None and any(not 1 <= p <= rec.n_panels for p in u.panels):
+        raise ValueError(f"uniformity.panels must be panel numbers 1..{rec.n_panels}")
+    if not u.max_cv > 0:
+        raise ValueError("uniformity.max_cv must be > 0")
+    e = case.engine
+    if e.no_forecast_policy not in ("clear_sky", "current") or e.stale_policy not in ("clear_sky", "last"):
+        raise ValueError("engine.no_forecast_policy must be clear_sky|current, stale_policy clear_sky|last")
+    if e.fallback not in ("hold_or_defocus", "defocus", "none"):
+        raise ValueError("engine.fallback must be hold_or_defocus|defocus|none")
+    for name in ("search_sampling", "review_sampling"):
+        if getattr(case.layout_opt, name) not in ("sun_bins", "sun_grid", "hourly"):
+            raise ValueError(f"layout_opt.{name} must be sun_bins|sun_grid|hourly")
+    if case.mcrt.tracking_mode not in ("per_ray", "per_heliostat"):
+        raise ValueError("mcrt.tracking_mode must be per_ray|per_heliostat")
+    if case.realtime.scenario not in ("clouds", "moving_edge", "sudden_clear"):
+        raise ValueError("realtime.scenario must be clouds|moving_edge|sudden_clear")
     if not 0 <= case.aps.safety_margin < 1:
         raise ValueError("aps.safety_margin must be in [0, 1)")
     if case.aps.method not in ("center", "kfactor", "greedy", "milp"):
         raise ValueError(f"aps.method '{case.aps.method}' not in center|kfactor|greedy|milp")
-    if case.annual.method not in ("sun_bins", "representative_days", "hourly"):
-        raise ValueError(f"annual.method '{case.annual.method}' not in sun_bins|representative_days|hourly")
+    if case.annual.method not in ("sun_bins", "sun_grid", "representative_days", "hourly"):
+        raise ValueError(f"annual.method '{case.annual.method}' not in sun_bins|sun_grid|representative_days|hourly")
     if case.weather.source == "file" and not case.weather.file:
         raise ValueError("weather.source is 'file' but weather.file is not set")
     case.sun.effective_sigma_mrad  # raises on an unknown shape

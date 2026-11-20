@@ -35,6 +35,8 @@ class MCRTResult:
     heliostat_power: np.ndarray  # (N,) W on the receiver
     n_rays: int
     grid: ReceiverGrid = dc_field(repr=False)
+    seed: int = 0
+    rays_per_heliostat: int = 0
 
     def summary(self) -> dict:
         p = self.power
@@ -123,7 +125,6 @@ def trace(
     s = sun.sun_vector(sun_elevation, sun_azimuth)
     aim_xyz = surface_point(rec, np.asarray(aim_az, float), np.asarray(aim_z, float))
     normals, t, slant, cos_inc = optics.heliostat_geometry(fld.xyz, aim_xyz, s)
-    e_w, e_h = mirror_frames(normals)
     if hel.focusing == "slant_range":
         focal = slant
     elif hel.focusing == "flat":
@@ -132,7 +133,14 @@ def trace(
         focal = np.full(n, float(hel.focusing))
     att = optics.attenuation(slant, case.atmosphere)
     rho = hel.reflectivity * hel.cleanliness
-    sig_n = 1e-3 * np.hypot(hel.slope_error_mrad, hel.tracking_error_mrad)
+    per_helio_track = case.mcrt.tracking_mode == "per_heliostat"
+    sig_n = 1e-3 * (hel.slope_error_mrad if per_helio_track else np.hypot(hel.slope_error_mrad, hel.tracking_error_mrad))
+    sig_spec = 1e-3 * hel.specular_error_mrad
+    if per_helio_track:  # one fixed pointing bias per heliostat for this realisation
+        bias = 1e-3 * hel.tracking_error_mrad * rng.normal(size=(n, 2))
+        normals = normals + bias[:, :1] * mirror_frames(normals)[0] + bias[:, 1:] * mirror_frames(normals)[1]
+        normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    e_w, e_h = mirror_frames(normals)
     hw, hh = 0.5 * hel.width, 0.5 * hel.height
     diag = hel.diagonal * 1.1
     dz = float(np.ptp(fld.xyz[:, 2])) if n > 1 else 0.0
@@ -177,6 +185,11 @@ def trace(
         n_loc /= np.linalg.norm(n_loc, axis=-1, keepdims=True)
         d_in = -s_ray
         r = d_in - 2 * np.sum(d_in * n_loc, axis=-1, keepdims=True) * n_loc
+        if sig_spec > 0:  # specularity error on the reflected ray
+            r1, r2 = _perp_basis(r.reshape(-1, 3))
+            r = r + sig_spec * (rng.normal(size=(c, nr))[..., None] * r1.reshape(c, nr, 3)
+                                + rng.normal(size=(c, nr))[..., None] * r2.reshape(c, nr, 3))
+            r /= np.linalg.norm(r, axis=-1, keepdims=True)
 
         keep_b = in_chunk & _corridor(rel, t[pair_i], diag, np.full(rel.shape[0], np.inf))
         blocked = _rect_mask(o, r, pair_i[keep_b] - sl[0], pair_j[keep_b], fld.xyz, normals, e_w, e_h, hw, hh)
@@ -197,7 +210,55 @@ def trace(
         iz = np.clip(((p[..., 2] - z0) / rec.height * n_z).astype(int), 0, n_z - 1)
         energy += np.bincount((iz * n_az + ia)[hit], weights=w_hit[hit], minlength=energy.size)
     flux = grid.to_map(energy / grid.cell_area)
-    return MCRTResult(flux, totals, per_h, n * nr, grid)
+    used_seed = case.mcrt.seed if seed is None else seed
+    return MCRTResult(flux, totals, per_h, n * nr, grid, int(used_seed), nr)
+
+
+def trace_repeated(case: Case, fld: Field, sun_elevation, sun_azimuth, dni, aim=None, active=None, grid=None,
+                   rays_per_heliostat: int | None = None, n_seeds: int | None = None, seed0: int | None = None):
+    """Independent realisations -> mean flux map and statistical uncertainty.
+
+    Returns (mean MCRTResult, stats dict with the standard error of the total
+    power and of the peak, and the relative standard error at the mean-map peak).
+    """
+    k = int(n_seeds or case.mcrt.n_seeds)
+    s0 = case.mcrt.seed if seed0 is None else seed0
+    runs = [trace(case, fld, sun_elevation, sun_azimuth, dni, aim, active, grid, rays_per_heliostat, s0 + j)
+            for j in range(max(1, k))]
+    flux = np.mean([r.flux for r in runs], axis=0)
+    power = {key: float(np.mean([r.power[key] for r in runs])) for key in runs[0].power}
+    per_h = np.mean([r.heliostat_power for r in runs], axis=0)
+    mean = MCRTResult(flux, power, per_h, sum(r.n_rays for r in runs), runs[0].grid, s0, runs[0].rays_per_heliostat)
+    p_rec = np.array([r.power["intercept"] for r in runs])
+    peaks = np.array([r.flux.max() for r in runs])
+    j = np.unravel_index(int(np.argmax(flux)), flux.shape)
+    at_peak = np.array([r.flux[j] for r in runs])
+    n = len(runs)
+    se = (lambda x: float(x.std(ddof=1) / np.sqrt(n)) if n > 1 else float("nan"))
+    stats = {
+        "engine": "cspaps-mcrt", "seeds": [s0 + j for j in range(n)], "rays_per_heliostat": runs[0].rays_per_heliostat,
+        "grid": list(flux.shape[::-1]),
+        "power_on_receiver_mw": {"mean": float(p_rec.mean() / 1e6), "std_error": se(p_rec / 1e6)},
+        "peak_flux_kw_m2": {"mean_of_runs": float(peaks.mean() / 1e3), "std_error": se(peaks / 1e3),
+                            "of_mean_map": float(flux.max() / 1e3)},
+        "relative_std_error_at_peak_cell": float(se(at_peak) / at_peak.mean()) if at_peak.mean() > 0 else float("nan"),
+        "note": "the maximum of a noisy map is biased high; compare the mean map and its standard error",
+    }
+    return mean, stats
+
+
+def convergence(case: Case, fld: Field, sun_elevation, sun_azimuth, dni, aim=None, active=None,
+                ray_counts=(250, 500, 1000, 2000, 4000), n_seeds: int = 3) -> list[dict]:
+    """Peak and power versus rays per heliostat (each with n_seeds realisations)."""
+    out = []
+    for nr in ray_counts:
+        _, st = trace_repeated(case, fld, sun_elevation, sun_azimuth, dni, aim, active, None, nr, n_seeds)
+        out.append({"rays_per_heliostat": nr, "power_mw": st["power_on_receiver_mw"]["mean"],
+                    "power_se_mw": st["power_on_receiver_mw"]["std_error"],
+                    "peak_kw_m2": st["peak_flux_kw_m2"]["of_mean_map"],
+                    "peak_se_kw_m2": st["peak_flux_kw_m2"]["std_error"],
+                    "rel_se_at_peak": st["relative_std_error_at_peak_cell"]})
+    return out
 
 
 def compare(analytic: Snapshot, ray: MCRTResult) -> dict:
@@ -220,5 +281,13 @@ def compare(analytic: Snapshot, ray: MCRTResult) -> dict:
         "peak_flux_kw_m2": {"analytic": round(float(fa.max()) / 1e3, 1), "mcrt": round(float(fm.max()) / 1e3, 1)},
         "flux_map_nrmse": round(rms, 4),
         "flux_map_correlation": round(float(np.corrcoef(fa.ravel(), fm.ravel())[0, 1]), 4),
+        "hotspot": {"analytic_azimuth_deg": round(float(ray.grid.azimuth_deg[np.unravel_index(int(np.argmax(fa)), fa.shape)[1]]), 2),
+                    "mcrt_azimuth_deg": round(float(ray.grid.azimuth_deg[np.unravel_index(int(np.argmax(fm)), fm.shape)[1]]), 2),
+                    "analytic_z_m": round(float(ray.grid.z[np.unravel_index(int(np.argmax(fa)), fa.shape)[0]]), 3),
+                    "mcrt_z_m": round(float(ray.grid.z[np.unravel_index(int(np.argmax(fm)), fm.shape)[0]]), 3)},
+        "difference_direction": "analytic minus MCRT",
         "n_rays": ray.n_rays,
+        "seed": ray.seed,
+        "rays_per_heliostat": ray.rays_per_heliostat,
+        "grid": [int(ray.grid.azimuth_deg.size), int(ray.grid.z.size)],
     }

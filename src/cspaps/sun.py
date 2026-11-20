@@ -117,6 +117,7 @@ class Samples:
     weight_h: np.ndarray
     times: pd.DatetimeIndex | None = None
     label: str = ""
+    members: np.ndarray | None = None  # hourly samples merged into each state (binned methods)
 
     def __len__(self) -> int:
         return int(self.elevation.size)
@@ -176,7 +177,8 @@ def representative_day_samples(case: Case) -> Samples:
     return _filter(case, Samples(el, az, dni_v, np.asarray(weights), idx, "representative_days"))
 
 
-def sun_bins(samples: Samples, n_bins: int, seed: int = 0, iters: int = 100, z_weight: float = 3.0) -> Samples:
+def sun_bins(samples: Samples, n_bins: int, seed: int = 0, iters: int = 100, z_weight: float = 3.0,
+             dni_bands: int = 1) -> Samples:
     """Cluster sun positions into ``n_bins`` representative positions (weighted k-means).
 
     Weights are the DNI energy of each sample. Clustering runs on the sun
@@ -187,6 +189,9 @@ def sun_bins(samples: Samples, n_bins: int, seed: int = 0, iters: int = 100, z_w
     of its members. For any quantity linear in DNI the annual sum is therefore
     preserved; the only approximation is evaluating each bin at one direction.
     With the default 30 bins the annual energy is within ~0.5 % of hourly.
+    ``dni_bands`` > 1 splits every bin by DNI quantiles: needed when the power
+    is not linear in DNI (flux-limited APS), where merging a 300 W/m2 and a
+    1200 W/m2 state overestimates the energy.
     """
     scale = np.array([1.0, 1.0, z_weight])
     v = sun_vector(samples.elevation, samples.azimuth) * scale
@@ -217,20 +222,68 @@ def sun_bins(samples: Samples, n_bins: int, seed: int = 0, iters: int = 100, z_w
             break
         c = new
     label = np.argmin(((v[:, None, :] - c[None]) ** 2).sum(-1), axis=1)
-    energy = np.bincount(label, weights=w, minlength=len(c))  # Wh/m2
-    dni_rep = np.bincount(label, weights=w * samples.dni, minlength=len(c))
+    return _aggregate(samples, label, scale, dni_bands, "sun_bins")
+
+
+def _aggregate(samples: Samples, label: np.ndarray, scale: np.ndarray, dni_bands: int, name: str) -> Samples:
+    """One representative state per label (optionally split into DNI bands)."""
+    v = sun_vector(samples.elevation, samples.azimuth) * scale
+    w = samples.dni * samples.weight_h
+    if dni_bands > 1:
+        # split every bin by DNI quantiles so that flux-limited states are not averaged with weak ones
+        new = np.zeros_like(label)
+        nxt = 0
+        for lab in np.unique(label):
+            idx = np.flatnonzero(label == lab)
+            edges = np.quantile(samples.dni[idx], np.linspace(0, 1, dni_bands + 1)[1:-1]) if idx.size > 1 else []
+            band = np.searchsorted(edges, samples.dni[idx], side="right") if len(edges) else np.zeros(idx.size, int)
+            _, band = np.unique(band, return_inverse=True)
+            new[idx] = nxt + band
+            nxt += int(band.max()) + 1
+        label = new
+    n_lab = int(label.max()) + 1 if label.size else 0
+    energy = np.bincount(label, weights=w, minlength=n_lab)  # Wh/m2
     keep = energy > 0
-    dni_rep = dni_rep[keep] / energy[keep]
-    el, az = vector_to_angles(c[keep] / scale)
-    return Samples(el, az, dni_rep, energy[keep] / dni_rep, None, "sun_bins")
+    cen = np.zeros((n_lab, 3))
+    np.add.at(cen, label, w[:, None] * v)
+    cen = cen[keep] / energy[keep, None]
+    dni_rep = np.bincount(label, weights=w * samples.dni, minlength=n_lab)[keep] / energy[keep]
+    el, az = vector_to_angles(cen / scale)
+    out = Samples(el, az, dni_rep, energy[keep] / dni_rep, None, name)
+    out.members = np.bincount(label, minlength=n_lab)[keep]
+    return out
 
 
-def annual_samples(case: Case, method: str | None = None, n_bins: int | None = None) -> Samples:
-    method = method or case.annual.method
+def sun_grid(samples: Samples, el_step_deg: float = 10.0, az_step_deg: float = 20.0, dni_bands: int = 1) -> Samples:
+    """Bin sun positions on a fixed elevation x azimuth grid (energy-weighted centroid per bin)."""
+    lab_el = np.floor(samples.elevation / el_step_deg).astype(int)
+    lab_az = np.floor(samples.azimuth / az_step_deg).astype(int)
+    _, label = np.unique(lab_el * 1000 + lab_az, return_inverse=True)
+    return _aggregate(samples, label, np.ones(3), dni_bands, "sun_grid")
+
+
+def annual_samples(case: Case, method: str | None = None, n_bins: int | None = None,
+                   dni_bands: int | None = None) -> Samples:
+    a = case.annual
+    method = method or a.method
+    bands = a.dni_bands if dni_bands is None else dni_bands
     if method == "hourly":
         return hourly_samples(case)
     if method == "representative_days":
         return representative_day_samples(case)
     if method == "sun_bins":
-        return sun_bins(hourly_samples(case), n_bins or case.annual.n_sun_bins)
+        return sun_bins(hourly_samples(case), n_bins or a.n_sun_bins, dni_bands=bands)
+    if method == "sun_grid":
+        return sun_grid(hourly_samples(case), a.grid_elevation_step_deg, a.grid_azimuth_step_deg, bands)
     raise ValueError(f"Unknown annual method '{method}'")
+
+
+def sampling_record(case: Case, samples: Samples, aiming: str) -> dict:
+    """What an annual number was computed with (for traceability)."""
+    return {
+        "method": samples.label, "n_states": len(samples), "aiming": aiming,
+        "weather": case.weather.file if case.weather.source == "file" else f"clear_sky ({case.sun.dni_model})",
+        "annual_dni_kwh_m2": round(samples.dni_hours, 2),
+        "min_sun_elevation_deg": case.annual.min_sun_elevation_deg,
+        "weights": "hours per state (DNI x hours = DNI energy of the merged hours)",
+    }

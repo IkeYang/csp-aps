@@ -23,6 +23,7 @@ from . import optics, shading, sun
 from .config import Case
 from .field import Field
 from .receiver import ReceiverGrid, build_grid, default_aim, surface_point
+from .uniformity import region_of_grid, uniformity_metrics
 
 STAGES = ("sun", "cosine", "reflectivity", "shading", "blocking", "attenuation", "intercept")
 LOSSES = STAGES[1:]
@@ -39,9 +40,11 @@ class Snapshot:
     active: np.ndarray  # (N,) bool, False = defocused / standby
     eta: dict[str, np.ndarray]  # per-heliostat efficiencies, keys = LOSSES
     power: dict[str, np.ndarray]  # per-heliostat power after each stage, W
-    flux: np.ndarray  # (n_height, n_azimuth) W/m2
+    flux: np.ndarray  # (n_height, n_azimuth) incident flux, W/m2
     grid: ReceiverGrid = dc_field(repr=False)
-    limit_kw_m2: float = 1000.0
+    region: np.ndarray | None = dc_field(default=None, repr=False)  # (M,) preheater cells H
+    beams: dict | None = dc_field(default=None, repr=False)  # aim_xyz, t, sigma, power of active beams
+    margin: float = 0.0
 
     @property
     def n(self) -> int:
@@ -53,20 +56,53 @@ class Snapshot:
 
     @property
     def p_receiver(self) -> float:
+        """Intercepted (incident) power on the receiver surface, W."""
         return float(self.power["intercept"].sum())
+
+    @property
+    def absorbed_flux(self) -> np.ndarray:
+        return self.flux * self.grid.to_map(self.grid.alpha)
+
+    @property
+    def p_absorbed(self) -> float:
+        """Absorbed power, W (intercepted power x flux-weighted absorptivity)."""
+        f = self.flux.sum()
+        if f <= 0:
+            return float(self.p_receiver * self.grid.alpha.mean())
+        return float(self.p_receiver * (self.absorbed_flux.sum() / f))
 
     def flux_stats(self) -> dict:
         kw = self.flux / 1e3
-        lit = kw[kw > 0.05 * kw.max()] if kw.max() > 0 else kw.ravel()
-        ring = kw.sum(axis=0)  # height-integrated, per azimuth column
+        ratio = self.grid.to_map(self.flux.ravel() / self.grid.limit)
+        j = np.unravel_index(int(np.argmax(ratio)), ratio.shape)
+        lim_kw = self.grid.to_map(self.grid.limit)[j] / 1e3
+        region = self.grid.to_map(self.region) if self.region is not None else None
+        u = uniformity_metrics(self.absorbed_flux, region)
         return {
             "peak_flux_kw_m2": round(float(kw.max()), 2),
             "mean_flux_kw_m2": round(float(kw.mean()), 2),
-            "peak_to_limit": round(float(kw.max()) / self.limit_kw_m2, 4),
-            "peak_to_mean_lit": round(float(kw.max() / lit.mean()), 3) if lit.size and lit.mean() > 0 else 0.0,
-            "circumferential_cv": round(float(ring.std() / ring.mean()), 4) if ring.mean() > 0 else 0.0,
+            "peak_to_limit": round(float(ratio.max()), 4),
+            "hotspot_panel": int(self.grid.to_map(self.grid.panel)[j]) + 1,
+            "hotspot_azimuth_deg": round(float(self.grid.azimuth_deg[j[1]]), 2),
+            "hotspot_z_m": round(float(self.grid.z[j[0]]), 3),
+            "margin_at_hotspot_kw_m2": round(float(lim_kw - kw[j]), 2),
+            "cv_2d": round(u["cv_2d"], 4),
+            "cv_circumferential": round(u["cv_circ"], 4),
+            "cv_height": round(u["cv_height"], 4),
             "flux_map_power_mw": round(float(self.flux.sum()) * self.grid.cell_area / 1e6, 4),
+            "flux_basis": "coarse grid; see flux_check for the verified peak",
         }
+
+    def verify(self, rec, margin: float | None = None, max_cells: int = 400_000):
+        """Fine-grid feasibility check of this snapshot's beams (uses the DNI it was evaluated with)."""
+        from .verify import verify_beams
+
+        b = self.beams
+        if b is None:
+            raise ValueError("snapshot has no beam data (evaluated with with_flux=False?)")
+        chk = verify_beams(rec, b["aim_xyz"], b["t"], b["sigma"], b["power"],
+                           self.margin if margin is None else margin, max_cells=max_cells)
+        return chk.remap(b["index"])
 
     def summary(self) -> dict:
         totals = {k: float(v.sum()) for k, v in self.power.items()}
@@ -79,6 +115,8 @@ class Snapshot:
             "n_heliostats": self.n,
             "n_defocused": int((~self.active).sum()),
             "power_mw": {k: round(v / 1e6, 4) for k, v in totals.items()},
+            "intercepted_power_mw": round(totals["intercept"] / 1e6, 4),
+            "absorbed_power_mw": round(self.p_absorbed / 1e6, 4),
             "field_efficiency": {
                 k: round(totals[k] / totals[prev], 5) if totals[prev] > 0 else 0.0
                 for prev, k in zip(STAGES[:-1], STAGES[1:])
@@ -117,10 +155,11 @@ def evaluate(
     aim_z = np.asarray(aim_z, dtype=float)
     active = np.ones(n, dtype=bool) if active is None else np.asarray(active, dtype=bool)
     zeros = np.zeros(n)
+    region = region_of_grid(case, grid)
     if sun_elevation <= 0 or n == 0 or not np.any(dni_v > 0):
         return Snapshot(time, sun_elevation, sun_azimuth, dni_v, aim_az, aim_z, active,
                         {k: zeros.copy() for k in LOSSES}, {k: zeros.copy() for k in STAGES},
-                        np.zeros(grid.shape), grid, rec.max_flux_kw_m2)
+                        np.zeros(grid.shape), grid, region, None, case.aps.safety_margin)
 
     s = sun.sun_vector(sun_elevation, sun_azimuth)
     aim_xyz = surface_point(rec, aim_az, aim_z)
@@ -148,13 +187,16 @@ def evaluate(
     for prev, k in zip(STAGES[:-1], STAGES[1:]):
         power[k] = power[prev] * eta[k]
 
+    beams = None
     if with_flux:
         p_att = power["attenuation"] * active
-        flux_flat, _ = optics.flux_on_receiver(grid, aim_xyz[active], t[active], sigma[active], p_att[active])
+        on = np.flatnonzero(active & (p_att > 0))
+        flux_flat, _ = optics.flux_on_receiver(grid, aim_xyz[on], t[on], sigma[on], p_att[on])
+        beams = {"aim_xyz": aim_xyz[on], "t": t[on], "sigma": sigma[on], "power": p_att[on], "index": on}
     else:
         flux_flat = np.zeros(grid.points.shape[0])
     return Snapshot(time, float(sun_elevation), float(sun_azimuth), dni_v, aim_az, aim_z, active,
-                    eta, power, grid.to_map(flux_flat), grid, rec.max_flux_kw_m2)
+                    eta, power, grid.to_map(flux_flat), grid, region, beams, case.aps.safety_margin)
 
 
 def sun_state(case: Case, time) -> tuple[pd.Timestamp, float, float, float]:
@@ -196,6 +238,7 @@ class AnnualResult:
     method: str = ""
     aiming: str = "center"
     runtime_s: float = 0.0
+    sampling: dict = dc_field(default_factory=dict)
 
     def summary(self) -> dict:
         e = self.energy_mwh
@@ -204,6 +247,7 @@ class AnnualResult:
         return {
             "method": self.method,
             "aiming": self.aiming,
+            "sampling": self.sampling,
             "n_sun_states": int(len(ts)),
             "energy_mwh": {k: round(v, 2) for k, v in e.items()},
             "annual_efficiency": {
@@ -212,9 +256,50 @@ class AnnualResult:
             },
             "total_optical_efficiency": round(e["intercept"] / e["sun"], 5) if e["sun"] > 0 else 0.0,
             "max_peak_flux_kw_m2": round(float(ts["peak_flux_kw_m2"].max()), 2) if len(ts) else 0.0,
+            "max_peak_to_limit": round(float(ts["peak_to_limit"].max()), 4) if len(ts) else 0.0,
             "hours_over_flux_limit": round(float(over), 1),
+            "absorbed_energy_mwh": round(float((ts["p_absorbed_mw"] * ts["weight_h"]).sum()), 2) if len(ts) else 0.0,
+            "peak_basis": "verified fine grid" if self.aiming != "center" else "coarse grid",
             "runtime_s": round(self.runtime_s, 2),
         }
+
+
+def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading_points):
+    """Evaluate one sun state; returns (stage power arrays, row dict)."""
+    if aiming == "center":
+        snap = evaluate(case, fld, el, az, dni_v, grid=grid, with_flux=with_flux, time=ts,
+                        shading_points=shading_points)
+        peak = snap.flux.max() / 1e3
+        ratio = float((snap.flux.ravel() / grid.limit).max())
+        status = ""
+    else:
+        from .aps import optimize_aims  # local import: aps depends on this module
+
+        res = optimize_aims(case, fld, el, az, dni_v, method=aiming, grid=grid, shading_points=shading_points)
+        snap = evaluate(case, fld, el, az, dni_v, aim=res.aim, active=res.active, grid=grid,
+                        with_flux=True, time=ts, shading_points=shading_points)
+        if res.check is not None:
+            peak, ratio = res.check.peak_flux_kw_m2, res.check.peak_ratio
+        else:
+            peak, ratio = snap.flux.max() / 1e3, float((snap.flux.ravel() / grid.limit).max())
+        status = res.status
+    flux_on = with_flux or aiming != "center"
+    row = {
+        "time": ts, "sun_elevation_deg": el, "sun_azimuth_deg": az,
+        "dni_w_m2": dni_v, "p_receiver_mw": snap.p_receiver / 1e6, "p_absorbed_mw": snap.p_absorbed / 1e6,
+        "optical_efficiency": snap.p_receiver / snap.power["sun"].sum() if snap.power["sun"].sum() > 0 else 0.0,
+        "peak_flux_kw_m2": peak, "peak_to_limit": ratio, "over_limit": bool(flux_on and ratio > 1.0 + 1e-9),
+        "n_defocused": int((~snap.active).sum()), "aps_status": status,
+    }
+    return {k: snap.power[k] for k in STAGES}, row
+
+
+def _annual_chunk(args):
+    case, xyz, ids, items, aiming, with_flux, shading_points = args
+    fld = Field(xyz, ids)
+    grid = build_grid(case.receiver)
+    return [(i, *_annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points))
+            for i, el, az, d, ts in items]
 
 
 def annual(
@@ -227,52 +312,57 @@ def annual(
     with_flux: bool = True,
     shading_points: int | None = None,
     progress: Callable[[int, int], None] | None = None,
+    workers: int | None = None,
 ) -> AnnualResult:
     """Annual energy on the receiver.
 
-    method: "sun_bins" (representative sun positions, fast), "representative_days"
-    or "hourly". aiming: "center" or an APS method ("kfactor", "greedy", "milp")
-    which then enforces the flux limit at every sun state.
+    method: "sun_bins" (representative sun positions, fast), "sun_grid",
+    "representative_days" or "hourly". aiming: "center" or an APS method
+    ("kfactor", "greedy", "milp") which then enforces the flux limit (verified)
+    at every sun state. Sun states are independent and run in parallel with
+    ``workers`` processes (default ``annual.workers``).
     """
+    from .parallel import n_workers, pool
+
     t0 = _time.perf_counter()
     method = method or case.annual.method
     aiming = aiming or case.annual.aiming
     grid = grid or build_grid(case.receiver)
     samples = samples or sun.annual_samples(case, method)
-    limit = case.receiver.max_flux_kw_m2
+    n_s = len(samples)
+    items = [(i, float(samples.elevation[i]), float(samples.azimuth[i]), float(samples.dni[i]),
+              samples.times[i] if samples.times is not None else None) for i in range(n_s)]
+    nw = min(n_workers(case.annual.workers if workers is None else workers), max(n_s, 1))
+    results: list = [None] * n_s
+    if nw > 1 and n_s > 1:
+        chunks = [items[k::nw] for k in range(nw)]
+        with pool(nw) as p:
+            done = 0
+            for out in p.imap_unordered(_annual_chunk, [(case, fld.xyz, fld.ids, c, aiming, with_flux, shading_points)
+                                                        for c in chunks]):
+                for i, powers, row in out:
+                    results[i] = (powers, row)
+                done += len(out)
+                if progress:
+                    progress(done, n_s)
+    else:
+        for i, el, az, d, ts in items:
+            results[i] = _annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points)
+            if progress:
+                progress(i + 1, n_s)
     energy = {k: 0.0 for k in STAGES}
     per_rec = np.zeros(fld.n)
     per_sun = np.zeros(fld.n)
     rows = []
-    for idx in range(len(samples)):
-        el, az, dni_v, w = (samples.elevation[idx], samples.azimuth[idx],
-                            samples.dni[idx], samples.weight_h[idx])
-        ts = samples.times[idx] if samples.times is not None else None
-        if aiming == "center":
-            snap = evaluate(case, fld, el, az, dni_v, grid=grid, with_flux=with_flux, time=ts,
-                            shading_points=shading_points)
-        else:
-            from .aps import optimize_aims  # local import: aps depends on this module
-
-            res = optimize_aims(case, fld, el, az, dni_v, method=aiming, grid=grid,
-                                shading_points=shading_points)
-            snap = evaluate(case, fld, el, az, dni_v, aim=res.aim, active=res.active, grid=grid,
-                            with_flux=True, time=ts, shading_points=shading_points)
+    for i, (powers, row) in enumerate(results):
+        w = float(samples.weight_h[i])
         for k in STAGES:
-            energy[k] += snap.power[k].sum() * w / 1e6  # W*h -> MWh
-        per_rec += snap.power["intercept"] * w / 1e6
-        per_sun += snap.power["sun"] * w / 1e6
-        peak = snap.flux.max() / 1e3
-        rows.append({
-            "time": ts, "sun_elevation_deg": el, "sun_azimuth_deg": az, "weight_h": w,
-            "dni_w_m2": dni_v, "p_receiver_mw": snap.p_receiver / 1e6,
-            "optical_efficiency": snap.p_receiver / snap.power["sun"].sum() if snap.power["sun"].sum() > 0 else 0.0,
-            "peak_flux_kw_m2": peak, "over_limit": bool(with_flux and peak > limit),
-            "n_defocused": int((~snap.active).sum()),
-        })
-        if progress:
-            progress(idx + 1, len(samples))
+            energy[k] += powers[k].sum() * w / 1e6  # W*h -> MWh
+        per_rec += powers["intercept"] * w / 1e6
+        per_sun += powers["sun"] * w / 1e6
+        rows.append({**row, "weight_h": w})
     with np.errstate(invalid="ignore", divide="ignore"):
         eff = np.where(per_sun > 0, per_rec / per_sun, 0.0)
-    return AnnualResult(energy, per_rec, eff, pd.DataFrame(rows), method, aiming,
-                        _time.perf_counter() - t0)
+    res = AnnualResult(energy, per_rec, eff, pd.DataFrame(rows), method, aiming, _time.perf_counter() - t0)
+    res.sampling = sun.sampling_record(case, samples, aiming)
+    return res

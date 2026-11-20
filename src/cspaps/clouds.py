@@ -26,6 +26,8 @@ class Cloud:
     vx: float = 0.0  # shadow velocity, m/s
     vy: float = 0.0
     edge: float = 30.0  # width of the soft edge, m
+    t_start_s: float | None = None  # the cloud exists from this time (s after t0) ...
+    t_end_s: float | None = None  # ... until this time (None = always); models sudden clearing
 
 
 class CloudField:
@@ -37,6 +39,8 @@ class CloudField:
         dt = (pd.Timestamp(t) - self.t0).total_seconds()
         f = np.ones(len(xy))
         for c in self.clouds:
+            if (c.t_start_s is not None and dt < c.t_start_s) or (c.t_end_s is not None and dt >= c.t_end_s):
+                continue
             d = np.hypot(xy[:, 0] - (c.x + c.vx * dt), xy[:, 1] - (c.y + c.vy * dt))
             # smoothstep from 0 (outside) to 1 (inside) across the edge band
             s = np.clip((c.radius - d) / max(c.edge, 1e-6) + 0.5, 0.0, 1.0)
@@ -86,10 +90,33 @@ def random_clouds(spec: dict, fld: Field, duration_s: float, center_xy=(0.0, 0.0
     return clouds
 
 
+def scenario_clouds(case: Case, fld: Field) -> list[Cloud]:
+    """Built-in replay scenarios.
+
+    moving_edge  : a cloud bank much larger than the field drifts across it, so a
+                   straight soft edge sweeps over the heliostats
+    sudden_clear : a cloud covering half of the field disappears at mid-replay
+    """
+    rt = case.realtime
+    rec = case.receiver
+    cx, cy = rec.center[0], rec.center[1]
+    extent = float(np.hypot(*(fld.xyz[:, :2] - [cx, cy]).T).max()) if fld.n else 300.0
+    duration = rt.duration_min * 60.0
+    if rt.scenario == "moving_edge":
+        radius = 20 * extent
+        speed = 2.0 * extent / max(duration, 1.0)  # the edge crosses the whole field during the replay
+        return [Cloud(cx - radius - extent, cy, radius, transmittance=0.1, vx=speed, vy=0.0, edge=60.0)]
+    if rt.scenario == "sudden_clear":
+        return [Cloud(cx - 0.6 * extent, cy, 0.9 * extent, transmittance=0.1, edge=40.0,
+                      t_end_s=0.5 * duration)]
+    return []
+
+
 def cloud_field(case: Case, fld: Field, t0: pd.Timestamp) -> CloudField:
     rt = case.realtime
     clouds = [Cloud(**c) for c in (rt.clouds or [])]
-    if rt.random_clouds:
+    clouds += scenario_clouds(case, fld)
+    if rt.random_clouds and rt.scenario == "clouds":
         rec = case.receiver
         clouds += random_clouds(rt.random_clouds, fld, rt.duration_min * 60.0, rec.center[:2])
     return CloudField(clouds, t0)
