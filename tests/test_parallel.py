@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import subprocess
 import sys
 import textwrap
@@ -5,10 +6,10 @@ import textwrap
 from .conftest import ROOT
 
 
-def test_parallel_run_from_unguarded_script(tmp_path):
-    """A script without a __main__ guard must not be re-executed by the worker processes."""
-    script = tmp_path / "unguarded.py"
-    script.write_text(textwrap.dedent(f"""
+def test_parallel_run_from_script(tmp_path):
+    """Fork runs top-level scripts directly. Spawn requires a guarded application entry."""
+    script = tmp_path / "parallel_annual.py"
+    body = textwrap.dedent(f"""
         import sys
         sys.path.insert(0, {str(ROOT)!r})
         print("TOP-LEVEL", flush=True)
@@ -21,7 +22,10 @@ def test_parallel_run_from_unguarded_script(tmp_path):
         bins = sun.sun_bins(sun.hourly_samples(case), 4)
         r = annual(case, fld, samples=bins, with_flux=False, workers=2)
         print("ENERGY", r.energy_mwh["intercept"], flush=True)
-    """))
+    """)
+    if "fork" not in mp.get_all_start_methods():
+        body = 'if __name__ == "__main__":\n' + textwrap.indent(body, "    ")
+    script.write_text(body)
     out = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, out.stderr
     assert out.stdout.count("TOP-LEVEL") == 1
