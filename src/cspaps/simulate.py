@@ -239,6 +239,7 @@ class AnnualResult:
     aiming: str = "center"
     runtime_s: float = 0.0
     sampling: dict = dc_field(default_factory=dict)
+    state_power_w: np.ndarray | None = dc_field(default=None, repr=False)  # (S, N) intercepted power per state
 
     def summary(self) -> dict:
         e = self.energy_mwh
@@ -348,6 +349,7 @@ def annual(
     shading_points: int | None = None,
     progress: Callable[[int, int], None] | None = None,
     workers: int | None = None,
+    keep_state_power: bool = False,
 ) -> AnnualResult:
     """Annual energy on the receiver.
 
@@ -355,7 +357,8 @@ def annual(
     "representative_days" or "hourly". aiming: "center" or an APS method
     ("kfactor", "greedy", "milp") which then enforces the flux limit (verified)
     at every sun state. Sun states are independent and run in parallel with
-    ``workers`` processes (default ``annual.workers``).
+    ``workers`` processes (default ``annual.workers``). ``keep_state_power``
+    keeps the (states x heliostats) intercepted power in ``state_power_w``.
     """
     from .parallel import n_workers, pool
 
@@ -400,4 +403,7 @@ def annual(
         eff = np.where(per_sun > 0, per_rec / per_sun, 0.0)
     res = AnnualResult(energy, per_rec, eff, pd.DataFrame(rows), method, aiming, _time.perf_counter() - t0)
     res.sampling = sun.sampling_record(case, samples, aiming)
+    if keep_state_power:
+        res.state_power_w = (np.stack([powers["intercept"] for powers, _ in results]) if results
+                             else np.zeros((0, fld.n)))
     return res

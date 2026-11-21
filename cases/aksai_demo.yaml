@@ -153,6 +153,7 @@ layout_opt:
   swap_fraction: 0.02
   shading_points: 4
   upper_bound: true
+  uniformity_weight: 0.3
 
 mcrt:
   rays_per_heliostat: 300

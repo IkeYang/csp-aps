@@ -148,6 +148,26 @@ def uniformity_curves(curves: dict[str, list[dict]]):
     return _base_layout(fig, "吸热功率与热流均匀度", 360)
 
 
+def _sparse_labels(x, y, labels, min_sep: float = 0.07) -> list[str]:
+    """Keep a text label only where it does not crowd the previously labelled point (normalised axes)."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    sx = np.ptp(x) or 1.0
+    sy = np.ptp(y) or 1.0
+    out, last = [], None
+    for i, lab in enumerate(labels):
+        p = np.array([x[i] / sx, y[i] / sy])
+        if last is None or i == len(labels) - 1 or np.hypot(*(p - last)) >= min_sep:
+            out.append(lab)
+            last = p
+        else:
+            out.append("")
+    if len(out) > 1 and out[-1] and last is not None:
+        prev = [i for i, t in enumerate(out[:-1]) if t]
+        if prev and np.hypot(x[-1] / sx - x[prev[-1]] / sx, y[-1] / sy - y[prev[-1]] / sy) < min_sep:
+            out[prev[-1]] = "" if prev[-1] != 0 else out[prev[-1]]
+    return out
+
+
 # --------------------------------------------------------------------------- certificates & overview
 
 def plant_scene(case: Case, xyz: np.ndarray, values=None, label: str = "", height: int = 460):
@@ -203,7 +223,8 @@ def pareto_chart(rows: list[dict], selected: float | None = None, height: int = 
     text = [f"λ = {l:g}" for l in lam]
     hover = [f"λ = {l:g}<br>二维 CV {c:.3f}<br>吸收功率 {p:.3f} MW" + (f"<br>最优性差距 ≤ {g:.2%}" if g is not None else "")
              for l, c, p, g in zip(lam, cv, pw, gaps)]
-    fig.add_trace(go.Scatter(x=cv, y=pw, mode="lines+markers+text", text=text, textposition="top right",
+    fig.add_trace(go.Scatter(x=cv, y=pw, mode="lines+markers+text", text=_sparse_labels(cv, pw, text),
+                             textposition="top right",
                              line=dict(color=TEAL, width=2), marker=dict(size=9, color=TEAL, line=dict(color="white", width=1)),
                              hovertext=hover, hoverinfo="text", name="已复核方案"))
     if selected is not None and selected in lam:
@@ -292,5 +313,47 @@ def history_chart(history, height: int = 300):
     fig.add_trace(go.Scatter(x=h["evaluation"], y=h["energy_mwh"].cummax(), mode="lines", line=dict(color=TEAL, width=2),
                              name="迄今最优"))
     fig.update_xaxes(title="布局评价次数")
-    fig.update_yaxes(title="年吸收热量 (MWhₜₕ)")
+    fig.update_yaxes(title="搜索目标 J (MWhₜₕ)")
+    return _base_layout(fig, "", height)
+
+
+def receiver_rose(share, centers_deg, compare=None, height: int = 380):
+    """Share of the annual absorbed energy per receiver azimuth sector (compass rose)."""
+    width = 360.0 / max(len(centers_deg), 1)
+    fig = go.Figure()
+    if compare is not None:
+        fig.add_trace(go.Barpolar(r=[100 * v for v in compare[1]], theta=centers_deg, width=[width * 0.9] * len(centers_deg),
+                                  marker=dict(color="rgba(194,69,58,0.25)", line=dict(color=RED, width=1)),
+                                  name=compare[0], hovertemplate="%{theta:.0f}°：%{r:.1f}%<extra>" + compare[0] + "</extra>"))
+    fig.add_trace(go.Barpolar(r=[100 * v for v in share], theta=centers_deg, width=[width * 0.9] * len(centers_deg),
+                              marker=dict(color=TEAL, opacity=0.85, line=dict(color="white", width=1)), name="本方案",
+                              hovertemplate="%{theta:.0f}°：%{r:.1f}%<extra>本方案</extra>"))
+    fig.update_layout(polar=dict(barmode="overlay",
+                                 angularaxis=dict(direction="clockwise", rotation=90, tickmode="array",
+                                                  tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
+                                                  ticktext=["北", "东北", "东", "东南", "南", "西南", "西", "西北"]),
+                                 radialaxis=dict(ticksuffix="%", angle=60, tickfont=dict(size=10))),
+                      showlegend=compare is not None)
+    return _base_layout(fig, "", height)
+
+
+def layout_tradeoff_chart(rows: list[dict], selected: float | None = None, height: int = 360):
+    """Annual energy vs circumferential CV of the layout for the weights lambda_L."""
+    cv = [r["cv_circ_weighted"] for r in rows]
+    e = [r["energy_mwh"] for r in rows]
+    lam = [r["lambda"] for r in rows]
+    hover = [f"λ_L = {l:g}<br>周向 CV {c:.3f}<br>年吸收 {v:,.0f} MWh<br>北侧镜子 {100 * r['north_fraction']:.0f}%"
+             for l, c, v, r in zip(lam, cv, e, rows)]
+    fig = go.Figure(go.Scatter(x=cv, y=e, mode="lines+markers+text",
+                               text=_sparse_labels(cv, e, [f"λ_L = {l:g}" for l in lam]),
+                               textposition="top right", hovertext=hover, hoverinfo="text",
+                               line=dict(color=NAVY, width=2), marker=dict(size=9, color=AMBER,
+                                                                          line=dict(color="white", width=1))))
+    if selected is not None and selected in lam:
+        j = lam.index(selected)
+        fig.add_trace(go.Scatter(x=[cv[j]], y=[e[j]], mode="markers", hoverinfo="skip",
+                                 marker=dict(size=17, color="rgba(0,0,0,0)", line=dict(color=TEAL, width=3))))
+    fig.update_xaxes(title="吸热器周向热流 CV（能量加权，越小越均匀）", autorange="reversed")
+    fig.update_yaxes(title="全年理论吸收热量 (MWhₜₕ)")
+    fig.update_layout(showlegend=False)
     return _base_layout(fig, "", height)

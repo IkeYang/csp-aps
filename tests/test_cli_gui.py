@@ -70,6 +70,9 @@ def test_cli_tools(case_file, tmp_path):
     assert main(["pareto", str(case_file), "--time", "2025-06-21 13:00", "--lambdas", "0", "1", "--out", str(out)]) == 0
     curve = json.loads((_run_dir(out, "pareto") / "pareto.json").read_text())["curve"]
     assert curve[1]["cv_2d"] <= curve[0]["cv_2d"] and all(r["gap"] is not None for r in curve)
+    assert main(["layout-tradeoff", str(case_file), "--lambdas", "0", "0.5", "--out", str(out)]) == 0
+    rows = json.loads((_run_dir(out, "layout_tradeoff") / "layout_tradeoff.json").read_text())["curve"]
+    assert rows[1]["cv_circ_weighted"] < rows[0]["cv_circ_weighted"]
 
 
 def test_gui_walkthrough(monkeypatch):
@@ -93,11 +96,20 @@ def test_gui_walkthrough(monkeypatch):
     for label in ("指令状态", "最高通量（复核）", "距上限余量", "散焦镜数", "数据新鲜度"):
         assert label in cards
     at.radio(key="page").set_value("布局优化").run()
+    at.slider(key="1:layout_opt.uniformity_weight").set_value(0.5).run()
+    assert at.session_state["case_dict"]["layout_opt"]["uniformity_weight"] == 0.5
     at.button(key="btn_opt").click().run()
     assert not at.exception
     res = at.session_state["res_opt"]
     ub = res["summary"]["upper_bound"]
     assert ub["upper_bound_mwh"] >= ub["found_energy_mwh"] > 0 and res["summary"]["existence"]["optimum_exists"]
+    uni = res["summary"]["uniformity"]
+    assert uni["weight"] == 0.5 and uni["north_fraction"] < 0.7
+    at.text_input(key="ltrade_lams").set_value("0, 0.5").run()
+    at.button(key="btn_ltrade").click().run()
+    assert not at.exception
+    curve = at.session_state["res_ltrade"]["summary"]["curve"]
+    assert curve[0]["north_fraction"] > curve[1]["north_fraction"]
     at.button(key="apply_layout").click().run()
     chk = at.session_state["apply_check"]
     assert chk["导出镜数"] == chk["重新载入镜数"] == 120 and chk["编号与坐标逐项一致"]

@@ -1,8 +1,12 @@
 """Outer loop: heliostat field layout optimisation.
 
-Objective: maximise the annual energy on the receiver for a fixed number of
+Objective: maximise the annual absorbed energy for a fixed number of
 heliostats (``layout_opt.n_heliostats``) inside the site (boundary, exclusion
-zone, minimum spacing).
+zone, minimum spacing), minus lambda_L (``layout_opt.uniformity_weight``) times
+the circumferential spread of the receiver flux, the part of the
+non-uniformity that the layout decides and no aiming strategy can remove
+(``layout_uniformity``). With lambda_L > 0 the N positions are chosen by an
+exchange search instead of the N highest energies, which surrounds the tower.
 
 Search
   1. A parametric generator (radial staggered or biomimetic spiral) fills the
@@ -70,6 +74,8 @@ class LayoutEval:
     aps_result: AnnualResult | None = dc_field(default=None, repr=False)
     center_energy_mwh: float | None = None
     search_aiming: str = "center"
+    uniformity: dict | None = None  # layout_uniformity.layout_metrics of the selected field (lambda_L > 0)
+    selection: dict | None = None  # exchange search info (swaps, time)
 
     @property
     def n(self) -> int:
@@ -95,34 +101,85 @@ def evaluate_layout(
     n_select: int | None,
     shading_points: int | None = None,
     aiming: str = "center",
+    lam: float | None = None,
 ) -> LayoutEval:
+    """Generate candidates, choose N of them and score the layout.
+
+    Score (``energy_mwh``) = annual absorbed energy (centre aiming, or the
+    feasible APS energy for an APS search) minus lambda_L times the annual
+    circumferential spread A_H sigma_circ (layout_uniformity). With lambda_L = 0
+    the N candidates with the highest annual energy are kept; otherwise the
+    exchange search of ``layout_uniformity.select`` maximises the score.
+    """
+    from . import layout_uniformity as lu
+
+    lam = case.layout_opt.uniformity_weight if lam is None else float(lam)
     try:
         xyz = generate(case, kind, params)
     except ValueError:
         return LayoutEval(params, 0, np.zeros((0, 3)), 0.0)
     if len(xyz) == 0:
         return LayoutEval(params, 0, xyz, 0.0)
+    keep_power = lam > 0
     center_all = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
-                        shading_points=shading_points, workers=1)
+                        shading_points=shading_points, workers=1, keep_state_power=keep_power)
     cand_xyz, cand_e = xyz, center_all.heliostat_energy_mwh
     n_cand = len(xyz)
     selected = bool(n_select and n_cand > n_select)
+    sel_info = None
     if selected:
-        # Center-aim single-mirror potential cheaply seeds a fixed-size candidate layout.
-        keep = np.sort(np.argsort(-center_all.heliostat_energy_mwh, kind="stable")[:n_select])
+        if lam > 0:
+            model = lu.build_model(case, xyz, samples, center_all.state_power_w, lam)
+            sel, sel_info = lu.select(model, n_select)
+            keep = np.flatnonzero(sel)
+        else:
+            # Center-aim single-mirror potential cheaply seeds a fixed-size candidate layout.
+            keep = np.sort(np.argsort(-center_all.heliostat_energy_mwh, kind="stable")[:n_select])
         xyz = xyz[keep]
     center_res = (annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
-                         shading_points=shading_points, workers=1) if selected else center_all)
+                         shading_points=shading_points, workers=1, keep_state_power=keep_power)
+                  if selected else center_all)
     center_energy = center_res.summary()["absorbed_energy_mwh"]
+    uni = lu.layout_metrics(case, xyz, samples, center_res.state_power_w, lam) if keep_power else None
+    penalty = lam * uni["circ_spread_mwh"] if uni else 0.0
     if aiming == "center":
-        return LayoutEval(params, n_cand, xyz, center_energy, center_res, cand_xyz, cand_e,
-                          center_energy_mwh=center_energy, search_aiming="center")
+        return LayoutEval(params, n_cand, xyz, center_energy - penalty, center_res, cand_xyz, cand_e,
+                          center_energy_mwh=center_energy, search_aiming="center", uniformity=uni,
+                          selection=sel_info)
     res = annual(case, Field(xyz), samples=samples, aiming=aiming, with_flux=True,
                  shading_points=shading_points, workers=1)
     aps_energy = res.summary()["feasible_absorbed_energy_mwh"]
-    return LayoutEval(params, n_cand, xyz, aps_energy, res, cand_xyz, cand_e,
+    return LayoutEval(params, n_cand, xyz, aps_energy - penalty, res, cand_xyz, cand_e,
                       aps_energy_mwh=aps_energy, aps_result=res, center_energy_mwh=center_energy,
-                      search_aiming=aiming)
+                      search_aiming=aiming, uniformity=uni, selection=sel_info)
+
+
+def layout_tradeoff(case: Case, kind: str, params: dict, samples: sun.Samples, n_select: int, lambdas,
+                    shading_points: int | None = None, certify: bool = True) -> list[dict]:
+    """Annual energy vs circumferential uniformity of the layout for several lambda_L (fixed generator)."""
+    from . import layout_uniformity as lu
+
+    xyz = generate(case, kind, params)
+    cand = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
+                  shading_points=shading_points, workers=1, keep_state_power=True)
+    rows = []
+    prev = None
+    for lam in sorted(float(v) for v in lambdas):
+        model = lu.build_model(case, xyz, samples, cand.state_power_w, lam)
+        sel, info = lu.select(model, n_select, init=prev)
+        prev = sel
+        lay = xyz[sel]
+        res = annual(case, Field(lay), samples=samples, aiming="center", with_flux=False,
+                     shading_points=shading_points, workers=1, keep_state_power=True)
+        met = lu.layout_metrics(case, lay, samples, res.state_power_w, lam)
+        row = {"lambda": lam, "energy_mwh": res.summary()["absorbed_energy_mwh"],
+               "cv_circ_weighted": met["cv_circ_weighted"], "centroid_offset_m": met["centroid_offset_m"],
+               "north_fraction": met["north_fraction"], "objective_mwh": met["objective_mwh"],
+               "sector_share": met["sector_share"], "swaps": info["swaps"], "xyz": lay}
+        if certify and lam > 0:
+            row["selection_gap"] = lu.selection_bound(model, n_select, sel, max_iter=120, time_limit_s=5.0)["gap"]
+        rows.append(row)
+    return rows
 
 
 class _Objective:
@@ -168,6 +225,12 @@ def validate_layout(case: Case, xyz: np.ndarray, n_required: int | None, spacing
         "required_min_spacing_m": round(spacing_m, 4), "pairs_too_close": close,
         "outside_site": int(out_idx.size), "boundary_tolerance_m": BOUNDARY_TOL_M, "violations": violations,
     }
+
+
+def _clean_uniformity(u: dict | None) -> dict | None:
+    if not u:
+        return None
+    return {k: (round(v, 5) if isinstance(v, float) else v) for k, v in u.items()}
 
 
 @dataclass
@@ -221,6 +284,7 @@ class LayoutOptResult:
             "validation": self.validation,
             "capacity": self.capacity,
             "upper_bound": self.bound,
+            "uniformity": _clean_uniformity(b.uniformity),
             "existence": self.existence(),
             "runtime_s": round(self.runtime_s, 1),
         }
@@ -263,6 +327,9 @@ def optimize_layout(
     names = list(bounds)
     say = progress or (lambda msg: None)
     stop = cancel or (lambda: False)
+    from . import layout_uniformity as lu
+
+    lam = float(spec.uniformity_weight)
     hourly = sun.hourly_samples(case)
     search_aiming = spec.search_aiming
     if search_aiming == "auto":
@@ -372,8 +439,14 @@ def optimize_layout(
         if ev.n and spec.refine_top > 0:
             say(f"review {rank}/{len(top)}: centre aiming on {len(review_center)} states")
             rc = annual(case, Field(ev.xyz), samples=review_center, aiming="center", grid=grid,
-                        shading_points=spec.shading_points)
+                        shading_points=spec.shading_points, keep_state_power=True)
             info["energy_review_center_mwh"] = rc.summary()["absorbed_energy_mwh"]
+            uni = lu.layout_metrics(case, ev.xyz, review_center, rc.state_power_w, lam, grid)
+            ev.uniformity = uni
+            info["circ_cv_review"] = uni["cv_circ_weighted"]
+            info["circ_spread_review_mwh"] = uni["circ_spread_mwh"]
+            info["centroid_offset_m"] = uni["centroid_offset_m"]
+            info["north_fraction"] = uni["north_fraction"]
             info["constrained_states_center"] = int(rc.timeseries["over_limit"].sum())
             info["hours_over_limit_center"] = float(rc.timeseries.loc[rc.timeseries["over_limit"], "weight_h"].sum())
             if spec.review_check_hourly:
@@ -400,19 +473,24 @@ def optimize_layout(
                 info["aps_max_peak_kw_m2"] = float(ra.timeseries["peak_flux_kw_m2"].max())
                 info["aps_states_not_ok"] = int((~ra.timeseries["operational_feasible"]).sum())
                 info["aps_max_defocused"] = int(ra.timeseries["n_defocused"].max())
+        if "energy_review_center_mwh" in info:
+            base_e = info.get("energy_constrained_aps_mwh", info["energy_review_center_mwh"])
+            info["objective_review_mwh"] = base_e - lam * info.get("circ_spread_review_mwh", 0.0)
         evals.append(ev)
         rows.append(info)
     ranking = pd.DataFrame(rows)
-    key_col = "energy_constrained_aps_mwh" if "energy_constrained_aps_mwh" in ranking else "energy_search_objective_mwh"
+    key_col = "objective_review_mwh" if "objective_review_mwh" in ranking else "energy_search_objective_mwh"
     ranking = ranking.sort_values(key_col, ascending=False).reset_index(drop=True)
     ranking["final_rank"] = np.arange(1, len(ranking) + 1)
     ranking["rank_change"] = ranking["search_rank"] - ranking["final_rank"]
     best_rank = int(ranking.loc[0, "search_rank"]) - 1
     best = evals[best_rank]
 
-    # ---- swap refinement on the winner (accepted on constrained annual energy)
+    # ---- swap refinement on the winner (accepted on constrained annual energy). With lambda_L > 0 the
+    # selection is already a swap-local optimum of the uniformity-weighted objective (exchange search).
     swaps = []
-    if use_aps and best.aps_result is not None and best.candidates_xyz is not None and spec.swap_rounds > 0:
+    if (use_aps and lam <= 0 and best.aps_result is not None and best.candidates_xyz is not None
+            and spec.swap_rounds > 0):
         cur_xyz, cur_res = best.xyz, best.aps_result
         m = max(1, int(round(spec.swap_fraction * len(cur_xyz))))
         for r in range(spec.swap_rounds):
@@ -452,7 +530,8 @@ def optimize_layout(
             cv_rows = cur_res.timeseries["uniformity_cv_2d"].dropna()
             if len(cv_rows):
                 ranking.loc[row_i, "aps_max_cv_2d"] = float(cv_rows.max())
-            ranking = ranking.sort_values("energy_constrained_aps_mwh", ascending=False).reset_index(drop=True)
+            ranking.loc[row_i, "objective_review_mwh"] = best.aps_energy_mwh
+            ranking = ranking.sort_values("objective_review_mwh", ascending=False).reset_index(drop=True)
             ranking["final_rank"] = np.arange(1, len(ranking) + 1)
             ranking["rank_change"] = ranking["search_rank"] - ranking["final_rank"]
 
@@ -487,5 +566,23 @@ def optimize_layout(
         if best.aps_energy_mwh is not None and use_aps and bound.get("upper_bound_mwh"):
             bound["found_aps_feasible_mwh"] = float(best.aps_energy_mwh)
             bound["gap_aps_feasible"] = max(0.0, 1.0 - best.aps_energy_mwh / bound["upper_bound_mwh"])
+        if lam > 0:
+            bound["objective_note"] = ("energy bound; the uniformity-weighted objective J = E - lambda_L * spread "
+                                       "is <= E, so J <= this bound as well")
+    uniformity = {"weight": lam}
+    if best.n:
+        say("certificate: uniformity metrics and selection bound")
+        rc = annual(case, Field(best.xyz), samples=review_center, aiming="center", with_flux=False,
+                    shading_points=spec.shading_points, keep_state_power=True)
+        uniformity.update(lu.layout_metrics(case, best.xyz, review_center, rc.state_power_w, lam, grid))
+        if lam > 0 and best.candidates_xyz is not None and spec.n_heliostats:
+            cand = annual(case, Field(best.candidates_xyz), samples=samples, aiming="center", with_flux=False,
+                          shading_points=spec.shading_points, workers=1, keep_state_power=True)
+            model = lu.build_model(case, best.candidates_xyz, samples, cand.state_power_w, lam, grid)
+            key = {tuple(np.round(p, 6)) for p in best.xyz}
+            sel = np.array([tuple(np.round(p, 6)) in key for p in best.candidates_xyz])
+            if sel.sum() == min(spec.n_heliostats, len(sel)):
+                uniformity["selection_certificate"] = lu.selection_bound(model, int(sel.sum()), sel)
+        best.uniformity = uniformity
     return LayoutOptResult(best, history, ranking, samples, _time.perf_counter() - t0, validation, swaps,
                            review_aps if use_aps else review_center, capacity, evals, bound, pmap)

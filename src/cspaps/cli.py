@@ -70,7 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("annual", "annual energy on the receiver")
     sp.add_argument("--method", choices=["sun_bins", "sun_grid", "representative_days", "hourly"], default=None)
     sp.add_argument("--aiming", choices=["center", "kfactor", "greedy", "milp"], default=None)
-    add("optimize-layout", "optimise the field layout for constrained annual energy")
+    sp = add("optimize-layout", "optimise the field layout for constrained annual energy")
+    sp.add_argument("--uniformity-weight", type=float, default=None,
+                    help="lambda_L: weight of the circumferential receiver non-uniformity (0 = energy only)")
+    sp = add("layout-tradeoff", "annual energy vs circumferential uniformity of the layout over lambda_L")
+    sp.add_argument("--lambdas", type=float, nargs="*", default=None)
     sp = add("uniformity", "power vs uniformity (CV) curve and edge-band bound at one instant")
     sp.add_argument("--time", required=True)
     sp.add_argument("--eps", type=float, nargs="*", default=None, help="CV targets (default: around the greedy CV)")
@@ -136,7 +140,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "annual":
         res = wf.task_annual(case, out, method=args.method, aiming=args.aiming, progress=_progress)
     elif args.command == "optimize-layout":
+        if args.uniformity_weight is not None:
+            case.layout_opt.uniformity_weight = args.uniformity_weight
         res = wf.task_optimize_layout(case, out, progress=_progress)
+    elif args.command == "layout-tradeoff":
+        res = wf.task_layout_tradeoff(case, out, lambdas=args.lambdas, progress=_progress)
     elif args.command == "uniformity":
         res = wf.task_uniformity(case, out, args.time, eps_values=args.eps, exact=args.exact)
     elif args.command == "validate":

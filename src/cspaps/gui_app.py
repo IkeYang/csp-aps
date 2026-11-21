@@ -29,8 +29,8 @@ from cspaps import workflows as wf
 from cspaps.config import _SECTIONS, case_from_dict, load_case
 from cspaps.field import Field, build_field, save_layout_csv
 from cspaps.gui_plots import (
-    bound_chart, field_map, history_chart, loss_waterfall, pareto_chart, plant_scene, potential_map_chart,
-    receiver_3d, receiver_map, replay_timeline, uniformity_curves,
+    bound_chart, field_map, history_chart, layout_tradeoff_chart, loss_waterfall, pareto_chart, plant_scene,
+    potential_map_chart, receiver_3d, receiver_map, receiver_rose, replay_timeline, uniformity_curves,
 )
 from cspaps.layout_opt import validate_layout
 from cspaps.optics import footprints_at
@@ -86,6 +86,7 @@ LABELS = {
     "aps.auto_grid": "自动细化求解网格", "aps.max_solver_cells": "求解网格上限",
     "aps.certify": "计算最优性证书（上界与差距）", "aps.certify_time_s": "证书迭代时限 (s)",
     "aps.certify_rounds": "松弛随机取整次数", "layout_opt.upper_bound": "计算可证上界",
+    "layout_opt.uniformity_weight": "布局均匀度权重 λ_L",
     "uniformity.enabled": "启用均匀度约束", "uniformity.max_cv": "允许二维 CV (ε)",
     "uniformity.mode": "均匀度目标模式", "uniformity.weight": "均匀度权重 λ",
     "uniformity.panels": "考核管屏 H (YAML 列表，空 = 全部)", "uniformity.z_range": "考核高度范围 [z1, z2]",
@@ -195,6 +196,8 @@ HELP = {
     "aps.certify": "用拉格朗日对偶 + Frank–Wolfe 计算任何方案都不可能超过的目标值上界，并用松弛解引导取整改进方案。",
     "aps.certify_rounds": "对松弛解做随机取整的次数；每次取整后修复通量并局部搜索，保留最好的方案。",
     "layout_opt.upper_bound": "按单镜无干扰年潜力与圆盘最密堆积计算任意布局的年能量上界，给出最优性差距。",
+    "layout_opt.uniformity_weight": "吸热器周向受热不均匀的惩罚权重。0 = 只追求全年能量（高纬度下镜场会集中在塔北侧）；"
+                                    "越大镜场越环绕吸热器，吸热器各朝向受热越均匀。",
     "heliostat.width": "定日镜反射面宽度（水平方向），单位米。", "heliostat.height": "定日镜反射面高度，单位米。",
     "heliostat.pivot_height": "定日镜旋转中心离地高度，单位米。",
     "receiver.diameter": "圆柱外置式吸热器直径，单位米。", "receiver.height": "吸热器受光段高度，单位米。",
@@ -653,7 +656,7 @@ def page_overview(case) -> None:
         st.markdown('<div style="height:.6rem"></div><div class="cs-flow"><div class="tag">问题二 · 电站设计</div>'
                     '<div class="h">镜场布局优化</div>'
                     '<div class="p">给定场地范围、镜面数量与尺寸、吸热器三维位置和经纬度，寻找全年理论吸热量最大的布置。</div>'
-                    '<ul><li>全年逐时气象压缩为 DNI 加权代表工况</li><li>参数化布局 + 差分进化 + 换位微调</li>'
+                    '<ul><li>用权重 λ_L 兼顾吸热器周向受热均匀，镜场环绕集热器</li><li>参数化布局 + 差分进化 + 交换选择</li>'
                     '<li>单镜潜力 + 圆盘堆积给出任意布局的能量上界</li><li>候选方案受限 APS 复核</li></ul></div>',
                     unsafe_allow_html=True)
         st.button("进入布局优化 →", key="go_layout", type="primary", on_click=_goto, args=("布局优化",), width="stretch")
@@ -1021,13 +1024,25 @@ def page_layout(case) -> None:
             wup = st.file_uploader("更换气象文件（EPW 或 CSV time,dni）", type=["epw", "csv"], key="weather_up")
             if wup is not None:
                 st.session_state["case_dict"]["weather"] = {"source": "file", "file": str(_save_upload(wup))}
+        with _card("layout_goal"):
+            _section(2, "布局目标", "APS 只能沿高度、在小范围周向内移动瞄准点；吸热器各朝向的受热由镜位决定。"
+                     "λ_L 是均匀性的重要性超参数：λ_L = 0 只追求全年能量，λ_L 越大镜场越环绕吸热器。")
+            ver = st.session_state["ver"]
+            lo_d = st.session_state["case_dict"].setdefault("layout_opt", {})
+            lo_d["uniformity_weight"] = float(st.slider("布局均匀度权重 λ_L", 0.0, 1.0,
+                                                        float(case.layout_opt.uniformity_weight), 0.05,
+                                                        key=f"{ver}:layout_opt.uniformity_weight",
+                                                        help=HELP["layout_opt.uniformity_weight"]))
+            st.latex(r"\max_X\;\sum_t w_t\big[P_t(X)-\lambda_L\,A_H\,\sigma_{circ,t}(X)\big]")
+            st.caption("σ_circ：吸热器各周向列平均吸收热流的标准差（不同朝向之间的差异）；P：吸收功率；w_t：代表工况小时数。")
         with _card("layout_search"):
-            _section(2, "搜索设置", "搜索阶段按全年理论吸收热量（中心瞄准，含阴影遮挡）评价布局，入围方案再用受限 APS 复核。")
+            _section(3, "搜索设置", "搜索阶段按目标 J（全年理论吸收热量减周向不均匀惩罚，中心瞄准，含阴影遮挡）评价布局，"
+                     "入围方案再用受限 APS 复核。")
             st.radio("计算强度", list(PRESETS), format_func=lambda k: PRESETS[k][0], key="layout_preset",
                      index=1, horizontal=False, on_change=_apply_preset)
             _fields("layout_opt", ["generator", "search_aiming", "refine_top", "upper_bound"])
             with st.expander("搜索范围、采样精度与计算资源"):
-                common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound"}
+                common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight"}
                 _fields("layout_opt", [f.name for f in dataclasses.fields(_SECTIONS["layout_opt"]) if f.name not in common])
             with st.expander("APS 复核使用的瞄准与均匀度设置"):
                 _fields("aps", ["method", "safety_margin", "n_height_levels", "azimuth_offsets_deg"])
@@ -1065,6 +1080,7 @@ def _layout_results(case, res: dict) -> None:
     val = s["validation"]
     site_status = {"ok": "通过", "capacity_shortfall": "镜数不足", "constraint_violation": "未通过"}.get(s["status"], s["status"])
     gap = ub.get("gap")
+    uni = s.get("uniformity") or {}
     _section(None, "优化结果", f"{s['n_heliostats']} 面定日镜 · 评价 {s['n_evaluations']} 个布局 · 用时 {s['runtime_s']:.0f} s")
     _kpis([
         ("全年理论吸收热量", f"{ub.get('found_energy_mwh', s.get('annual_energy_mwh_center_aiming') or 0):,.0f}", "MWhₜₕ",
@@ -1077,14 +1093,27 @@ def _layout_results(case, res: dict) -> None:
          "MWhₜₕ", "通过通量与均匀度约束的工况"),
         ("最小镜距", f"{val.get('min_distance_m')}", "m", f"要求 ≥ {val.get('required_min_spacing_m')} m · 场地校验{site_status}",
          "good" if s["status"] == "ok" else "bad"),
-    ])
+    ] + ([
+        ("吸热器周向 CV", _format_number(uni.get("cv_circ_weighted"), 3), "", f"布局权重 λ_L = {uni.get('weight', 0):g} · 能量加权",
+         "good" if (uni.get("cv_circ_weighted") or 9) < 0.25 else "warn"),
+        ("镜场质心偏移", f"{uni.get('centroid_offset_m', 0):.0f}", "m",
+         f"北侧镜子 {100 * uni.get('north_fraction', 0):.0f}% · 0 m 表示集热器位于镜场中心",
+         "good" if (uni.get("centroid_offset_rel") or 9) < 0.25 else "warn"),
+    ] if uni else []))
+    if uni and uni.get("weight", 0) <= 0 and uni.get("north_fraction", 0) > 0.75:
+        _callout("warn", "镜场集中在塔的一侧", f"{100 * uni['north_fraction']:.0f}% 的定日镜在塔北侧，吸热器南侧几乎不受热，"
+                 f"周向 CV {uni['cv_circ_weighted']:.2f}。这部分不均匀无法靠瞄准策略消除——在 ② 中提高布局均匀度权重 λ_L，"
+                 "让镜场环绕吸热器。")
     exist = s.get("existence") or {}
     if exist.get("optimum_exists") is True and ub.get("upper_bound_mwh"):
         _callout("ok", "最优布置存在；本方案与全局最优的距离已被量化",
                  f"镜位可行集（场地内、镜间距 ≥ {ub['min_spacing_m']:.2f} m、镜数 {ub['n_heliostats']}）有界且闭，"
                  f"年能量随镜位连续变化，因此全局最优布置存在（一般不唯一）。本方案全年理论吸收 "
                  f"{ub['found_energy_mwh']:,.0f} MWhₜₕ；任何布局都不超过 {ub['upper_bound_mwh']:,.0f} MWhₜₕ，"
-                 f"差距 ≤ {_pct(gap, 1)}。上界忽略阴影遮挡并允许最密堆积，因此真实最优值位于两者之间。")
+                 f"差距 ≤ {_pct(gap, 1)}。上界忽略阴影遮挡并允许最密堆积，因此真实最优值位于两者之间。"
+                 + (f"布局目标含周向均匀度（λ_L = {uni['weight']:g}），能量上界同样是目标值 J 的上界；"
+                    f"在本组生成参数的候选镜位上，镜位选择的差距 ≤ {_pct(uni['selection_certificate']['gap'], 2)}。"
+                    if uni.get("weight", 0) > 0 and uni.get("selection_certificate") else ""))
     elif exist.get("optimum_exists") is False:
         _callout("bad", "已证明不存在满足条件的布置", exist.get("statement", ""))
     elif exist:
@@ -1095,7 +1124,7 @@ def _layout_results(case, res: dict) -> None:
         st.warning(f"按最密生成参数估计可放置 {s['capacity']['max_placeable_with_densest_parameters']} 面镜，低于目标镜数。")
     best = r.best.aps_result or r.best.result
     eff = best.heliostat_efficiency if best is not None and len(best.heliostat_efficiency) == r.best.n else None
-    tabs = st.tabs(["单镜潜力图与布局", "三维视图", "搜索收敛", "上界说明"])
+    tabs = st.tabs(["单镜潜力图与布局", "吸热器周向受热", "能量–均匀度权衡", "三维视图", "搜索收敛", "上界说明"])
     with tabs[0]:
         if r.potential is not None:
             _chart(potential_map_chart(case, r.potential, r.best.xyz, eff, "年均光学效率",
@@ -1104,11 +1133,62 @@ def _layout_results(case, res: dict) -> None:
             _chart(field_map(case, r.best.xyz, np.arange(1, r.best.n + 1), values=eff, label="年均光学效率",
                              title="优化镜位"), "opt_map")
     with tabs[1]:
-        _chart(plant_scene(case, r.best.xyz, values=eff, label="年均光学效率"), "opt_scene")
+        if uni.get("sector_share"):
+            a, b = st.columns([1.1, 1])
+            with a:
+                tr = st.session_state.get("res_ltrade")
+                compare = None
+                if tr and tr["summary"]["curve"] and tr["summary"]["curve"][0]["lambda"] == 0:
+                    compare = ("仅能量最大（λ_L = 0）", tr["summary"]["curve"][0].get("sector_share"))
+                _chart(receiver_rose(uni["sector_share"], uni["sector_center_deg"],
+                                     compare if compare and compare[1] else None), "opt_rose")
+            with b:
+                st.markdown("**吸热器各朝向分得的全年吸收热量**（30° 扇区，按方位：北 0°、东 90°）")
+                st.markdown(f"- 周向 CV（逐工况、能量加权）：**{uni['cv_circ_weighted']:.3f}**；全年累计：{_format_number(uni.get('cv_circ_annual'))}\n"
+                            f"- 镜场能量质心距塔 **{uni['centroid_offset_m']:.0f} m**（相对平均镜距 {100 * uni['centroid_offset_rel']:.0f}%）\n"
+                            f"- 北侧镜子占 {100 * uni['north_fraction']:.0f}%")
+                st.caption("圆柱外置式吸热器的每一侧只被朝向它的定日镜照射。瞄准策略可以沿高度、在小角度内调整热流，"
+                           "但不能把北侧的热流搬到南侧，所以周向均匀性必须在布局阶段解决。")
     with tabs[2]:
-        _chart(history_chart(r.history), "opt_hist")
-        st.caption("灰点为每次评价的布局参数，绿线为迄今最优。搜索阶段按代表工况快速评价，入围方案随后复核。")
+        _section(None, "布局的能量–均匀度权衡",
+                 "固定本次最优生成参数，只改变 λ_L 重新选择镜位（每点数秒）。用于决定愿意用多少年发电量换取周向均匀受热。")
+        c1, c2 = st.columns([2, 1])
+        lam_txt = c1.text_input("λ_L 序列", "0, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0", key="ltrade_lams")
+        try:
+            lams = [float(v) for v in lam_txt.replace("，", ",").split(",") if v.strip()]
+        except ValueError:
+            lams = None
+            st.error("λ_L 序列格式错误")
+        best_params = {k: v for k, v in r.best.params.items()}
+        with c2:
+            if lams:
+                _job_button("ltrade", "计算布局权衡曲线", wf.task_layout_tradeoff, lambdas=lams, params=best_params,
+                            progress=True)
+        _job_error("ltrade")
+        tr = st.session_state.get("res_ltrade")
+        if tr:
+            rows = tr["summary"]["curve"]
+            a, b = st.columns([1.5, 1])
+            with a:
+                _chart(layout_tradeoff_chart(rows, uni.get("weight")), "ltrade_chart")
+            with b:
+                df = pd.DataFrame(rows)
+                st.dataframe(pd.DataFrame({"λ_L": df["lambda"], "年吸收 (MWh)": df["energy_mwh"].round(0),
+                                           "周向 CV": df["cv_circ_weighted"].round(3),
+                                           "北侧占比": (100 * df["north_fraction"]).round(0).astype(int).astype(str) + "%",
+                                           "质心偏移 (m)": df["centroid_offset_m"].round(0)}), hide_index=True)
+                if len(rows) > 1:
+                    e0 = rows[0]["energy_mwh"]
+                    best = min(rows, key=lambda q: q["cv_circ_weighted"])
+                    st.caption(f"λ_L {rows[0]['lambda']:g} → {best['lambda']:g}：周向 CV {rows[0]['cv_circ_weighted']:.2f} → "
+                               f"{best['cv_circ_weighted']:.2f}，全年能量 {100 * (best['energy_mwh'] / e0 - 1):+.1f}%。")
     with tabs[3]:
+        _chart(plant_scene(case, r.best.xyz, values=eff, label="年均光学效率"), "opt_scene")
+    with tabs[4]:
+        _chart(history_chart(r.history), "opt_hist")
+        st.caption("灰点为每次评价的布局参数，绿线为迄今最优。搜索目标 J = 全年理论吸收热量 − λ_L × 周向不均匀惩罚；"
+                   "入围方案随后复核。")
+    with tabs[5]:
         if ub:
             st.latex(r"E(X)\;\le\;\sum_i e_0(x_i)\;=\;\int_0^\infty \#\{i:e_0(x_i)\ge t\}\,dt\;\le\;"
                      r"\int_0^\infty \min\!\big(N,\ \mathrm{cap}(L_t)\big)\,dt")
@@ -1144,7 +1224,8 @@ def _planning_compare(case) -> None:
                              "energy_search_center_absorbed_mwh", "energy_search_objective_mwh",
                              "energy_review_center_mwh", "energy_hourly_center_mwh", "search_sampling_error_pct",
                              "energy_constrained_aps_mwh", "energy_raw_aps_absorbed_mwh", "aps_max_cv_2d",
-                             "aps_max_peak_kw_m2", "aps_hours_uniformity_failed", "aps_states_not_ok"] if c in rank]
+                             "aps_max_peak_kw_m2", "aps_hours_uniformity_failed", "aps_states_not_ok",
+                             "circ_cv_review", "north_fraction", "objective_review_mwh"] if c in rank]
     review = res["summary"]["review_sampling"]
     st.markdown(f"**候选方案** · {CHOICE_LABELS['layout_opt.search_aiming'].get(r.best.search_aiming, r.best.search_aiming)}"
                 f" · {review['n_states']} 个复核工况")
@@ -1158,6 +1239,7 @@ def _planning_compare(case) -> None:
         "energy_raw_aps_absorbed_mwh": "原始 APS 热量 (MWhₜₕ)", "aps_max_cv_2d": "最大二维 CV",
         "aps_max_peak_kw_m2": "最高复核通量 (kW/m²)",
         "aps_hours_uniformity_failed": "均匀度失败工况权重 (h)", "aps_states_not_ok": "未通过工况数",
+        "circ_cv_review": "周向 CV", "north_fraction": "北侧占比", "objective_review_mwh": "复核目标 J (MWhₜₕ)",
     }
     view = rank[show_cols].rename(columns=display_names)
     ev = st.dataframe(view, on_select="rerun", selection_mode="single-row", key="cand_table", hide_index=True)
@@ -1439,13 +1521,30 @@ def page_theory(case) -> None:
                     "6. 小规模问题可用 SCIP 求混合整数二阶锥规划的精确最优作为基准。")
     with t3:
         _section(None, "问题表述")
-        st.markdown("给定场地 $\\Omega$、镜数 $N$、镜面尺寸、吸热器三维坐标和经纬度（决定全年太阳轨迹与 DNI）：")
+        st.markdown(r"给定场地 $\\Omega$、镜数 $N$、镜面尺寸、吸热器三维坐标和经纬度（决定全年太阳轨迹与 DNI）：")
         st.latex(r"\max_{X=(x_1,\dots,x_N)}\;E(X)=\sum_{t} w_t\sum_i P_i(X,t)\quad \text{s.t.}\;\;x_i\in\Omega,\;\;"
                  r"\|x_i-x_j\|\ge d\;\;(i\ne j)")
         st.markdown("$E$ 包含余弦、阴影、遮挡、衰减、截断；全年按 DNI 加权的代表太阳位置积分（能量守恒）。")
+        _section(None, "为什么布局必须考虑均匀性")
+        st.markdown(r"圆柱外置式吸热器的每一侧只被朝向它的定日镜照射：位于方位 $\phi_i$ 的定日镜，其光斑在像平面上落在"
+                    r"宽 $2R$ 的吸热器轮廓内，表面方位 $\phi$ 对应横向坐标 $u=R\sin(\phi-\phi_i)$（$|\phi-\phi_i|<90°$）。"
+                    "各周向列分得的功率比例为")
+        st.latex(r"s_{ij}=\frac{\Phi\!\left(\tfrac{R\sin(\phi_{j+1}-\phi_i)}{\sigma_i}\right)-"
+                 r"\Phi\!\left(\tfrac{R\sin(\phi_j-\phi_i)}{\sigma_i}\right)}{\Phi(R/\sigma_i)-\Phi(-R/\sigma_i)}")
+        st.markdown("APS 只能沿高度、在几度范围内移动瞄准点，可以抹平每一列内部的差异，但不能把北侧的热流搬到南侧。"
+                    "等面积列的方差分解")
+        st.latex(r"\sigma^2_{2D}=\underbrace{\sigma^2_{circ}}_{\text{由布局决定}}+"
+                 r"\underbrace{\overline{\sigma^2_{列内}}}_{\text{APS 可调}}")
+        st.markdown("说明周向部分是问题一的均匀度惩罚中任何瞄准策略都去不掉的部分。只按全年能量布置时，"
+                    "高纬度场址的镜子会集中在塔北侧（余弦效率高），吸热器南侧几乎不受热。因此问题二的目标取")
+        st.latex(r"\max_X\;J(X)=\sum_t w_t\Big[P_t(X)-\lambda_L\,A_H\,\sigma_{circ,t}(X)\Big]"
+                 r"=\sum_t w_t\,P_t\,(1-\lambda_L\,\mathrm{CV}_{circ,t})")
+        st.markdown(r"与问题一的加权目标同构，$\lambda_L$ 是布局阶段均匀性的重要性超参数；$\lambda_L=0$ 退化为只追求全年能量。"
+                    r"固定生成参数时，从候选镜位中选 $N$ 个是 $\max J(x),\ \sum x=N$；$J$ 对松弛变量是凹函数，"
+                    "用交换局部搜索求解，并用 Frank–Wolfe 上界（线性子问题为取前 $N$ 大）证明选择的差距。")
         _section(None, "最优布置存在吗？")
-        _callout("ok", "存在（只要镜子放得下）。", "可行集 $\\{X: x_i\\in\\Omega, \\|x_i-x_j\\|\\ge d\\}$ 是有界闭集，"
-                 "即紧集；年能量对镜位连续，由 Weierstrass 定理最大值必然取到。若圆盘堆积上界表明场地容纳不下 N 面镜，"
+        _callout(r"ok", "存在（只要镜子放得下）。", "可行集 $\\{X: x_i\\in\\Omega, \\|x_i-x_j\\|\\ge d\\}$ 是有界闭集，"
+                 "即紧集；年能量与周向惩罚都对镜位连续，由 Weierstrass 定理最大值必然取到。若圆盘堆积上界表明场地容纳不下 N 面镜，"
                  "软件给出“不存在可行布置”的证明。由于对称性，最优布置一般不唯一。")
         _section(None, "上界：任意布局都不可能超过的能量")
         st.latex(r"E(X)\le\sum_i e_0(x_i)=\int_0^\infty\#\{i:e_0(x_i)\ge t\}\,dt\le\int_0^\infty\min\big(N,\mathrm{cap}(L_t)\big)\,dt")
@@ -1454,7 +1553,7 @@ def page_theory(case) -> None:
                     "得到 $\\mathrm{cap}(S)\\le \\mathrm{area}(S\\oplus B(d/\\sqrt3))/(\\sqrt3 d^2/2)$；\n"
                     "- 栅格取 3×3 邻域最大值作包络，保证不低估。")
         _section(None, "搜索方法")
-        st.markdown("径向交错 / 仿生螺旋参数化生成器铺满场地 → 每个参数向量按单镜年收益选出最好的 N 个镜位 → "
+        st.markdown("径向交错 / 仿生螺旋参数化生成器铺满场地 → 每个参数向量用交换搜索选出使 J 最大的 N 个镜位（λ_L = 0 时即年收益最高的 N 个）→ "
                     "差分进化 + 局部模式搜索 → 入围方案用更细采样和受限 APS 复核排名 → 低收益镜位与未用候选换位 → "
                     "镜数、边界、禁排区、最小镜距最终校验 → 上界与差距。")
     with t4:

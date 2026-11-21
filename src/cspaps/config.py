@@ -244,6 +244,9 @@ class LayoutOpt:
     polish_rounds: int = 4  # local pattern-search rounds after the global search
     refine_top: int = 3  # re-rank the best layouts with APS-aware annual energy
     upper_bound: bool = True  # certify: upper bound on the annual energy of any layout (packing bound)
+    # lambda_L: weight of the circumferential (layout-determined) non-uniformity of the receiver flux.
+    # Objective J = sum_t w_t [P_abs,t - lambda_L * A_H * sigma_circ,t]; 0 = annual energy only.
+    uniformity_weight: float = 0.0
 
 
 @dataclass
@@ -369,6 +372,8 @@ def _validate(case: Case) -> None:
     for name in ("search_sampling", "review_sampling"):
         if getattr(case.layout_opt, name) not in ("sun_bins", "sun_grid", "hourly"):
             raise ValueError(f"layout_opt.{name} must be sun_bins|sun_grid|hourly")
+    if case.layout_opt.uniformity_weight < 0:
+        raise ValueError("layout_opt.uniformity_weight must be >= 0")
     if case.layout_opt.search_aiming not in ("auto", "center", "greedy", "kfactor"):
         raise ValueError("layout_opt.search_aiming must be auto|center|greedy|kfactor")
     if case.mcrt.tracking_mode not in ("per_ray", "per_heliostat"):

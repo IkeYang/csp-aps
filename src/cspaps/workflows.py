@@ -421,10 +421,52 @@ def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None
     summary["search_settings"] = {k: getattr(case.layout_opt, k) for k in (
         "generator", "n_heliostats", "bounds", "fixed", "search_sampling", "n_sun_bins", "review_sampling",
         "search_aiming", "review_n_sun_bins", "review_dni_bands", "maxiter", "popsize", "seed", "polish_rounds", "refine_top",
-        "swap_rounds", "swap_fraction")}
+        "swap_rounds", "swap_fraction", "uniformity_weight")}
     _json(files["summary_json"], summary)
     finish(out, "layout_opt", summary, t0=t0)
     return {"summary": _clean(summary), "files": files, "result": res, "run_dir": out}
+
+
+def task_layout_tradeoff(case: Case, base: str | Path, lambdas=None, params: dict | None = None,
+                         progress: Progress | None = None) -> dict:
+    """Annual energy vs circumferential uniformity of the layout over lambda_L (fixed generator parameters).
+
+    ``params`` are the generator parameters (default: the case's field generator,
+    else the middle of the layout_opt bounds); the search sampling of layout_opt is used.
+    """
+    from .layout_opt import DEFAULT_BOUNDS, layout_tradeoff, make_samples
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "layout_tradeoff")
+    lo = case.layout_opt
+    kind = lo.generator
+    if params is None:
+        gen = dict(case.field.generator or {})
+        if gen and gen.pop("type", kind) == kind:
+            params = {k: v for k, v in gen.items() if k not in ("r_min", "r_max")}
+        else:
+            bounds = {**DEFAULT_BOUNDS.get(kind, {}), **(lo.bounds or {})}
+            params = {k: 0.5 * (v[0] + v[1]) for k, v in bounds.items()}
+        params = {**lo.fixed, **params}
+    lambdas = list(lambdas) if lambdas is not None else [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]
+    if progress:
+        progress(f"layout trade-off: {len(lambdas)} weights, {lo.n_sun_bins} sun states")
+    samples = make_samples(case, lo.search_sampling, lo.n_sun_bins, 1, seed=lo.seed)
+    n_select = lo.n_heliostats or len(generate(case, kind, params))
+    rows = layout_tradeoff(case, kind, params, samples, n_select, lambdas, lo.shading_points)
+    files = {"summary_json": out / "layout_tradeoff.json", "curve_csv": out / "layout_tradeoff.csv"}
+    layouts = {}
+    for r in rows:
+        layouts[r["lambda"]] = r.pop("xyz")
+        p = out / f"layout_lambda_{r['lambda']:g}.csv"
+        save_layout_csv(Field(layouts[r["lambda"]]), p)
+        r["layout_csv"] = p.name
+    pd.DataFrame(rows).to_csv(files["curve_csv"], index=False)
+    summary = {"generator": kind, "params": params, "n_heliostats": n_select,
+               "sampling": {"method": samples.label, "n_states": len(samples)}, "curve": rows}
+    _json(files["summary_json"], summary)
+    finish(out, "layout_tradeoff", summary, {"lambdas": lambdas, "params": params}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out, "layouts": layouts}
 
 
 def task_uniformity(case: Case, base: str | Path, time, eps_values=None, exact: bool = False,
