@@ -39,6 +39,39 @@ def absorptivity_at(rec: Receiver, azimuth_deg) -> np.ndarray:
     return _per_panel(rec, rec.panel_absorptivity, rec.absorptivity)[panel_of(rec, azimuth_deg)]
 
 
+def effective_absorptivity(rec: Receiver, aim_azimuth_deg, sigma) -> np.ndarray:
+    """Absorptivity seen by each beam: panel absorptivities weighted by the beam's spread over the panels.
+
+    The beam centred on the surface point at azimuth phi_a lands on the visible
+    half of the cylinder; the surface point at azimuth phi lies at the lateral
+    image coordinate u = R sin(phi - phi_a). With a lateral Gaussian of std
+    sigma the share of panel p (azimuth sector [a_p, b_p], clipped to the
+    visible +-90 deg) is Phi(R sin(b_p - phi_a) / sigma) - Phi(R sin(a_p - phi_a) / sigma).
+    Equals the flux-weighted absorptivity of the flux map up to the vertical
+    distribution, without needing a map.
+    """
+    from scipy.special import ndtr
+
+    alpha = _per_panel(rec, rec.panel_absorptivity, rec.absorptivity)
+    phi = np.atleast_1d(np.asarray(aim_azimuth_deg, dtype=float))
+    if np.allclose(alpha, alpha[0]):
+        return np.full(phi.shape, float(alpha[0]))
+    sig = np.maximum(np.broadcast_to(np.asarray(sigma, dtype=float), phi.shape), 1e-9)
+    w = 360.0 / rec.n_panels
+    starts = rec.panel_start_azimuth_deg + w * np.arange(rec.n_panels)
+    lo = (starts[None, :] - phi[..., None] + 180.0) % 360.0 - 180.0  # relative start of each panel
+    hi = lo + w
+    total = np.zeros(phi.shape)
+    acc = np.zeros(phi.shape)
+    for shift in (-360.0, 0.0):  # a sector may wrap past +180 deg
+        a = np.radians(np.clip(lo + shift, -90.0, 90.0))
+        b = np.radians(np.clip(hi + shift, -90.0, 90.0))
+        m = ndtr(rec.radius * np.sin(b) / sig[..., None]) - ndtr(rec.radius * np.sin(a) / sig[..., None])
+        total += m.sum(axis=-1)
+        acc += (m * alpha).sum(axis=-1)
+    return np.where(total > 0, acc / np.maximum(total, 1e-300), alpha[panel_of(rec, phi)])
+
+
 def nominal_limit_kw_m2(rec: Receiver, azimuth_deg, z) -> np.ndarray:
     """Configured limit (on its own basis: incident or absorbed), kW/m2."""
     lim = _per_panel(rec, rec.panel_max_flux_kw_m2, rec.max_flux_kw_m2)[panel_of(rec, azimuth_deg)]

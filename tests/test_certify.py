@@ -182,3 +182,85 @@ def test_layout_bound_dominates_generated_layouts(small_case):
     densest = generate(small_case, "radial_staggered", {"radial_spacing": 0.866, "radial_growth": 0.0,
                                                         "azimuthal_spacing": 1.0, "spacing_factor": 1.1})
     assert len(densest) <= b["packing_capacity_bound"]
+
+
+# --------------------------------------------------------------------------- audit regressions (layout bound rigour)
+
+def _random_cell_points(pm, case, n, seed=0):
+    from cspaps.field import site_mask
+
+    rng = np.random.default_rng(seed)
+    iy, ix = np.nonzero(pm.inside)
+    k = rng.integers(0, len(ix), n)
+    pts = np.column_stack([pm.x[ix[k]] + (rng.random(n) - 0.5) * pm.cell_m,
+                           pm.y[iy[k]] + (rng.random(n) - 0.5) * pm.cell_m])
+    ok = site_mask(case, np.column_stack([pts, np.full(n, case.heliostat.pivot_height)]))[0]
+    return pts[ok], iy[k][ok], ix[k][ok]
+
+
+@pytest.mark.parametrize("alpha", [None, [0.95, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3], [0.3, 0.3, 0.3, 0.3, 0.95, 0.3, 0.3, 0.3]])
+def test_cell_bound_holds_anywhere_in_the_cell(small_case, alpha):
+    """The per-cell bound dominates the lone-heliostat energy at random points inside the cells."""
+    small_case.receiver.n_panels = 8
+    small_case.receiver.panel_absorptivity = alpha
+    small_case.field.boundary = [[-150, -150], [150, -150], [150, 150], [-150, 150]]
+    smp = sun.sun_bins(sun.hourly_samples(small_case), 4)
+    pm = potential_map(small_case, smp, cell_m=8.0)
+    pts, iy, ix = _random_cell_points(pm, small_case, 4000)
+    e = lone_heliostat_energy(small_case, pts, smp)
+    assert np.all(e <= pm.ub_mwh[iy, ix] * (1 + 1e-9))
+
+
+@pytest.mark.parametrize("alpha", [None, [0.95, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]])
+def test_single_heliostat_cannot_beat_layout_bound(small_case, alpha):
+    """Audit counterexample: the best one-heliostat layout must not exceed the N = 1 bound."""
+    from cspaps.field import site_mask
+
+    small_case.receiver.n_panels = 8
+    small_case.receiver.panel_absorptivity = alpha
+    small_case.field.boundary = [[-150, -150], [150, -150], [150, 150], [-150, 150]]
+    smp = sun.sun_bins(sun.hourly_samples(small_case), 4)
+    pm = potential_map(small_case, smp, cell_m=8.0)  # coarse raster: peaks fall between centres
+    ub = layout_upper_bound(small_case, 1, small_case.heliostat.diagonal * 1.1, samples=smp, pmap=pm)
+    centre = np.where(pm.inside, pm.energy_mwh, -np.inf)
+    a, b = np.unravel_index(np.argmax(centre), centre.shape)
+    g = np.linspace(-2 * pm.cell_m, 2 * pm.cell_m, 41)
+    gx, gy = np.meshgrid(pm.x[b] + g, pm.y[a] + g)
+    loc = np.column_stack([gx.ravel(), gy.ravel()])
+    loc = loc[site_mask(small_case, np.column_stack([loc, np.full(len(loc), 4.0)]))[0]]
+    lone = lone_heliostat_energy(small_case, loc, smp)
+    p = loc[int(np.argmax(lone))]
+    one = Field(np.array([[p[0], p[1], small_case.heliostat.pivot_height]]))
+    real = annual(small_case, one, samples=smp, aiming="center", with_flux=True).summary()["absorbed_energy_mwh"]
+    assert lone.max() <= ub["upper_bound_mwh"] and real <= ub["upper_bound_mwh"] * (1 + 1e-3)
+    checked = layout_upper_bound(small_case, 1, small_case.heliostat.diagonal * 1.1, samples=smp, pmap=pm,
+                                 found_energy_mwh=real)
+    assert checked["status"] == "ok" and checked["gap"] >= 0
+
+
+def test_fast_energy_path_uses_beam_spread_absorptivity(small_case):
+    """Without a flux map the absorbed power follows the panels each beam actually hits (not the mean)."""
+    small_case.receiver.n_panels = 8
+    small_case.receiver.panel_absorptivity = [0.95, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]
+    fld = build_field(small_case)
+    smp = sun.sun_bins(sun.hourly_samples(small_case), 4)
+    fine = build_grid(small_case.receiver, 144, 24)  # columns resolve the panel edges
+    fast = annual(small_case, fld, samples=smp, aiming="center", with_flux=False).summary()["absorbed_energy_mwh"]
+    full = annual(small_case, fld, samples=smp, aiming="center", grid=fine).summary()["absorbed_energy_mwh"]
+    assert fast == pytest.approx(full, rel=2e-3)
+    # a heliostat facing the middle of panel 1 (0-45 deg) lights the 0.95 panel; the old
+    # mean-absorptivity shortcut gave 0.38 for it
+    a = np.radians(22.5)
+    one = Field(np.array([[80.0 * np.sin(a), 80.0 * np.cos(a), small_case.heliostat.pivot_height]]))
+    e1 = annual(small_case, one, samples=smp, aiming="center", with_flux=False)
+    assert e1.summary()["absorbed_energy_mwh"] / e1.energy_mwh["intercept"] > 0.9
+
+
+def test_bound_violation_is_reported_not_clipped(small_case):
+    smp = sun.sun_bins(sun.hourly_samples(small_case), 4)
+    small_case.field.boundary = [[-120, -120], [120, -120], [120, 120], [-120, 120]]
+    pm = potential_map(small_case, smp)
+    b = layout_upper_bound(small_case, 10, small_case.heliostat.diagonal * 1.1, samples=smp, pmap=pm)
+    bad = layout_upper_bound(small_case, 10, small_case.heliostat.diagonal * 1.1, samples=smp, pmap=pm,
+                             found_energy_mwh=2 * b["upper_bound_mwh"])
+    assert bad["status"] == "bound_violation" and bad["gap"] < 0

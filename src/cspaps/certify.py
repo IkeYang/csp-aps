@@ -39,9 +39,7 @@ bound, the reported one is the smallest. Hence
 Problem 2 -- layout of N heliostats in the site, annual absorbed energy
 -----------------------------------------------------------------------
 e0(x) = annual absorbed energy of one heliostat at x with no neighbours
-(no shading / blocking, centre aim, which maximises the intercept of a
-centred Gaussian beam on the symmetric receiver silhouette -- Anderson's
-inequality). Neighbours and flux limits only remove energy, so
+(no shading / blocking). Neighbours and flux limits only remove energy, so
 E(X) <= sum_i e0(x_i). Layer-cake + packing:
 
     sum_i e0(x_i) = int_0^inf #{i : e0(x_i) >= t} dt <= int_0^inf min(N, cap(L_t)) dt
@@ -49,6 +47,9 @@ E(X) <= sum_i e0(x_i). Layer-cake + packing:
 with L_t = {x in site : e0(x) >= t}. For points with mutual distance >= d the
 Voronoi cells truncated by discs of radius d/sqrt(3) are disjoint and each has
 area >= sqrt(3) d^2 / 2 (Fejes Toth), so cap(S) <= area(S (+) B(d/sqrt 3)) / (sqrt(3) d^2 / 2).
+On the raster, ``cell_energy_upper_bound`` bounds e0 over every point of each
+cell and every aim point (interval bounds on cosine, attenuation, intercept and
+absorptivity), so no step relies on sampling.
 """
 
 from __future__ import annotations
@@ -542,15 +543,19 @@ def hex_cell_area(spacing_m: float) -> float:
 def packing_capacity(mask: np.ndarray, cell_m: float, spacing_m: float) -> int:
     """Upper bound on the number of points with mutual distance >= spacing in a raster set.
 
-    Each set cell is a square of side ``cell_m``; the set is dilated by
-    d / sqrt(3) + cell diagonal / 2 (raster safety) and its area divided by the
+    Each set cell is a square of side ``cell_m`` and points may lie anywhere in
+    it. Their truncated Voronoi cells lie within d / sqrt(3) of the squares; the
+    area of that region is over-counted by all raster cells whose centres lie
+    within d / sqrt(3) + sqrt(2) cell_m of a set-cell centre, and divided by the
     hexagon area sqrt(3) d^2 / 2 (Fejes Toth's truncated Voronoi cell bound).
     """
     from scipy.ndimage import distance_transform_edt
 
     if not mask.any():
         return 0
-    r = spacing_m / math.sqrt(3.0) + cell_m * math.sqrt(0.5)
+    # points lie anywhere in the set cells (half diagonal from a centre); a counted cell must also
+    # cover any partially overlapped part of the dilated region (another half diagonal)
+    r = spacing_m / math.sqrt(3.0) + cell_m * math.sqrt(2.0)
     pad = int(math.ceil(r / cell_m)) + 1
     m = np.pad(mask, pad)
     dist = distance_transform_edt(~m) * cell_m
@@ -563,8 +568,9 @@ class PotentialMap:
     x: np.ndarray  # (nx,) cell-centre x, m
     y: np.ndarray  # (ny,) cell-centre y, m
     cell_m: float
-    energy_mwh: np.ndarray  # (ny, nx) annual absorbed energy of a lone heliostat, nan outside the site
-    inside: np.ndarray  # (ny, nx) bool: cell centre inside the site
+    energy_mwh: np.ndarray  # (ny, nx) annual absorbed energy of a lone heliostat at the cell centre (display)
+    inside: np.ndarray  # (ny, nx) bool: the cell touches the site
+    ub_mwh: np.ndarray | None = None  # (ny, nx) bound on the lone energy anywhere in the cell (certificate)
 
     def at(self, xy: np.ndarray) -> np.ndarray:
         """Nearest-cell value at points (N, 2) (display only; bounds use the exact model)."""
@@ -577,7 +583,7 @@ def lone_heliostat_energy(case, xy: np.ndarray, samples, chunk: int = 4000) -> n
     """Annual absorbed energy (MWh) of a heliostat alone at each xy: cosine, reflectivity,
     attenuation, intercept (centre aim) and absorptivity; no shading, blocking or flux limit."""
     from . import optics, sun
-    from .receiver import absorptivity_at, default_aim, surface_point
+    from .receiver import default_aim, effective_absorptivity, surface_point
 
     rec, hel = case.receiver, case.heliostat
     xy = np.asarray(xy, dtype=float).reshape(-1, 2)
@@ -589,7 +595,6 @@ def lone_heliostat_energy(case, xy: np.ndarray, samples, chunk: int = 4000) -> n
         xyz = np.column_stack([p, np.full(len(p), hel.pivot_height)])
         az, z = default_aim(rec, xyz)
         aim = surface_point(rec, az, z)
-        alpha = absorptivity_at(rec, az)
         e = np.zeros(len(p))
         for el, sa, dni, w in zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h):
             if el <= 0 or dni <= 0 or w <= 0:
@@ -598,8 +603,107 @@ def lone_heliostat_energy(case, xy: np.ndarray, samples, chunk: int = 4000) -> n
             _, t, slant, cos_inc = optics.heliostat_geometry(xyz, aim, s)
             sigma = optics.beam_sigma(slant, cos_inc, hel, case.sun)
             beam = hel.area * hel.reflectivity * hel.cleanliness * cos_inc * optics.attenuation(slant, case.atmosphere)
-            e += dni * w * beam * optics.intercept_fraction(rec, aim, t, sigma)
-        out[start:start + chunk] = e * alpha / 1e6
+            e += dni * w * beam * optics.intercept_fraction(rec, aim, t, sigma) * effective_absorptivity(rec, az, sigma)
+        out[start:start + chunk] = e / 1e6
+    return out
+
+
+TAIL_K = 5.0  # beam mass beyond 5 sigma laterally: 2 (1 - Phi(5)) = 5.7e-7
+
+
+def cell_energy_upper_bound(case, centers_xy: np.ndarray, half_m: float, samples, chunk: int = 4000,
+                            any_aim: bool = True) -> np.ndarray:
+    """Annual energy (MWh) that a lone heliostat placed *anywhere* in each square cell cannot exceed.
+
+    Cell = centre +- half_m in x and y; rho = half diagonal. For every point x of
+    the cell the heliostat -> aim vector v(x) differs from v(c) (centre aim of the
+    cell centre) by at most eps = rho (1 + R / r_min) (heliostat shift plus the
+    shift of the facing point on the cylinder) plus, with ``any_aim``, the largest
+    distance of any visible aim point from the facing mid-height point,
+    sqrt(2 R^2 + (H/2)^2) -- so the bound holds for every aiming strategy (APS
+    included), not only centre aiming. The direction of v turns by at most
+    delta = asin(eps / |v(c)|). Per sun state:
+      cosine        cos(theta / 2) <= cos(max(0, theta_c - delta) / 2)
+      attenuation   decreasing in slant range -> value at |v(c)| - eps
+      intercept     silhouette within the rectangle |u| <= R, |v| <= V(beta), V = H/2 cos beta + R sin beta,
+                    Gaussian mass of that rectangle at the smallest beam sigma D_min * sigma_0
+      absorptivity  largest panel absorptivity within the azimuths the beam can reach (the visible half
+                    with any_aim, else facing azimuths +- asin(5 sigma_max / R)), plus the 5-sigma tail at
+                    the largest absorptivity of all panels.
+    Shading, blocking and flux limits only remove energy, so the bound also holds with neighbours.
+    """
+    from scipy.special import ndtr
+
+    from . import optics, sun
+    from .receiver import _per_panel, default_aim, surface_point
+
+    rec, hel = case.receiver, case.heliostat
+    xy = np.asarray(centers_xy, dtype=float).reshape(-1, 2)
+    out = np.zeros(len(xy))
+    if not len(xy):
+        return out
+    R, H = rec.radius, rec.height
+    rho = half_m * math.sqrt(2.0)
+    s0 = math.sqrt((case.sun.effective_sigma_mrad * 1e-3) ** 2 + (2e-3 * hel.slope_error_mrad) ** 2
+                   + (2e-3 * hel.tracking_error_mrad) ** 2 + (1e-3 * hel.specular_error_mrad) ** 2)
+    d_m = math.sqrt(hel.area)
+    alpha = _per_panel(rec, rec.panel_absorptivity, rec.absorptivity)
+    alpha_max = float(alpha.max())
+    uniform = bool(np.allclose(alpha, alpha[0]))
+    width = 360.0 / rec.n_panels
+    starts = rec.panel_start_azimuth_deg + width * np.arange(rec.n_panels)
+    tail = 2.0 * (1.0 - ndtr(TAIL_K))
+    const = hel.area * hel.reflectivity * hel.cleanliness
+    states = [(float(el), float(sa), float(dni) * float(w)) for el, sa, dni, w in
+              zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h) if el > 0 and dni > 0 and w > 0]
+    for start in range(0, len(xy), chunk):
+        p = xy[start:start + chunk]
+        xyz = np.column_stack([p, np.full(len(p), hel.pivot_height)])
+        az, z = default_aim(rec, xyz)
+        v = surface_point(rec, az, z) - xyz
+        dc = np.linalg.norm(v, axis=1)
+        r_c = np.hypot(p[:, 0] - rec.center[0], p[:, 1] - rec.center[1])
+        r_min = r_c - rho
+        regular = r_min > R  # the cell does not reach the receiver footprint
+        eps = rho * (1.0 + R / np.maximum(r_min, 1e-9)) + (math.sqrt(2.0 * R * R + 0.25 * H * H) if any_aim else 0.0)
+        delta = np.where(regular & (eps < dc), np.arcsin(np.clip(eps / np.maximum(dc, 1e-9), 0.0, 1.0)), math.pi)
+        d_min = np.maximum(dc - eps, 1e-3)
+        d_max = dc + eps
+        beta_c = np.arcsin(np.clip(v[:, 2] / np.maximum(dc, 1e-9), -1.0, 1.0))
+        # largest half silhouette height over beta in [beta_c - delta, beta_c + delta]
+        amp, beta_star = math.hypot(0.5 * H, R), math.atan2(R, 0.5 * H)
+        b_lo, b_hi = beta_c - delta, beta_c + delta
+        v_half = np.where((b_lo <= beta_star) & (beta_star <= b_hi), amp,
+                          np.maximum(0.5 * H * np.cos(b_lo) + R * np.sin(b_lo), 0.5 * H * np.cos(b_hi) + R * np.sin(b_hi)))
+        v_half = np.maximum(v_half, 0.0)
+        sig_min = d_min * s0
+        icpt = (2 * ndtr(R / sig_min) - 1.0) * (2 * ndtr(v_half / sig_min) - 1.0)
+        icpt = np.where(regular, np.clip(icpt, 0.0, 1.0), 1.0)
+        att = np.where(regular, optics.attenuation(d_min, case.atmosphere), 1.0)
+        if uniform:
+            a_ub = np.full(len(p), float(alpha[0]))
+        else:
+            focus = hel.focusing
+            df_max = (np.ones_like(d_max) if focus == "slant_range" else np.zeros_like(d_max) if focus == "flat"
+                      else d_max / float(focus))
+            sig_ast = d_m * np.maximum(df_max, 1.0) / (4.0 * d_min)
+            sig_max = d_max * np.sqrt(s0 ** 2 + sig_ast ** 2)
+            dphi = np.degrees(np.arcsin(np.clip(rho / np.maximum(r_c, 1e-9), 0.0, 1.0)))
+            # the beam centre may sit anywhere on the visible half with any_aim
+            reach = dphi + (90.0 if any_aim else np.degrees(np.arcsin(np.clip(TAIL_K * sig_max / R, 0.0, 1.0))))
+            reach = np.where(regular, reach, 180.0)
+            # panel p intersects [az - reach, az + reach] if its sector start lies within reach + width
+            rel = (starts[None, :] + 0.5 * width - az[:, None] + 180.0) % 360.0 - 180.0  # sector centre offsets
+            hit = np.abs(rel) <= reach[:, None] + 0.5 * width
+            a_ub = np.where(hit, alpha[None, :], 0.0).max(axis=1)
+        e = np.zeros(len(p))
+        for el, sa, weight in states:
+            s = sun.sun_vector(el, sa)
+            theta_c = np.arccos(np.clip((v @ s) / np.maximum(dc, 1e-9), -1.0, 1.0))
+            cos_ub = np.where(regular, np.cos(np.maximum(theta_c - delta, 0.0) / 2.0), 1.0)
+            frac = cos_ub * att * icpt
+            e += weight * const * (frac * a_ub + (0.0 if uniform else alpha_max * tail))
+        out[start:start + chunk] = e / 1e6
     return out
 
 
@@ -629,7 +733,9 @@ def potential_map(case, samples, cell_m: float | None = None, max_cells: int = 6
     inside = site_mask(case, pts, tol=cell_m * math.sqrt(0.5))[0]
     e = np.full(gx.size, np.nan)
     e[inside] = lone_heliostat_energy(case, pts[inside, :2], samples)
-    return PotentialMap(xs, ys, float(cell_m), e.reshape(gx.shape), inside.reshape(gx.shape))
+    ub = np.full(gx.size, np.nan)
+    ub[inside] = cell_energy_upper_bound(case, pts[inside, :2], 0.5 * cell_m, samples)
+    return PotentialMap(xs, ys, float(cell_m), e.reshape(gx.shape), inside.reshape(gx.shape), ub.reshape(gx.shape))
 
 
 def layout_upper_bound(case, n_heliostats: int, spacing_m: float, samples=None, pmap: PotentialMap | None = None,
@@ -637,53 +743,56 @@ def layout_upper_bound(case, n_heliostats: int, spacing_m: float, samples=None, 
                        found_energy_mwh: float | None = None) -> dict:
     """Upper bound on the annual absorbed energy of any layout of N heliostats in the site.
 
-    Raster cells use the largest e0 of the cell and its 8 neighbours (envelope),
-    so the smooth e0 is not underestimated between raster points. ``samples``
-    must be the sun states the potential map was computed with.
+    Every site point lies in a raster cell that touches the site, and
+    ``cell_energy_upper_bound`` bounds the lone-heliostat energy anywhere in
+    that cell, so #{i : e(x_i) >= t} <= cap(union of cells with bound >= t).
+    ``samples`` must be the sun states of ``pmap``. Without a site boundary the
+    site is the square of half-width ``field.default_r_max`` around the tower.
+    A found energy above the bound is reported as ``bound_violation`` (it would
+    mean a modelling inconsistency), never clipped.
     """
-    from scipy.ndimage import maximum_filter
-
     from . import sun as sun_mod
 
     t0 = _time.perf_counter()
     if pmap is None:
         samples = samples if samples is not None else sun_mod.annual_samples(case, "sun_bins", n_bins=30)
         pmap = potential_map(case, samples)
-    e = np.where(pmap.inside, pmap.energy_mwh, -np.inf)
-    env = maximum_filter(np.where(np.isfinite(e), e, -np.inf), size=3, mode="constant", cval=-np.inf)
-    env = np.where(pmap.inside, env, -np.inf)
+    if pmap.ub_mwh is None:
+        raise ValueError("potential map has no cell bounds; build it with certify.potential_map")
+    env = np.where(pmap.inside, pmap.ub_mwh, -np.inf)
     vals = env[np.isfinite(env)]
     if vals.size == 0 or n_heliostats <= 0:
         return {"status": "empty_site", "upper_bound_mwh": 0.0}
     e_max = float(vals.max())
-    # layer cake: integrate min(N, cap(L_t)) over t in [0, e_max]
+    # layer cake: integrate min(N, cap(L_t)) over t in [0, e_max]; cap(L_t) is non-increasing in t, so the
+    # value at the left end of every level interval gives an upper Riemann sum
     levels = np.linspace(0.0, e_max, n_levels + 1)
-    caps = []
-    for t in levels[1:]:
+    site_capacity = packing_capacity(env >= 0.0, pmap.cell_m, spacing_m)
+    caps = [min(n_heliostats, site_capacity)]
+    for t in levels[1:-1]:
         caps.append(min(n_heliostats, packing_capacity(env >= t, pmap.cell_m, spacing_m)))
     caps = np.asarray(caps, dtype=float)
-    # cap(L_t) is non-increasing in t: on (t_j, t_{j+1}] bound by the value at t_j (upper Riemann sum)
-    site_capacity = packing_capacity(env >= 0.0, pmap.cell_m, spacing_m)
-    cap_left = np.concatenate([[min(n_heliostats, site_capacity)], caps[:-1]])
-    ub = float((cap_left * np.diff(levels)).sum())
-    total_capacity = int(site_capacity)
+    ub = float((caps * np.diff(levels)).sum())
     out = {
-        "status": "ok" if total_capacity >= n_heliostats else "no_layout_exists",
+        "status": "ok" if site_capacity >= n_heliostats else "no_layout_exists",
         "upper_bound_mwh": ub,
         "lone_heliostat_max_mwh": e_max,
-        "packing_capacity_bound": total_capacity,
+        "packing_capacity_bound": int(site_capacity),
         "n_heliostats": int(n_heliostats),
         "min_spacing_m": float(spacing_m),
         "raster_cell_m": pmap.cell_m,
         "n_levels": n_levels,
         "time_s": round(_time.perf_counter() - t0, 3),
-        "model": "lone-heliostat annual energy (no shading/blocking, centre aim) + Fejes Toth packing bound",
+        "model": "per-cell bound on the lone-heliostat annual energy (no shading/blocking, centre aim, "
+                 "interval bounds on cosine, attenuation, intercept and absorptivity) + Fejes Toth packing bound",
     }
     if layout_xyz is not None and len(layout_xyz) and samples is not None:
         e_lone = lone_heliostat_energy(case, np.asarray(layout_xyz)[:, :2], samples)
         out["layout_lone_sum_mwh"] = float(e_lone.sum())
-        out["interference_free_gap"] = max(0.0, 1.0 - out["layout_lone_sum_mwh"] / ub) if ub > 0 else None
+        out["interference_free_gap"] = 1.0 - out["layout_lone_sum_mwh"] / ub if ub > 0 else None
     if found_energy_mwh is not None:
         out["found_energy_mwh"] = float(found_energy_mwh)
-        out["gap"] = max(0.0, 1.0 - found_energy_mwh / ub) if ub > 0 else None
+        out["gap"] = 1.0 - found_energy_mwh / ub if ub > 0 else None
+        if ub > 0 and found_energy_mwh > ub * (1 + 1e-9):
+            out["status"] = "bound_violation"
     return out

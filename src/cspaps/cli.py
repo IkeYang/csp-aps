@@ -94,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("sunbins", "representative sun positions for the annual evaluation")
     sp.add_argument("--bins", type=int, default=None)
     sp.add_argument("--check", action="store_true", help="annual-energy error of 20/30/40 bins and the grid vs hourly")
+    sp = add("fetch-weather", "download hourly DNI for the case's site from NASA POWER (writes CSV + case copy)")
+    sp.add_argument("--year", type=int, default=None, help="calendar year (default: annual.year)")
     sp = sub.add_parser("engine", help="online control engine as a JSON-lines service on stdin/stdout")
     sp.add_argument("case")
     sp = sub.add_parser("gui", help="open the graphical interface in the browser")
@@ -143,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.uniformity_weight is not None:
             case.layout_opt.uniformity_weight = args.uniformity_weight
         res = wf.task_optimize_layout(case, out, progress=_progress)
+    elif args.command == "fetch-weather":
+        res = wf.task_fetch_weather(case, out, year=args.year)
     elif args.command == "layout-tradeoff":
         res = wf.task_layout_tradeoff(case, out, lambdas=args.lambdas, progress=_progress)
     elif args.command == "uniformity":

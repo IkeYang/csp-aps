@@ -34,11 +34,12 @@ from cspaps.gui_plots import (
 )
 from cspaps.layout_opt import validate_layout
 from cspaps.optics import footprints_at
+from cspaps.resources import demo_case_path
 from cspaps.receiver import build_grid, incident_limit_w_m2, panel_of, surface_normal, surface_point
 from cspaps.simulate import evaluate, sun_state
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CASE = ROOT / "cases" / "aksai_demo.yaml"
+DEFAULT_CASE = demo_case_path()  # repository copy, or the copy packaged in the wheel
 RESULTS = Path.cwd() / "results" / "gui"
 UPLOADS = RESULTS / "_uploads"
 
@@ -47,6 +48,9 @@ PAGE_LABELS = {"总览": "◎  总览", "瞄准优化": "◉  瞄准优化 · �
                "云影回放": "☁  云影回放", "光学校验": "◇  光学校验", "参数设置": "⚙  参数设置",
                "运行记录": "☰  运行记录", "方法与理论": "∑  方法与理论"}
 PLOTLY_CONFIG = {"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]}
+# Blocking input problems found while drawing the current page (the script reruns from the top on every
+# interaction, so this list is fresh each time); any entry disables the run buttons.
+INPUT_ERRORS: list[str] = []
 
 SECTION_TITLES = {
     "site": "站址", "receiver": "集热器与管屏", "heliostat": "定日镜", "sun": "太阳", "atmosphere": "大气衰减",
@@ -226,6 +230,8 @@ def _initial_case_path() -> Path:
 def _load_into_state(data: dict, base_dir: Path) -> None:
     st.session_state["case_dict"] = data
     st.session_state["base_dir"] = str(base_dir)
+    site, weather = data.get("site") or {}, data.get("weather") or {}
+    st.session_state["weather_site"] = (site.get("latitude"), site.get("longitude"), weather.get("file"))
     st.session_state["ver"] = st.session_state.get("ver", 0) + 1
     for k in [k for k in st.session_state if k.startswith("res_") or k.startswith("job_")]:
         del st.session_state[k]
@@ -305,6 +311,7 @@ def _fields(section: str, fields: list[str] | None = None, n_cols: int = 2) -> N
                 new[name] = _widget(section, name, value, f"{ver}:{section}.{name}")
             except yaml.YAMLError as exc:
                 st.error(f"{name}: YAML 格式错误 {exc}")
+                INPUT_ERRORS.append(f"{LABELS.get(f'{section}.{name}', name)} 的 YAML 格式错误")
     data[section] = {k: v for k, v in new.items() if k in current or v != default_obj.get(k)}
 
 
@@ -418,6 +425,10 @@ div.stButton>button{border-radius:9px}
 .stTabs [data-baseweb="tab-highlight"]{background:var(--cs-teal)}
 div[data-testid="stExpander"] details{border-radius:10px;background:#fff}
 .katex{font-size:1.06em}
+button[data-testid="stNumberInputStepUp"],button[data-testid="stNumberInputStepDown"]{display:none}
+div[data-testid="stHorizontalBlock"]{flex-wrap:wrap;row-gap:.6rem}
+div[data-testid="stColumn"]{min-width:min(340px,100%)}
+div[data-testid="stColumn"] div[data-testid="stColumn"]{min-width:min(118px,100%)}
 @media(max-width:760px){.stMainBlockContainer{padding:3.2rem .8rem 2rem}.cs-hero .title{font-size:1.3rem}}
 </style>""", unsafe_allow_html=True)
 
@@ -545,11 +556,18 @@ class Job:
             st.session_state.pop(f"err_{key}", None)
 
 
-def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help: str | None = None, **kwargs) -> None:
-    """Start a background job; the result lands in st.session_state['res_<key>']."""
+def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help: str | None = None,
+                blockers: list[str] | None = None, **kwargs) -> None:
+    """Start a background job; the result lands in st.session_state['res_<key>'].
+
+    The button is disabled while the case is invalid or any input problem is
+    pending (``INPUT_ERRORS`` + ``blockers``), so a stale value is never solved.
+    """
     case, err = _case()
-    if err:
-        st.error(f"参数有误：{err}")
+    problems = list(INPUT_ERRORS) + list(blockers or []) + ([f"参数有误：{err}"] if err else [])
+    if problems:
+        st.button(label, key=f"btn_{key}", type="primary", disabled=True, width="stretch")
+        st.error("无法开始计算：" + "；".join(dict.fromkeys(problems)))
         return
     job = st.session_state.get(f"job_{key}")
     if job is None or job.done:
@@ -613,6 +631,110 @@ def _contributors(case, fld, t, dni, aim, active, az, z, top=6):
     df = pd.DataFrame({"镜子 ID": fld.ids[idx], "贡献通量 (kW/m²)": np.round(f[order] / 1e3, 2),
                        "占比": np.round(f[order] / max(f.sum(), 1e-9), 3), "DNI (W/m²)": np.round(np.asarray(dni)[idx], 1)})
     return df, float(f.sum() / 1e3)
+
+# --------------------------------------------------------------------------- site, weather and field inputs
+
+def _weather_panel(case, key: str) -> None:
+    """Weather source of the case; warns when the site moved away from the weather file's site."""
+    from cspaps.weather import fetch_power_dni
+
+    case = _case()[0] or case  # include edits made by the widgets above in this run
+    data = st.session_state["case_dict"]
+    lat, lon = case.site.latitude, case.site.longitude
+    ws = st.session_state.get("weather_site")
+    if case.weather.source == "file":
+        name = Path(case.weather.file).name
+        origin = (f"（对应站址 {ws[0]:.3f}°N, {ws[1]:.3f}°E）"
+                  if ws and ws[2] == case.weather.file and ws[0] is not None else "")
+        st.caption(f"气象数据：逐时 DNI 文件 {name}{origin}")
+        moved = (ws is not None and ws[2] == case.weather.file and ws[0] is not None
+                 and (abs(ws[0] - lat) > 0.05 or abs(ws[1] - lon) > 0.05))
+        if moved:
+            _callout("warn", "站址已修改，气象文件仍属于原站址",
+                     f"当前站址 {lat:.3f}°N, {lon:.3f}°E，气象文件对应 {ws[0]:.3f}°N, {ws[1]:.3f}°E。"
+                     "请下载新站址的逐时 DNI、上传实测气象文件，或改用晴空模型。")
+    else:
+        st.caption("气象数据：晴空模型（Meinel，按海拔修正）")
+    c1, c2 = st.columns(2)
+    year = case.annual.year
+    if c1.button(f"下载 NASA POWER {year} 年逐时 DNI", key=f"power_{key}",
+                 help="从 NASA POWER 下载当前经纬度的逐时直射辐照度（需要联网），按站址时区换算到每小时中点。"):
+        path = UPLOADS / f"nasa_power_dni_{lat:.4f}_{lon:.4f}_{year}.csv"
+        try:
+            with st.spinner("正在下载 NASA POWER 逐时 DNI …"):
+                info = fetch_power_dni(lat, lon, year, case.site.timezone, path)
+            data["weather"] = {"source": "file", "file": str(path)}
+            st.session_state["weather_site"] = (lat, lon, str(path))
+            st.session_state["weather_msg"] = (f"已下载 {info['n_hours']} 小时，年 DNI {info['annual_dni_kwh_m2']:,.0f} kWh/m²，"
+                                               f"峰值 {info['peak_dni_w_m2']:.0f} W/m²")
+            st.session_state["ver"] += 1
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001 - network or service problems are shown to the user
+            st.error(f"下载失败：{exc}。可改用晴空模型或上传气象文件。")
+    if c2.button("改用晴空模型", key=f"clear_{key}"):
+        data["weather"] = {"source": "clear_sky"}
+        data.setdefault("sun", {})["dni_model"] = "meinel"
+        st.session_state["ver"] += 1
+        st.rerun()
+    if st.session_state.get("weather_msg"):
+        st.success(st.session_state.pop("weather_msg"))
+    wup = st.file_uploader("上传气象文件（EPW，或 CSV 两列 time,dni，当地时间、W/m²）", type=["epw", "csv"],
+                           key=f"weather_up_{key}")
+    if wup is not None and st.session_state.get(f"weather_loaded_{key}") != (wup.name, wup.size):
+        path = _save_upload(wup)
+        if path.suffix.lower() == ".csv":
+            head = pd.read_csv(path, nrows=5)
+            if not {"time", "dni"} <= set(head.columns):
+                INPUT_ERRORS.append("气象 CSV 需要 time,dni 两列")
+                return
+        st.session_state[f"weather_loaded_{key}"] = (wup.name, wup.size)
+        data["weather"] = {"source": "file", "file": str(path)}
+        st.session_state["weather_site"] = (lat, lon, str(path))
+        st.session_state["ver"] += 1
+        st.rerun()
+
+
+def _field_inputs(case) -> None:
+    """Problem 1 inputs: heliostat coordinates (CSV import), heliostat size, receiver position and size."""
+    data = st.session_state["case_dict"]
+    fspec = data.setdefault("field", {})
+    try:
+        fld = build_field(case)
+        n_txt = f"{fld.n} 面定日镜"
+    except Exception as exc:  # noqa: BLE001
+        n_txt = f"无法读取：{exc}"
+        INPUT_ERRORS.append("镜场坐标无法读取")
+    src = (f"导入坐标 {Path(case.field.layout_file).name}" if case.field.layout_file else "布置生成器")
+    st.caption(f"镜场来源：{src} · {n_txt}")
+    up = st.file_uploader("导入镜场坐标 CSV（列 id,x,y[,z]，单位 m，x 东、y 北、原点为塔底）", type=["csv"], key="field_csv")
+    if up is not None and st.session_state.get("field_csv_loaded") != (up.name, up.size):
+        df = pd.read_csv(up)
+        up.seek(0)
+        if not {"x", "y"} <= set(df.columns):
+            st.error("镜场 CSV 需要 x、y 两列（可选 id、z）。")
+            INPUT_ERRORS.append("镜场 CSV 缺少 x、y 列")
+        elif "id" in df and df["id"].duplicated().any():
+            st.error("镜场 CSV 的 id 有重复。")
+            INPUT_ERRORS.append("镜场 CSV 的 id 重复")
+        else:
+            fspec["layout_file"] = str(_save_upload(up))
+            st.session_state["field_csv_loaded"] = (up.name, up.size)
+            st.session_state["ver"] += 1
+            st.rerun()
+    c1, c2 = st.columns(2)
+    template = "id,x,y,z\n1,0.0,80.0,5.0\n2,15.0,95.0,5.0\n3,-15.0,95.0,5.0\n"
+    c1.download_button("下载坐标模板", template.encode("utf-8"), file_name="field_template.csv", width="stretch")
+    if case.field.layout_file and case.field.generator and c2.button("改回生成器镜场", width="stretch"):
+        fspec["layout_file"] = None
+        st.session_state.pop("field_csv_loaded", None)
+        st.session_state["ver"] += 1
+        st.rerun()
+    st.caption("吸热器（圆柱）中心三维坐标与尺寸")
+    _receiver_center_inputs(case)
+    _fields("receiver", ["diameter", "height"])
+    st.caption("定日镜尺寸")
+    _fields("heliostat", ["width", "height", "pivot_height"], n_cols=3)
+
 
 # --------------------------------------------------------------------------- overview
 
@@ -707,11 +829,30 @@ def page_aps(case) -> None:
             c1, c2 = st.columns(2)
             date = c1.date_input("日期", value=default_time.date(), key=f"s_date:{case.name}")
             tm = c2.time_input("当地时间", value=default_time.time(), key=f"s_time:{case.name}", step=300)
+            with st.expander("镜场坐标、定日镜与吸热器（给定条件）", expanded=bool(case.field.layout_file)):
+                _field_inputs(case)
             dni_src = st.radio("DNI 分布", list(DNI_SOURCES), format_func=DNI_SOURCES.get, key="aps_dni_src",
                                help="站址气象：全场同一 DNI；云影场景：按回放设置生成云影，DNI 随镜位变化；"
                                     "导入：CSV (x, y, dni) 插值到每面镜。")
+            aps_blockers = []
             if dni_src == "upload":
-                up_now = st.file_uploader("当前镜场 DNI（CSV x,y,dni）", type=["csv"], key="s_now")
+                up_now = st.file_uploader("当前镜场 DNI（CSV x,y,dni，W/m²）", type=["csv"], key="s_now")
+                if up_now is None:
+                    aps_blockers.append("请上传当前镜场 DNI 分布")
+                else:
+                    df_now = pd.read_csv(up_now)
+                    up_now.seek(0)
+                    if not {"x", "y", "dni"} <= set(df_now.columns):
+                        aps_blockers.append("DNI 文件需要 x,y,dni 三列")
+                    elif (pd.to_numeric(df_now["dni"], errors="coerce") < 0).any() or df_now["dni"].isna().any():
+                        aps_blockers.append("DNI 文件含负值或空值")
+                    else:
+                        st.caption(f"已读取 {len(df_now)} 个测点，DNI {df_now['dni'].min():.0f}–{df_now['dni'].max():.0f} W/m²，"
+                                   "按位置插值到每面定日镜。")
+            else:
+                with st.expander("站址与气象数据"):
+                    _fields("site", ["latitude", "longitude", "elevation_m", "timezone"])
+                    _weather_panel(case, "aps")
             with st.expander("预报 DNI 与上一周期方案（可选）"):
                 up_fc = st.file_uploader("预测时段最高 DNI（CSV x,y,dni）", type=["csv"], key="s_fc",
                                          help="用于避免云层移开后预测时段内吸热器局部热流超限。")
@@ -752,9 +893,7 @@ def page_aps(case) -> None:
             st.error(err)
             return
         stamp = f"{date} {tm}"
-        if dni_src == "upload" and up_now is None:
-            st.info("请上传当前镜场 DNI 分布，或改用站址气象 / 云影场景。")
-        _job_button("single", "▶  计算瞄准方案", wf.task_aim, stamp, method=method,
+        _job_button("single", "▶  计算瞄准方案", wf.task_aim, stamp, method=method, blockers=aps_blockers,
                     dni_map=_save_upload(up_now) if up_now else None,
                     forecast_dni_map=_save_upload(up_fc) if up_fc else None,
                     prev_aims=_save_upload(up_prev) if up_prev else None,
@@ -919,6 +1058,7 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
             return
         with c2:
             _job_button("pareto", "计算权衡曲线", wf.task_pareto, stamp, lambdas=lambdas,
+                        blockers=["请上传当前镜场 DNI 分布"] if dni_src == "upload" and up_now is None else None,
                         dni_map=_save_upload(up_now) if (dni_src == "upload" and up_now) else None,
                         dni_source="cloud" if dni_src == "cloud" else "site", progress=True)
         _job_error("pareto")
@@ -987,6 +1127,7 @@ def _site_inputs(case) -> None:
             fspec["boundary"] = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
         else:
             st.error("边界无效：需要 x_max > x_min 且 y_max > y_min。")
+            INPUT_ERRORS.append("场地边界无效（需要 x_max > x_min、y_max > y_min）")
     else:
         _fields("field", ["boundary"], n_cols=1)
     _fields("field", ["exclusion_radius"], n_cols=1)
@@ -1021,9 +1162,7 @@ def page_layout(case) -> None:
             _receiver_center_inputs(case)
             _fields("receiver", ["diameter", "height"])
             _site_inputs(case)
-            wup = st.file_uploader("更换气象文件（EPW 或 CSV time,dni）", type=["epw", "csv"], key="weather_up")
-            if wup is not None:
-                st.session_state["case_dict"]["weather"] = {"source": "file", "file": str(_save_upload(wup))}
+            _weather_panel(case, "layout")
         with _card("layout_goal"):
             _section(2, "布局目标", "APS 只能沿高度、在小范围周向内移动瞄准点；吸热器各朝向的受热由镜位决定。"
                      "λ_L 是均匀性的重要性超参数：λ_L = 0 只追求全年能量，λ_L 越大镜场越环绕吸热器。")
@@ -1105,7 +1244,10 @@ def _layout_results(case, res: dict) -> None:
                  f"周向 CV {uni['cv_circ_weighted']:.2f}。这部分不均匀无法靠瞄准策略消除——在 ② 中提高布局均匀度权重 λ_L，"
                  "让镜场环绕吸热器。")
     exist = s.get("existence") or {}
-    if exist.get("optimum_exists") is True and ub.get("upper_bound_mwh"):
+    if ub.get("status") == "bound_violation":
+        _callout("bad", "上界校验失败：本方案的能量超过了计算出的上界",
+                 "这说明模型之间存在不一致，本次的差距不能作为证明。请保存运行记录并反馈。")
+    elif exist.get("optimum_exists") is True and ub.get("upper_bound_mwh"):
         _callout("ok", "最优布置存在；本方案与全局最优的距离已被量化",
                  f"镜位可行集（场地内、镜间距 ≥ {ub['min_spacing_m']:.2f} m、镜数 {ub['n_heliostats']}）有界且闭，"
                  f"年能量随镜位连续变化，因此全局最优布置存在（一般不唯一）。本方案全年理论吸收 "
@@ -1548,10 +1690,12 @@ def page_theory(case) -> None:
                  "软件给出“不存在可行布置”的证明。由于对称性，最优布置一般不唯一。")
         _section(None, "上界：任意布局都不可能超过的能量")
         st.latex(r"E(X)\le\sum_i e_0(x_i)=\int_0^\infty\#\{i:e_0(x_i)\ge t\}\,dt\le\int_0^\infty\min\big(N,\mathrm{cap}(L_t)\big)\,dt")
-        st.markdown("- $e_0(x)$：单镜在无邻镜干扰、中心瞄准下的全年吸收热量（对称吸热器轮廓上，居中的高斯光斑截断最大——Anderson 不等式）；\n"
+        st.markdown("- $e_0(x)$：单镜在无邻镜干扰时的全年吸收热量（余弦、反射、衰减、截断、按光斑在各管屏上分布加权的吸收率）；\n"
                     "- 镜距 $\\ge d$ 的点集，Voronoi 胞与半径 $d/\\sqrt3$ 圆盘之交互不重叠，面积 $\\ge\\sqrt3d^2/2$（Fejes Tóth），"
                     "得到 $\\mathrm{cap}(S)\\le \\mathrm{area}(S\\oplus B(d/\\sqrt3))/(\\sqrt3 d^2/2)$；\n"
-                    "- 栅格取 3×3 邻域最大值作包络，保证不低估。")
+                    "- 栅格上的严格做法：对每个格子求对格内**任意位置、任意瞄准点**都成立的上界——余弦按方向最大偏转、"
+                    "衰减按最短斜距、截断按包含吸热器轮廓的矩形在最小光斑下的高斯质量、吸收率按光斑可达管屏的最大值；"
+                    "圆盘膨胀半径再加 √2 个格宽。每一步都是不等式，不依赖采样密度。")
         _section(None, "搜索方法")
         st.markdown("径向交错 / 仿生螺旋参数化生成器铺满场地 → 每个参数向量用交换搜索选出使 J 最大的 N 个镜位（λ_L = 0 时即年收益最高的 N 个）→ "
                     "差分进化 + 局部模式搜索 → 入围方案用更细采样和受限 APS 复核排名 → 低收益镜位与未用候选换位 → "

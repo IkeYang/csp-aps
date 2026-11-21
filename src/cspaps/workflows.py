@@ -427,6 +427,28 @@ def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None
     return {"summary": _clean(summary), "files": files, "result": res, "run_dir": out}
 
 
+def task_fetch_weather(case: Case, base: str | Path, year: int | None = None) -> dict:
+    """Hourly DNI for the case's site from NASA POWER, plus a copy of the case that uses it."""
+    from .weather import fetch_power_dni
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "weather")
+    year = int(year or case.annual.year)
+    site = case.site
+    path = out / f"nasa_power_dni_{site.latitude:.4f}_{site.longitude:.4f}_{year}.csv"
+    info = fetch_power_dni(site.latitude, site.longitude, year, site.timezone, path)
+    new_case = case.copy()
+    new_case.weather.source, new_case.weather.file = "file", path.name
+    new_case.annual.year = year
+    new_case.base_dir = out
+    files = {"weather_csv": path, "case_yaml": out / f"{case.name}_weather_{year}.yaml"}
+    files["case_yaml"].write_text(new_case.to_yaml(), encoding="utf-8")
+    info["file"] = path.name
+    _json(out / "weather.json", info)
+    finish(out, "fetch_weather", info, {"year": year}, t0)
+    return {"summary": _clean(info), "files": files, "run_dir": out}
+
+
 def task_layout_tradeoff(case: Case, base: str | Path, lambdas=None, params: dict | None = None,
                          progress: Progress | None = None) -> dict:
     """Annual energy vs circumferential uniformity of the layout over lambda_L (fixed generator parameters).

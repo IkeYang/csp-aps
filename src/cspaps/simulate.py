@@ -22,7 +22,7 @@ import pandas as pd
 from . import optics, shading, sun
 from .config import Case
 from .field import Field
-from .receiver import ReceiverGrid, build_grid, default_aim, surface_point
+from .receiver import ReceiverGrid, build_grid, default_aim, effective_absorptivity, surface_point
 from .uniformity import region_of_grid, uniformity_metrics
 
 STAGES = ("sun", "cosine", "reflectivity", "shading", "blocking", "attenuation", "intercept")
@@ -45,6 +45,7 @@ class Snapshot:
     region: np.ndarray | None = dc_field(default=None, repr=False)  # (M,) preheater cells H
     beams: dict | None = dc_field(default=None, repr=False)  # aim_xyz, t, sigma, power of active beams
     margin: float = 0.0
+    alpha_eff: np.ndarray | None = dc_field(default=None, repr=False)  # (N,) beam-spread absorptivity
 
     @property
     def n(self) -> int:
@@ -65,9 +66,12 @@ class Snapshot:
 
     @property
     def p_absorbed(self) -> float:
-        """Absorbed power, W (intercepted power x flux-weighted absorptivity)."""
+        """Absorbed power, W: intercepted power x flux-weighted absorptivity (flux map), or x the
+        beam-spread absorptivity of each heliostat when no flux map was computed."""
         f = self.flux.sum()
         if f <= 0:
+            if self.alpha_eff is not None:
+                return float((self.power["intercept"] * self.alpha_eff).sum())
             return float(self.p_receiver * self.grid.alpha.mean())
         return float(self.p_receiver * (self.absorbed_flux.sum() / f))
 
@@ -195,8 +199,9 @@ def evaluate(
         beams = {"aim_xyz": aim_xyz[on], "t": t[on], "sigma": sigma[on], "power": p_att[on], "index": on}
     else:
         flux_flat = np.zeros(grid.points.shape[0])
+    alpha_eff = effective_absorptivity(rec, aim_az, sigma)
     return Snapshot(time, float(sun_elevation), float(sun_azimuth), dni_v, aim_az, aim_z, active,
-                    eta, power, grid.to_map(flux_flat), grid, region, beams, case.aps.safety_margin)
+                    eta, power, grid.to_map(flux_flat), grid, region, beams, case.aps.safety_margin, alpha_eff)
 
 
 def sun_state(case: Case, time) -> tuple[pd.Timestamp, float, float, float]:
