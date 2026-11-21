@@ -138,10 +138,18 @@ def load_dni_map(path, xy: np.ndarray) -> np.ndarray:
         raise ValueError(f"{path}: DNI map CSV needs columns x,y,dni")
     pts = df[["x", "y"]].to_numpy(float)
     val = df["dni"].to_numpy(float)
+    if not len(pts) or not np.isfinite(pts).all() or not np.isfinite(val).all() or (val < 0).any():
+        raise ValueError("DNI samples need finite coordinates and nonnegative irradiance")
     if len(df) == len(xy) and np.allclose(pts, xy[:, :2], atol=1e-3):
         return np.clip(val, 0.0, None)
     nearest = NearestNDInterpolator(pts, val)(xy[:, 0], xy[:, 1])
-    if len(df) >= 3:
+    offsets = pts - pts.mean(axis=0)
+    if len(df) >= 3 and np.linalg.matrix_rank(offsets) == 2:
         lin = LinearNDInterpolator(pts, val)(xy[:, 0], xy[:, 1])
         nearest = np.where(np.isfinite(lin), lin, nearest)
+    elif len(df) >= 2 and np.any(offsets):
+        axis = np.linalg.svd(offsets, full_matrices=False)[2][0]
+        projected = pts @ axis
+        order = np.argsort(projected)
+        nearest = np.interp(xy[:, :2] @ axis, projected[order], val[order])
     return np.clip(nearest, 0.0, None)

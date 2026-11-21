@@ -202,7 +202,7 @@ def aps_upper_bound(
     lam = float(lam) if mode == "weighted" else 0.0
     eps_v = float(eps) if mode == "cv_limit" else 0.0
     use_mu = mode == "cv_limit"
-    use_rho = mode == "cv_limit" and min_load_w > 0
+    use_rho = mode in ("cv_limit", "weighted") and min_load_w > 0
     p_ref = max(float(np.maximum(model.c.reshape(n, k), 0.0).max(axis=1, initial=0.0).sum()), 1.0)
 
     # value of the given plan
@@ -212,11 +212,11 @@ def aps_upper_bound(
     p0, s0, ph0 = float(model.c @ x0), model.sc * nd0, float(model.h_lin @ x0)
     flux_ok0 = bool(np.all(fc <= model.lim * (1 + 1e-9)))
     if mode == "weighted":
-        found = p0 - lam * s0
-        plan_feasible = flux_ok0
+        plan_feasible = flux_ok0 and ph0 >= min_load_w * (1 - 1e-9)
+        found = p0 - lam * s0 if plan_feasible else None
     elif mode == "power":
-        found = p0
         plan_feasible = flux_ok0
+        found = p0 if plan_feasible else None
     else:
         plan_feasible = flux_ok0 and s0 <= eps_v * ph0 * (1 + 1e-9) and ph0 >= min_load_w * (1 - 1e-9) and ph0 > 0
         found = p0 if plan_feasible else None
@@ -364,6 +364,8 @@ def _model_value(prob, choice, mode, lam, eps, min_load_w, h_mask) -> float | No
     if np.any(prob.flux(choice) > prob.limit * (1 + 1e-9)):
         return None
     v = objective_value(prob, choice, mode, lam, h_mask)
+    if v["power_h_w"] < min_load_w * (1 - 1e-9):
+        return None
     if mode == "cv_limit":
         if not (v["power_h_w"] > 0 and v["spread_w"] <= eps * v["power_h_w"] * (1 + 1e-9)
                 and v["power_h_w"] >= min_load_w * (1 - 1e-9)):
@@ -744,6 +746,46 @@ def potential_map(case, samples, cell_m: float | None = None, max_cells: int = 6
     ub = np.full(gx.size, np.nan)
     ub[inside] = cell_energy_upper_bound(case, pts[inside, :2], 0.5 * cell_m, samples)
     return PotentialMap(xs, ys, float(cell_m), e.reshape(gx.shape), inside.reshape(gx.shape), ub.reshape(gx.shape))
+
+
+def hourly_site_upper_bound(case, n_heliostats, spacing_m, hourly, pmap):
+    """Packing bound for every recorded hour, every site position and every aim on the cylinder.
+
+    cos(incidence) = sqrt((1 + s.t)/2) is concave in s.t. Within each solar-direction
+    bin, Jensen's inequality bounds the DNI-weighted mean by its value at the mean
+    sun vector (retain its length). The half diagonal of a site cell plus the radius
+    of the receiver's enclosing sphere bounds all changes in the mirror-to-aim vector.
+    """
+    from dataclasses import replace
+    from . import sun
+
+    xx, yy = np.meshgrid(pmap.x, pmap.y)
+    cx, cy, cz = case.receiver.center
+    delta = np.stack([cx - xx, cy - yy, np.full_like(xx, cz - case.heliostat.pivot_height)], axis=-1)
+    distance = np.linalg.norm(delta, axis=-1)
+    radius = pmap.cell_m / math.sqrt(2) + math.hypot(case.receiver.radius, case.receiver.height / 2)
+    cone = np.where(distance > radius, np.arcsin(np.minimum(1, radius / np.maximum(distance, 1e-15))), math.pi)
+    direction = delta / np.maximum(distance[..., None], 1e-15)
+    vectors = sun.sun_vector(hourly.elevation, hourly.azimuth)
+    weights = hourly.dni * hourly.weight_h
+    bins = np.floor(hourly.azimuth / 15).astype(int) + 24 * np.floor(hourly.elevation / 10).astype(int)
+    envelope = np.zeros_like(distance)
+    for label in np.unique(bins):
+        subset = bins == label
+        mass = float(weights[subset].sum())
+        if mass <= 0:
+            continue
+        mean = (weights[subset] @ vectors[subset]) / mass
+        length = np.linalg.norm(mean)
+        angle = np.arccos(np.clip((direction @ mean) / max(length, 1e-15), -1, 1))
+        dot_max = np.minimum(1.0, length * np.cos(np.maximum(0, angle - cone)))
+        envelope += mass * np.sqrt((1 + dot_max) / 2)
+    h = case.heliostat
+    alpha = max(case.receiver.panel_absorptivity or [case.receiver.absorptivity])
+    envelope *= h.area * h.reflectivity * h.cleanliness * alpha / 1e6
+    hourly_map = replace(pmap, ub_mwh=envelope * (1 + 1e-12))
+    bound = layout_upper_bound(case, n_heliostats, spacing_m, pmap=hourly_map)
+    return bound["upper_bound_mwh"]
 
 
 def layout_upper_bound(case, n_heliostats: int, spacing_m: float, samples=None, pmap: PotentialMap | None = None,

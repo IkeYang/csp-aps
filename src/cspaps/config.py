@@ -155,6 +155,8 @@ class APSSpec:
     certify: bool = True
     certify_time_s: float = 15.0  # time budget of the upper-bound iterations
     certify_rounds: int = 4  # randomised roundings of the relaxed solution
+    coupled_exact_limit: int = 256  # enumerate all joint mirror poses up to this many assignments
+    coupled_trials: int = 18  # additional joint-pose trials for larger offline problems
 
 
 @dataclass
@@ -242,11 +244,13 @@ class LayoutOpt:
     seed: int = 1
     workers: int = 1  # parallel processes for the global search (-1 = all CPUs)
     polish_rounds: int = 4  # local pattern-search rounds after the global search
+    position_trials: int = 12  # feasible continuous XY perturbations per shortlisted theoretical layout
     refine_top: int = 3  # re-rank the best layouts with APS-aware annual energy
     upper_bound: bool = True  # certify: upper bound on the annual energy of any layout (packing bound)
     # lambda_L: weight of the circumferential (layout-determined) non-uniformity of the receiver flux.
     # Objective J = sum_t w_t [P_abs,t - lambda_L * A_H * sigma_circ,t]; 0 = annual energy only.
     uniformity_weight: float = 0.0
+    uniformity_metric: str = "circumferential"  # "surface": area-weighted 2-D flux over the receiver region
     # Fixed-point passes that re-price every candidate against the selected layout (only the selected
     # heliostats shade / block) and reselect; stops when the selection no longer changes.
     selection_iterations: int = 2  # search stage; the review stage uses at least 6 plus the full swap polish
@@ -358,10 +362,16 @@ def _validate(case: Case) -> None:
         raise ValueError("receiver.flux_limit_basis must be 'incident' or 'absorbed'")
     if not 0 < rec.absorptivity <= 1:
         raise ValueError("receiver.absorptivity must be in (0, 1]")
+    if rec.panel_absorptivity and any(v > 1 for v in rec.panel_absorptivity):
+        raise ValueError("receiver.panel_absorptivity must be in (0, 1]")
     if rec.limit_height_profile is not None and (len(rec.limit_height_profile) < 1
                                                  or any(not v > 0 for v in rec.limit_height_profile)):
         raise ValueError("receiver.limit_height_profile needs positive values")
     u = case.uniformity
+    if u.min_load_mw < 0 or case.aps.coupled_exact_limit < 0 or case.aps.coupled_trials < 0:
+        raise ValueError("minimum load and coupled-search budgets must be nonnegative")
+    if case.layout_opt.min_spacing_factor is not None and not case.layout_opt.min_spacing_factor > 0:
+        raise ValueError("layout_opt.min_spacing_factor must be positive")
     if u.mode not in ("cv_limit", "weighted"):
         raise ValueError("uniformity.mode must be cv_limit|weighted")
     if u.weight < 0:
@@ -380,6 +390,10 @@ def _validate(case: Case) -> None:
             raise ValueError(f"layout_opt.{name} must be sun_bins|sun_grid|hourly")
     if case.layout_opt.uniformity_weight < 0:
         raise ValueError("layout_opt.uniformity_weight must be >= 0")
+    if case.layout_opt.uniformity_metric not in ("circumferential", "surface"):
+        raise ValueError("layout_opt.uniformity_metric must be circumferential|surface")
+    if case.layout_opt.position_trials < 0:
+        raise ValueError("layout_opt.position_trials must be nonnegative")
     if case.layout_opt.uniformity_sectors < 0 or case.layout_opt.selection_iterations < 0:
         raise ValueError("layout_opt.uniformity_sectors and selection_iterations must be >= 0")
     if case.layout_opt.search_aiming not in ("auto", "center", "greedy", "kfactor"):

@@ -34,7 +34,7 @@ Review (the advisor's "受限全年收益复排")
 from __future__ import annotations
 
 import time as _time
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass, field as dc_field, replace
 from typing import Callable
 
 import numpy as np
@@ -93,6 +93,38 @@ def make_samples(case: Case, method: str, n_bins: int, dni_bands: int = 1, hourl
     return sun.sun_bins(hourly, n_bins, seed=seed, dni_bands=dni_bands)
 
 
+def _spread_mwh(result, case, operational=False):
+    ts = result.timeseries
+    column = "surface_spread_mw" if case.layout_opt.uniformity_metric == "surface" else "circ_spread_mw"
+    if operational:
+        ts = ts.loc[ts.operational_feasible]
+    return float(ts[column] @ ts.weight_h) if len(ts) else 0.0
+
+
+def _surface_score(case):
+    return case.layout_opt.uniformity_metric == "surface" or case.uniformity.z_range is not None
+
+
+def _hourly_theoretical_score(case, xyz, hourly, lam, shading_points):
+    """Evaluate one fixed layout over the weather year, bounding working memory by time blocks."""
+    from .layout_uniformity import build_model
+
+    full = _surface_score(case)
+    res = annual(case, Field(xyz), samples=hourly, aiming="center", with_flux=full,
+                 shading_points=shading_points, keep_state_power=lam > 0 and not full)
+    energy = float(res.timeseries["p_absorbed_mw"] @ hourly.weight_h) if len(hourly) else 0.0
+    if full:
+        return energy, _spread_mwh(res, case)
+    spread = 0.0
+    if lam > 0:
+        for start in range(0, len(hourly), 24):
+            sl = slice(start, start + 24)
+            subset = sun.Samples(hourly.elevation[sl], hourly.azimuth[sl], hourly.dni[sl], hourly.weight_h[sl])
+            model = build_model(case, xyz, subset, res.state_power_w[sl], lam)
+            spread += model.terms(np.ones(len(xyz)))["spread_mwh"]
+    return energy, spread
+
+
 def evaluate_layout(
     case: Case,
     kind: str,
@@ -140,6 +172,11 @@ def evaluate_layout(
     center_energy = center_res.summary()["absorbed_energy_mwh"]
     uni = lu.layout_metrics(case, xyz, samples, center_res.state_power_w, lam) if keep_power else None
     penalty = lam * uni["circ_spread_mwh"] if uni else 0.0
+    if aiming == "center" and lam > 0 and _surface_score(case):
+        center_res = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=True,
+                            shading_points=shading_points, workers=1)
+        center_energy = center_res.summary()["absorbed_energy_mwh"]
+        penalty = lam * _spread_mwh(center_res, case)
     if aiming == "center":
         return LayoutEval(params, n_cand, xyz, center_energy - penalty, center_res, cand_xyz, cand_e,
                           center_energy_mwh=center_energy, search_aiming="center", uniformity=uni,
@@ -147,6 +184,7 @@ def evaluate_layout(
     res = annual(case, Field(xyz), samples=samples, aiming=aiming, with_flux=True,
                  shading_points=shading_points, workers=1)
     aps_energy = res.summary()["feasible_absorbed_energy_mwh"]
+    penalty = lam * _spread_mwh(res, case, operational=True)
     return LayoutEval(params, n_cand, xyz, aps_energy - penalty, res, cand_xyz, cand_e,
                       aps_energy_mwh=aps_energy, aps_result=res, center_energy_mwh=center_energy,
                       search_aiming=aiming, uniformity=uni, selection=sel_info)
@@ -224,14 +262,21 @@ def layout_tradeoff(case: Case, kind: str, params: dict, samples: sun.Samples, n
             case, Field(xyz), samples=samples, aiming="center", with_flux=False, shading_points=shading_points,
             workers=1, keep_state_power=True, blockers=sel).state_power_w, lam)
         lay = xyz[sel]
-        res = annual(case, Field(lay), samples=samples, aiming="center", with_flux=False,
+        full = _surface_score(case)
+        res = annual(case, Field(lay), samples=samples, aiming="center", with_flux=full,
                      shading_points=shading_points, workers=1, keep_state_power=True)
         met = lu.layout_metrics(case, lay, samples, res.state_power_w, lam)
         row = {"lambda": lam, "energy_mwh": res.summary()["absorbed_energy_mwh"],
                "cv_circ_weighted": met["cv_circ_weighted"], "centroid_offset_m": met["centroid_offset_m"],
                "north_fraction": met["north_fraction"], "objective_mwh": met["objective_mwh"],
                "sector_share": met["sector_share"], "n_detached": met["n_detached"], "swaps": info["swaps"], "xyz": lay}
-        if certify and lam > 0:
+        if full:
+            spread = _spread_mwh(res, case)
+            row["objective_mwh"] = row["energy_mwh"] - lam * spread
+            if case.layout_opt.uniformity_metric == "surface":
+                row["surface_spread_mwh"] = spread
+            row["uniformity_metric"] = case.layout_opt.uniformity_metric
+        if certify and lam > 0 and not full:
             row["selection_gap"] = lu.selection_bound(model, n_select, sel, max_iter=120, time_limit_s=5.0)["gap"]
         rows.append(row)
     return rows
@@ -252,7 +297,59 @@ class _Objective:
         lo = self.case.layout_opt
         ev = evaluate_layout(self.case, self.kind, self.params(x), self.samples, lo.n_heliostats,
                              lo.shading_points, self.aiming)
+        if lo.n_heliostats and ev.n < lo.n_heliostats:
+            # Spread of C nonnegative equal-area columns is at most sqrt(C) times
+            # the mean. Rank every shortfall below any feasible weighted objective.
+            max_e = self.samples.dni_hours * lo.n_heliostats * self.case.heliostat.area / 1000
+            floor = max_e * (1 + lo.uniformity_weight * np.sqrt(self.case.receiver.n_azimuth)) + 1
+            return floor * (1 + lo.n_heliostats - ev.n)
         return -ev.energy_mwh
+
+
+def _refine_positions(case, ev, samples, rng):
+    """Improve a feasible field in continuous XY space, keeping count and spacing at every move."""
+    from . import layout_uniformity as lu
+
+    spec = case.layout_opt
+    if not spec.position_trials or not ev.n or ev.n != spec.n_heliostats or ev.search_aiming != "center":
+        return
+    spacing = case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
+    original = ev.xyz.copy()
+    accepted = 0
+    for step in range(spec.position_trials):
+        xyz = ev.xyz.copy()
+        ids = rng.choice(ev.n, size=min(ev.n, 1 + step % 5), replace=False)
+        angles = rng.uniform(0, 2 * np.pi, len(ids))
+        radius = spacing * (0.1, 0.4, 1.0)[step % 3]
+        if ev.n > 1:
+            nearest = cKDTree(xyz[:, :2]).query(xyz[ids, :2], k=2)[0][:, 1]
+            # A step below half the available clearance stays legal even when
+            # both members of a tight pair move towards one another.
+            radius = np.minimum(radius, np.maximum(0.02, (nearest - spacing) * 0.48))[:, None]
+        xyz[ids, :2] += radius * np.column_stack((np.cos(angles), np.sin(angles)))
+        if not site_mask(case, xyz[ids])[0].all() or cKDTree(xyz[:, :2]).query_pairs(spacing * (1 - 1e-9)):
+            continue
+        full = _surface_score(case)
+        result = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=full,
+                        shading_points=spec.shading_points, workers=1, keep_state_power=spec.uniformity_weight > 0)
+        energy = result.summary()["absorbed_energy_mwh"]
+        uni = (lu.layout_metrics(case, xyz, samples, result.state_power_w, spec.uniformity_weight)
+               if spec.uniformity_weight > 0 else None)
+        spread = _spread_mwh(result, case) if full else (uni["circ_spread_mwh"] if uni else 0)
+        score = energy - spec.uniformity_weight * spread
+        if score > ev.energy_mwh:
+            ev.xyz, ev.result, ev.uniformity = xyz, result, uni
+            ev.energy_mwh, ev.center_energy_mwh = score, energy
+            accepted += 1
+    if accepted:
+        # Keep unused candidate positions that remain compatible with every moved mirror.
+        moved = (ev.xyz != original).any(axis=1)
+        distances, _ = cKDTree(ev.xyz[moved, :2]).query(ev.candidates_xyz[:, :2])
+        pool = ev.candidates_xyz[distances >= spacing * (1 - 1e-9)]
+        ev.candidates_xyz = np.unique(np.vstack([pool, ev.xyz]), axis=0)
+        ev.candidate_energy = None
+    ev.selection = {**(ev.selection or {}), "position_trials": spec.position_trials,
+                    "position_improvements": accepted}
 
 
 def validate_layout(case: Case, xyz: np.ndarray, n_required: int | None, spacing_m: float) -> dict:
@@ -355,8 +452,9 @@ class LayoutOptResult:
                                  "(Fejes Toth packing bound)"}
         if self.validation.get("status") == "ok":
             return {"optimum_exists": True,
-                    "statement": "a feasible layout was found; the set of feasible layouts is closed and bounded and "
-                                 "the annual energy is continuous in the positions, so a best layout exists",
+                    "scope": "finite evaluated design set",
+                    "statement": "A feasible layout exists and the best of the finite evaluated layouts is attained. "
+                                 "Continuous-site attainment requires an upper-semicontinuous objective on the closed site.",
                     "found_mwh": b.get("found_energy_mwh"), "upper_bound_mwh": b.get("upper_bound_mwh"),
                     "gap": b.get("gap")}
         return {"optimum_exists": None, "statement": "no feasible layout with N heliostats was found and the packing "
@@ -487,6 +585,20 @@ def optimize_layout(
         say(f"review {rank}/{len(top)}: selecting the positions (full swap neighbourhood)")
         ev = evaluate_layout(case, kind, params, samples, spec.n_heliostats, spec.shading_points,
                              aiming=search_aiming, polish=True)
+        original = replace(ev)
+        _refine_positions(case, ev, samples, np.random.default_rng(spec.seed + rank))
+        scored = None
+        if spec.refine_top > 0 and ev.xyz is not original.xyz:
+            # A move profitable on the search quadrature can lose energy over the year.
+            # Keep the unmoved layout as an incumbent under the final ranking objective.
+            reference = hourly if spec.review_check_hourly else review_center
+            base_score = _hourly_theoretical_score(case, original.xyz, reference, lam, spec.shading_points)
+            scored = _hourly_theoretical_score(case, ev.xyz, reference, lam, spec.shading_points)
+            if scored[0] - lam * scored[1] <= base_score[0] - lam * base_score[1]:
+                original.selection = {**(ev.selection or {}), "position_review_accepted": False}
+                ev, scored = original, base_score
+            else:
+                ev.selection["position_review_accepted"] = True
         info = {**{k: params[k] for k in names}, "search_rank": rank, "n_heliostats": ev.n,
                 "n_candidates": ev.n_candidates, "search_aiming": search_aiming,
                 "energy_search_objective_mwh": ev.energy_mwh,
@@ -501,16 +613,17 @@ def optimize_layout(
             ev.uniformity = uni
             info["circ_cv_review"] = uni["cv_circ_weighted"]
             info["circ_spread_review_mwh"] = uni["circ_spread_mwh"]
+            info["objective_spread_review_mwh"] = (_spread_mwh(rc, case) if _surface_score(case)
+                                                   else uni["circ_spread_mwh"])
             info["centroid_offset_m"] = uni["centroid_offset_m"]
             info["north_fraction"] = uni["north_fraction"]
             info["constrained_states_center"] = int(rc.timeseries["over_limit"].sum())
             info["hours_over_limit_center"] = float(rc.timeseries.loc[rc.timeseries["over_limit"], "weight_h"].sum())
             if spec.review_check_hourly:
                 say(f"review {rank}/{len(top)}: hourly year with centre aiming (sampling error)")
-                rh = annual(case, Field(ev.xyz), samples=hourly, aiming="center", grid=grid, with_flux=False,
-                            shading_points=spec.shading_points)
-                e_h = rh.summary()["absorbed_energy_mwh"]
+                e_h, spread_h = scored or _hourly_theoretical_score(case, ev.xyz, hourly, lam, spec.shading_points)
                 info["energy_hourly_center_mwh"] = e_h
+                info["objective_spread_hourly_mwh"] = spread_h
                 info["search_sampling_error_pct"] = 100 * (float(ev.center_energy_mwh or 0.0) / e_h - 1) if e_h else None
                 info["review_sampling_error_pct"] = 100 * (info["energy_review_center_mwh"] / e_h - 1) if e_h else None
             if use_aps and not stop():
@@ -530,8 +643,14 @@ def optimize_layout(
                 info["aps_states_not_ok"] = int((~ra.timeseries["operational_feasible"]).sum())
                 info["aps_max_defocused"] = int(ra.timeseries["n_defocused"].max())
         if "energy_review_center_mwh" in info:
-            base_e = info.get("energy_constrained_aps_mwh", info["energy_review_center_mwh"])
-            info["objective_review_mwh"] = base_e - lam * info.get("circ_spread_review_mwh", 0.0)
+            if search_aiming != "center" and ev.aps_result is not None:
+                spread = _spread_mwh(ev.aps_result, case, operational=True)
+                info["objective_review_mwh"] = ev.aps_energy_mwh - lam * spread
+            else:
+                energy = info.get("energy_hourly_center_mwh", info["energy_review_center_mwh"])
+                spread = info.get("objective_spread_hourly_mwh", info["objective_spread_review_mwh"])
+                ev.center_energy_mwh = energy
+                info["objective_review_mwh"] = energy - lam * spread
         evals.append(ev)
         rows.append(info)
     ranking = pd.DataFrame(rows)
@@ -545,7 +664,7 @@ def optimize_layout(
     # ---- swap refinement on the winner (accepted on constrained annual energy). With lambda_L > 0 the
     # selection is already a swap-local optimum of the uniformity-weighted objective (exchange search).
     swaps = []
-    if (use_aps and lam <= 0 and best.aps_result is not None and best.candidates_xyz is not None
+    if (search_aiming != "center" and use_aps and lam <= 0 and best.aps_result is not None and best.candidates_xyz is not None
             and spec.swap_rounds > 0):
         cur_xyz, cur_res = best.xyz, best.aps_result
         m = max(1, int(round(spec.swap_fraction * len(cur_xyz))))
@@ -612,7 +731,7 @@ def optimize_layout(
         validation["cancelled"] = True
     bound, pmap = {}, None
     if spec.upper_bound and spec.n_heliostats:
-        from .certify import layout_upper_bound, potential_map
+        from .certify import hourly_site_upper_bound, layout_upper_bound, potential_map
 
         say("certificate: lone-heliostat potential map and packing bound")
         bound_samples = review_aps if use_aps else review_center
@@ -626,14 +745,26 @@ def optimize_layout(
         if best.aps_energy_mwh is not None and use_aps and bound.get("upper_bound_mwh"):
             bound["found_aps_feasible_mwh"] = float(best.aps_energy_mwh)
             bound["gap_aps_feasible"] = max(0.0, 1.0 - best.aps_energy_mwh / bound["upper_bound_mwh"])
-        if lam > 0:
+        if validation["status"] == "ok":
             bound["objective_note"] = ("energy bound; the uniformity-weighted objective J = E - lambda_L * spread "
                                        "is <= E, so J <= this bound as well (conservative: no tighter general bound)")
             best_row = ranking.loc[ranking["final_rank"] == 1]
             if len(best_row) and "objective_review_mwh" in best_row and bound.get("upper_bound_mwh"):
                 j_obj = float(best_row["objective_review_mwh"].iloc[0])
                 bound["objective_review_mwh"] = j_obj
-                bound["gap_objective_conservative"] = 1.0 - j_obj / bound["upper_bound_mwh"]
+                hourly_rank = search_aiming == "center" and "energy_hourly_center_mwh" in best_row
+                alpha = max(case.receiver.panel_absorptivity or [case.receiver.absorptivity])
+                objective_upper = (hourly_site_upper_bound(case, best.n, dm, hourly, pmap)
+                                   if hourly_rank else bound["upper_bound_mwh"])
+                if search_aiming == "center" and not hourly_rank and use_aps and spec.review_dni_bands > 1:
+                    objective_upper = (review_center.dni_hours / 1000 * best.n * case.heliostat.area
+                                       * case.heliostat.reflectivity * case.heliostat.cleanliness * alpha)
+                bound["objective_upper_bound_mwh"] = float(objective_upper)
+                bound["objective_method"] = "hourly" if hourly_rank else spec.review_sampling
+                bound["objective_aiming"] = search_aiming
+                bound["uniformity_metric"] = spec.uniformity_metric
+                bound["objective_states"] = len(hourly if hourly_rank else review_center if search_aiming == "center" else review_aps)
+                bound["gap_objective_conservative"] = (1.0 - j_obj / objective_upper) if objective_upper > 0 else None
     uniformity = {"weight": lam}
     if best.n:
         say("certificate: uniformity metrics and selection bound")

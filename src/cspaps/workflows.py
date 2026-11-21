@@ -23,6 +23,7 @@ from .aps import build_problem, optimize_aims, solve, solve_greedy
 from .certify import improve_and_certify
 from .clouds import load_dni_map
 from .config import Case
+from .coupled import search_joint_poses
 from .engine import APSEngine, request_from_dict, response_to_dict
 from .field import Field, build_field, generate, save_layout_csv
 from .layout_opt import optimize_layout
@@ -57,12 +58,12 @@ def _default(o):
 
 
 def _json(path: Path, data) -> Path:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=_default), encoding="utf-8")
+    path.write_text(json.dumps(_clean(data), indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
     return path
 
 
 def _clean(d):
-    return json.loads(json.dumps(d, default=_default))
+    return json.loads(json.dumps(d, default=_default), parse_constant=lambda _: None)
 
 
 def out_dir(base: str | Path, case: Case, task: str = "run") -> Path:
@@ -175,11 +176,26 @@ def task_aim(
     rounding and an upper bound on the optimum is attached (``summary["certificate"]``).
     """
     t_start = _time.perf_counter()
-    out = out_dir(base, case, tag)
     fld = build_field(case)
+    if not fld.n or fld.dropped:
+        raise ValueError(f"Fixed field needs all supplied coordinates inside the site: {fld.n} accepted, "
+                         f"{len(fld.dropped)} excluded. Check boundary and tower exclusion radius.")
+    out = out_dir(base, case, tag)
+    def save_input(path, label):
+        if path is None:
+            return None
+        dest = out / f"input_{label}_{Path(path).name}"
+        shutil.copyfile(path, dest)
+        return str(dest.resolve())
+
+    dni_map = save_input(dni_map, "dni")
+    forecast_dni_map = save_input(forecast_dni_map, "forecast")
+    prev_aims = save_input(prev_aims, "previous")
     method = method or case.aps.method
     ts, el, az, dni_model = sun_state(case, time)
     dni_v = load_dni_map(dni_map, fld.xyz) if dni_map else (dni_model if dni is None else float(dni))
+    if not np.isfinite(dni_v).all() or np.any(np.asarray(dni_v) < 0):
+        raise ValueError("DNI must be finite and nonnegative")
     if dni_source == "cloud" and not dni_map:
         from .clouds import cloud_dni_snapshot
 
@@ -197,11 +213,18 @@ def task_aim(
         t_solve = _time.perf_counter()
         prob = build_problem(case, fld, el, az, dni_v, dni_con, grid=grid)
         res = solve(prob, method, case.aps, prev, prev_active)
+        proposal_check = res.check
         if do_certify and method in ("greedy", "kfactor", "milp") and fld.n:
             if progress:
                 progress("certifying: upper bound and relaxation rounding")
-            res, cert = improve_and_certify(prob, res, case.aps, rounds=case.aps.certify_rounds,
-                                            time_limit_s=case.aps.certify_time_s, prev=prev, prev_active=prev_active)
+            initial = res.choice.copy()
+            if (prob.k + 1) ** min(prob.n, 20) > case.aps.coupled_exact_limit and np.any(prob.dni_obj > 0):
+                res, _ = improve_and_certify(prob, res, case.aps, rounds=case.aps.certify_rounds,
+                                             time_limit_s=case.aps.certify_time_s, prev=prev, prev_active=prev_active)
+            res, cert = search_joint_poses(prob, fld, res, warm=initial)
+        else:
+            res.info["global_optimality_proven"] = False
+            res.info["solution_class"] = "joint_pose_verification"
         res.solve_time_s = _time.perf_counter() - t_solve
         aim, active = res.aim, res.active
     snap = evaluate(case, fld, el, az, dni_v, aim=aim, active=active, grid=grid, time=ts)
@@ -217,8 +240,21 @@ def task_aim(
     if res is not None and status == "infeasible" and res.info.get("solution_class") != "infeasible_after_verification":
         res.info["solution_class"] = "infeasible_after_verification"
         res.info["global_optimality_proven"] = False
-    if res is not None and case.uniformity.enabled and not res.info.get("uniformity_met", True):
+    thermal = snap.thermal_objective(case.uniformity) if cert is None else None
+    if res is not None and thermal is not None:
+        u = case.uniformity
+        metrics = uniformity_metrics(snap.absorbed_flux, snap.grid.to_map(snap.region))
+        res.info.update(uniformity_met=thermal["uniformity_met"], cv_2d_H=thermal["cv_2d"],
+                        cv_circ_H=metrics["cv_circ"], cv_height_H=metrics["cv_height"],
+                        power_H_mw=thermal["power_h_w"] / 1e6, objective_absorbed_power_w=snap.p_absorbed)
+        if u.enabled:
+            res.info["uniformity_status"] = ("weighted" if thermal["uniformity_met"] and u.mode == "weighted"
+                                             else "feasible" if thermal["uniformity_met"] else "not_reached")
+    uniform_ok = thermal["uniformity_met"] if thermal is not None else res.info["uniformity_met"]
+    if not uniform_ok:
         status = "uniformity_infeasible"
+    if cert is not None and cert["optimum_exists"] is not True and status in ("ok", "margin_reduced"):
+        status = "infeasible"
     stamp = f"{ts:%Y%m%d_%H%M}_{method}"
     files = {
         "summary_json": out / f"{tag}_{stamp}.json",
@@ -237,8 +273,8 @@ def task_aim(
                "flux_check": check_summary, **snap.summary(), **_dropped_note(fld)}
     summary["flux_check"]["basis"] = ("final aim points, shading and blocking re-evaluated for them, full beams, "
                                       "fine grid, constraint DNI")
-    if res is not None and res.check is not None:
-        summary["solver_flux_check"] = {"status": res.check.status, "peak_flux_kw_m2": round(res.check.peak_flux_kw_m2, 2),
+    if res is not None and proposal_check is not None:
+        summary["solver_flux_check"] = {"status": proposal_check.status, "peak_flux_kw_m2": round(proposal_check.peak_flux_kw_m2, 2),
                                         "basis": "solver response model (candidate aims)"}
     summary["aps"].pop("flux_check", None)
     summary["aps"].pop("certificate", None)
@@ -263,6 +299,13 @@ def task_aim(
 
 def existence_statement_aps(case: Case, cert: dict) -> dict:
     """Plain statement of what is proven about problem 1 for this instant."""
+    if "optimum_exists" in cert:
+        exists = cert["optimum_exists"]
+        statement = {True: "Verified feasible assignment in a finite set of joint aim poses.",
+                     False: "No admissible assignment meets all constraints under this model.",
+                     None: "Feasibility is unresolved within the joint-pose search budget."}
+        return {"optimum_exists": exists, "statement": statement[exists],
+                "found_mw": cert["objective_found_mw"], "upper_bound_mw": cert["upper_bound_mw"], "gap": cert["gap"]}
     mode = cert["mode"]
     if cert["status"] == "certified_infeasible":
         return {"optimum_exists": False, "statement": "no plan meets the CV target and the minimum load "
@@ -279,7 +322,8 @@ def existence_statement_aps(case: Case, cert: dict) -> dict:
 
 
 def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map: str | Path | None = None,
-                        dni_source: str = "site", progress: Progress | None = None) -> dict:
+                        dni_source: str = "site", progress: Progress | None = None, dni: float | None = None,
+                        forecast_dni_map: str | Path | None = None) -> dict:
     """Problem 1 on nested, increasingly fine candidate grids: how the certified optimum converges.
 
     The certificate of ``task_aim`` holds for the discrete candidate set. Real aim
@@ -292,7 +336,8 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
     out = out_dir(base, case, "aps_refinement")
     fld = build_field(case)
     ts, el, az, dni_model = sun_state(case, time)
-    dni_v = load_dni_map(dni_map, fld.xyz) if dni_map else dni_model
+    dni_v = load_dni_map(dni_map, fld.xyz) if dni_map else (dni_model if dni is None else dni)
+    forecast = load_dni_map(forecast_dni_map, fld.xyz) if forecast_dni_map else None
     if dni_source == "cloud" and not dni_map:
         from .clouds import cloud_dni_snapshot
 
@@ -307,7 +352,7 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
         c.aps.azimuth_offsets_deg = [float(v) for v in np.linspace(-off_max, off_max, n_az)] if off_max > 0 else [0.0]
         c.aps.n_height_levels = int(n_z)
         t_lvl = _time.perf_counter()
-        prob = build_problem(c, fld, el, az, dni_v, grid=build_grid(c.receiver))
+        prob = build_problem(c, fld, el, az, dni_v, forecast, grid=build_grid(c.receiver))
         init = None
         if prev is not None:  # nested grids: the previous plan's aims are candidates of this level
             d_az = (prob.cand_az - np.asarray(prev[0])[:, None] + 180.0) % 360.0 - 180.0
@@ -316,6 +361,7 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
         res = solve(prob, case.aps.method if case.aps.method != "center" else "greedy", c.aps, init=init)
         budget = min(120.0, c.aps.certify_time_s * max(1.0, (prob.k / 21.0) ** 0.75))
         res, cert = improve_and_certify(prob, res, c.aps, rounds=c.aps.certify_rounds, time_limit_s=budget)
+        res, cert = search_joint_poses(prob, fld, res, warm=init)
         prev = (res.aim[0], res.aim[1], res.active)
         rows.append({"n_azimuth": n_az, "n_height": n_z, "n_candidates": int(prob.k),
                      "azimuth_step_deg": (2 * off_max / (n_az - 1)) if n_az > 1 else None,
@@ -338,8 +384,6 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
 def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str | Path | None = None,
                 certify: bool = True, progress: Progress | None = None, dni_source: str = "site") -> dict:
     """Power vs uniformity trade-off over the weight lambda at one instant (fixed field and DNI)."""
-    from .certify import pareto_front
-
     t0 = _time.perf_counter()
     out = out_dir(base, case, "pareto")
     fld = build_field(case)
@@ -356,15 +400,24 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
     base_choice, _ = solve_greedy(prob, case.aps)
     prob.rs.case = case
     lambdas = list(lambdas) if lambdas is not None else [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
-    rows = []
+    rows, previous = [], base_choice
     for j, lam in enumerate(sorted(lambdas)):
         if progress:
             progress(f"weight {j + 1}/{len(lambdas)}: lambda = {lam:g}")
-        rows += pareto_front(prob, [lam], base_choice if not rows else rows[-1]["choice"], case.uniformity,
-                             certify=certify)
-        prob.rs.case = case
-    for r in rows:
-        r.pop("choice", None)
+        c = case.copy()
+        c.uniformity.enabled, c.uniformity.mode, c.uniformity.weight = True, "weighted", lam
+        prob.rs.case = c
+        res = solve(prob, "greedy", c.aps, init=previous)
+        if certify:
+            res, _ = improve_and_certify(prob, res, c.aps, rounds=2, max_iter=200, time_limit_s=6.0)
+        res, bound = search_joint_poses(prob, fld, res, warm=previous)
+        previous = res.choice
+        rows.append({"lambda": lam, "power_abs_mw": res.info["objective_absorbed_power_w"] / 1e6,
+                     "power_h_mw": res.info["power_H_mw"], "cv_2d": res.info["cv_2d_H"],
+                     "objective_mw": bound["objective_found_mw"], "status": res.status,
+                     "peak_flux_kw_m2": res.check.peak_flux_kw_m2, "n_defocused": res.n_defocused,
+                     "upper_bound_mw": bound["upper_bound_mw"] if certify else None,
+                     "gap": bound["gap"] if certify else None})
     files = {"summary_json": out / "pareto.json", "curve_csv": out / "pareto_curve.csv"}
     pd.DataFrame(rows).to_csv(files["curve_csv"], index=False)
     summary = {"time": ts.isoformat(), "dni_mean_w_m2": float(np.mean(dni_v)), "n_heliostats": fld.n,
@@ -495,7 +548,8 @@ def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None
         "swap_rounds", "swap_fraction", "uniformity_weight")}
     _json(files["summary_json"], summary)
     finish(out, "layout_opt", summary, t0=t0)
-    return {"summary": _clean(summary), "files": files, "result": res, "run_dir": out}
+    return {"summary": _clean(summary), "files": files, "result": res, "run_dir": out,
+            "input_parameters": case.to_dict()}
 
 
 def task_fetch_weather(case: Case, base: str | Path, year: int | None = None) -> dict:

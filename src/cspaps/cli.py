@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("case")
     sp = sub.add_parser("gui", help="open the graphical interface in the browser")
     sp.add_argument("case", nargs="?", default=None)
-    sp.add_argument("--port", type=int, default=8501)
+    sp.add_argument("--port", type=int, help="browser port (auto-select a free port when omitted)")
     return p
 
 
@@ -111,10 +111,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "gui":
         app = Path(__file__).with_name("gui_app.py")
-        cmd = [sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
+        cmd = [sys.executable, "-m", "streamlit", "run", str(app),
                "--theme.base", "light", "--theme.primaryColor", "#14806f", "--theme.backgroundColor", "#f4f6f6",
                "--theme.secondaryBackgroundColor", "#eef2f1", "--theme.textColor", "#16232b",
-               "--browser.gatherUsageStats", "false", "--"]
+               "--browser.gatherUsageStats", "false"]
+        if args.port is not None:
+            cmd += ["--server.port", str(args.port)]
+        cmd.append("--")
         if args.case:
             cmd += ["--case", str(Path(args.case).resolve())]
         return subprocess.call(cmd)

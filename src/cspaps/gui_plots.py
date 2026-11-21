@@ -339,7 +339,8 @@ def receiver_rose(share, centers_deg, compare=None, height: int = 380):
 
 def layout_tradeoff_chart(rows: list[dict], selected: float | None = None, height: int = 360):
     """Annual energy vs circumferential CV of the layout for the weights lambda_L."""
-    cv = [r["cv_circ_weighted"] for r in rows]
+    surface = bool(rows and "surface_spread_mwh" in rows[0])
+    cv = [r["surface_spread_mwh"] if surface else r["cv_circ_weighted"] for r in rows]
     e = [r["energy_mwh"] for r in rows]
     lam = [r["lambda"] for r in rows]
     hover = [f"λ_L = {l:g}<br>管屏间 CV {c:.3f}<br>年吸收 {v:,.0f} MWh<br>北侧镜子 {100 * r['north_fraction']:.0f}%"
@@ -353,7 +354,8 @@ def layout_tradeoff_chart(rows: list[dict], selected: float | None = None, heigh
         j = lam.index(selected)
         fig.add_trace(go.Scatter(x=[cv[j]], y=[e[j]], mode="markers", hoverinfo="skip",
                                  marker=dict(size=17, color="rgba(0,0,0,0)", line=dict(color=TEAL, width=3))))
-    fig.update_xaxes(title="管屏间吸热 CV（逐工况能量加权，越小越均匀）", autorange="reversed")
+    fig.update_xaxes(title="二维不均匀惩罚量 (MWhₜₕ)" if surface else "管屏间吸热 CV（逐工况能量加权）",
+                     autorange="reversed")
     fig.update_yaxes(title="全年理论吸收热量 (MWhₜₕ)")
     fig.update_layout(showlegend=False)
     return _base_layout(fig, "", height)

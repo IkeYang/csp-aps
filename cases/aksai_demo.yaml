@@ -142,7 +142,7 @@ layout_opt:
   review_sampling: sun_bins
   review_n_sun_bins: 6
   review_dni_bands: 1
-  review_check_hourly: false
+  review_check_hourly: true
   maxiter: 4
   popsize: 4
   seed: 7

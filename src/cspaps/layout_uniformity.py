@@ -129,7 +129,7 @@ def build_model(case: Case, xyz: np.ndarray, samples, state_power_w: np.ndarray,
     shares = column_shares(case, xyz, samples, grid)  # (S, N, C)
     col_az = grid.azimuth_deg
     alpha = grid.alpha.reshape(grid.shape)[0]  # absorptivity per column (panels are azimuth sectors)
-    h_cols = region_mask(rec, case.uniformity, col_az, np.full(col_az.size, rec.center[2])) \
+    h_cols = region_mask(rec, case.uniformity, col_az, np.full(col_az.size, np.mean(case.uniformity.z_range) if case.uniformity.z_range else rec.center[2])) \
         if case.uniformity.panels is not None else np.ones(col_az.size, dtype=bool)
     col_area = rec.radius * np.radians(360.0 / col_az.size) * rec.height
     p = np.asarray(state_power_w, dtype=float)  # (S, N) intercepted
@@ -347,7 +347,7 @@ def layout_metrics(case: Case, xyz: np.ndarray, samples, state_power_w: np.ndarr
     grid = grid or build_grid(rec)
     col_az = grid.azimuth_deg
     if case.uniformity.panels is not None:
-        col_az = col_az[region_mask(rec, case.uniformity, col_az, np.full(col_az.size, rec.center[2]))]
+        col_az = col_az[region_mask(rec, case.uniformity, col_az, np.full(col_az.size, np.mean(case.uniformity.z_range) if case.uniformity.z_range else rec.center[2]))]
     sec = (np.floor(((col_az + 180.0 / n_sectors) % 360.0) / (360.0 / n_sectors))).astype(int)
     sector_energy = np.bincount(sec, weights=g_ann, minlength=n_sectors)
     share = sector_energy / sector_energy.sum() if sector_energy.sum() > 0 else sector_energy

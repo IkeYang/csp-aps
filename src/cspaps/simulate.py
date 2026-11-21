@@ -97,6 +97,23 @@ class Snapshot:
             "flux_basis": "coarse grid; see flux_check for the verified peak",
         }
 
+    def thermal_objective(self, spec) -> dict:
+        """Area-weighted absorbed flux on H, normalised to intercepted-energy quadrature."""
+        q = self.absorbed_flux
+        mask = self.grid.to_map(self.region) if self.region is not None else np.ones(q.shape, bool)
+        region = q[mask]
+        total = self.p_absorbed
+        scale = total / q.sum() if q.sum() > 0 else 0.0  # W per cell per sampled W/m²
+        load = float(region.sum() * scale)
+        spread = float(region.std() * region.size * scale) if region.size else 0.0
+        cv = spread / load if load > 0 else None
+        valid = (not spec.enabled or
+                 (load >= spec.min_load_mw * 1e6 and
+                  (spec.mode == "weighted" or (cv is not None and cv <= spec.max_cv + 1e-10))))
+        value = total - spec.weight * spread if spec.enabled and spec.mode == "weighted" else total
+        return {"objective_w": float(value), "power_w": total, "power_h_w": load,
+                "spread_w": spread, "cv_2d": cv, "uniformity_met": bool(valid)}
+
     def verify(self, rec, margin: float | None = None, max_cells: int = 400_000):
         """Fine-grid feasibility check of this snapshot's beams (uses the DNI it was evaluated with)."""
         from .verify import verify_beams
@@ -162,9 +179,11 @@ def evaluate(
     zeros = np.zeros(n)
     region = region_of_grid(case, grid)
     if sun_elevation <= 0 or n == 0 or not np.any(dni_v > 0):
+        beams = ({"aim_xyz": np.empty((0, 3)), "t": np.empty((0, 3)), "sigma": np.empty(0),
+                  "power": np.empty(0), "index": np.empty(0, dtype=int)} if with_flux else None)
         return Snapshot(time, sun_elevation, sun_azimuth, dni_v, aim_az, aim_z, active,
                         {k: zeros.copy() for k in LOSSES}, {k: zeros.copy() for k in STAGES},
-                        np.zeros(grid.shape), grid, region, None, case.aps.safety_margin)
+                        np.zeros(grid.shape), grid, region, beams, case.aps.safety_margin)
 
     s = sun.sun_vector(sun_elevation, sun_azimuth)
     aim_xyz = surface_point(rec, aim_az, aim_z)
@@ -292,14 +311,14 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
     else:
         from .aps import optimize_aims  # local import: aps depends on this module
 
-        res = optimize_aims(case, fld, el, az, dni_v, method=aiming, grid=grid, shading_points=shading_points)
+        res = optimize_aims(case, fld, el, az, dni_v, method=aiming, grid=grid, shading_points=shading_points,
+                            joint_trials=min(2, case.aps.coupled_trials))
         snap = evaluate(case, fld, el, az, dni_v, aim=res.aim, active=res.active, grid=grid,
                         with_flux=True, time=ts, shading_points=shading_points)
-        if res.check is not None:
-            peak, ratio = res.check.peak_flux_kw_m2, res.check.peak_ratio
-        else:
-            peak, ratio = snap.flux.max() / 1e3, float((snap.flux.ravel() / grid.limit).max())
-        status = res.status
+        actual = (res.check if res.info.get("joint_pose_checked") else
+                  snap.verify(case.receiver, max_cells=case.aps.verify_max_cells))
+        peak, ratio = actual.peak_flux_kw_m2, actual.peak_ratio
+        status = actual.status
         uniformity_status = res.info.get("uniformity_status", "disabled") if case.uniformity.enabled else "disabled"
         cv_2d = res.info.get("cv_2d_H", float("nan"))
         cv_circ = res.info.get("cv_circ_H", float("nan"))
@@ -308,19 +327,35 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
     flux_on = with_flux or aiming != "center"
     over_limit = bool(flux_on and ratio > 1.0 + 1e-9)
     flux_feasible = (status in ("ok", "margin_reduced") if aiming != "center" else (with_flux and not over_limit))
-    if aiming == "center" and case.uniformity.enabled and with_flux:
+    if case.uniformity.enabled and flux_on:
         mask = region_of_grid(case, grid, case.uniformity)
         metrics = uniformity_metrics(snap.absorbed_flux, grid.to_map(mask))
         cv_2d = metrics["cv_2d"]
         cv_circ = metrics["cv_circ"]
         cv_height = metrics["cv_height"]
-        power_h_mw = float(snap.absorbed_flux.ravel()[mask].sum() * grid.cell_area / 1e6)
-        uniformity_status = "feasible" if case.uniformity.mode == "weighted" or cv_2d <= case.uniformity.max_cv else "not_reached"
+        thermal = snap.thermal_objective(case.uniformity)
+        power_h_mw = thermal["power_h_w"] / 1e6
+        uniformity_status = "feasible" if thermal["uniformity_met"] else "not_reached"
+        if power_h_mw < case.uniformity.min_load_mw:
+            uniformity_status = "below_min_load"
     uniformity_feasible = (not case.uniformity.enabled or
                            uniformity_status in ("feasible", "weighted"))
     min_load_ok = (not case.uniformity.enabled or power_h_mw >= case.uniformity.min_load_mw - 1e-9)
     uniformity_feasible = uniformity_feasible and min_load_ok
     operational_feasible = flux_feasible and uniformity_feasible
+    circ_spread = 0.0
+    if flux_on:
+        from .layout_uniformity import sector_of_columns
+
+        q = snap.absorbed_flux
+        sector = np.broadcast_to(sector_of_columns(case, grid.azimuth_deg), q.shape)
+        mask = grid.to_map(snap.region)
+        sector = sector[mask]
+        count = np.bincount(sector)
+        if count.size and q.sum() > 0:
+            means = np.bincount(sector, weights=q[mask])[count > 0] / count[count > 0]
+            variance = np.average((means - q[mask].mean()) ** 2, weights=count[count > 0])
+            circ_spread = mask.sum() * np.sqrt(variance) * snap.p_absorbed / q.sum()
     row = {
         "time": ts, "sun_elevation_deg": el, "sun_azimuth_deg": az,
         "dni_w_m2": dni_v, "p_receiver_mw": snap.p_receiver / 1e6, "p_absorbed_mw": snap.p_absorbed / 1e6,
@@ -332,6 +367,8 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
         "uniformity_power_h_mw": power_h_mw, "uniformity_feasible": bool(uniformity_feasible),
         "operational_feasible": bool(operational_feasible),
         "feasible_absorbed_mw": snap.p_absorbed / 1e6 if operational_feasible else 0.0,
+        "circ_spread_mw": circ_spread / 1e6,
+        "surface_spread_mw": snap.thermal_objective(case.uniformity)["spread_w"] / 1e6 if flux_on else 0.0,
     }
     return {k: snap.power[k] for k in STAGES}, row
 

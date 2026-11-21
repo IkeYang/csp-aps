@@ -31,6 +31,8 @@ class Field:
 
     def __post_init__(self):
         self.xyz = np.asarray(self.xyz, dtype=float).reshape(-1, 3)
+        if not np.isfinite(self.xyz).all():
+            raise ValueError("Field: every mirror needs finite x,y,z coordinates")
         if self.ids is None:
             self.ids = np.arange(1, self.xyz.shape[0] + 1)
         self.ids = np.asarray(self.ids, dtype=np.int64)
@@ -197,9 +199,46 @@ def generate(case: Case, kind: str, params: dict[str, Any]) -> np.ndarray:
     if "r_max" not in params:
         params["r_max"] = default_r_max(case)
     params.setdefault("r_min", max(case.field.exclusion_radius, rec.radius + case.heliostat.diagonal))
+    # Every subset (including later swaps) inherits the site's minimum centre distance.
+    required = case.layout_opt.min_spacing_factor or case.layout_opt.fixed.get("spacing_factor", 1.1)
+    params["spacing_factor"] = max(params.get("spacing_factor", 1.1), required)
     xy = GENERATORS[kind](case.heliostat, (rec.center[0], rec.center[1]), rec.center[2], **params)
+    xy = remove_collisions(xy, required * case.heliostat.diagonal)
     xyz = np.column_stack([xy, np.full(len(xy), case.heliostat.pivot_height)])
-    return xyz[site_mask(case, xyz)[0]]
+    xyz = xyz[site_mask(case, xyz)[0]]
+    count = case.layout_opt.n_heliostats
+    if count and len(xyz) < count and case.field.boundary is not None:
+        xyz = _fill_shortfall(case, xyz, count, required * case.heliostat.diagonal)
+    return xyz
+
+
+def _fill_shortfall(case: Case, incumbent: np.ndarray, count: int, spacing: float) -> np.ndarray:
+    """Try translated triangular lattices aligned with the site or with world axes."""
+    polygon = np.asarray(case.field.boundary)
+    longest = np.diff(polygon, axis=0, append=polygon[:1])
+    dx, dy = longest[np.argmax(np.linalg.norm(longest, axis=1))]
+    for angle in {0.0, math.atan2(dy, dx)}:
+        c, s = math.cos(angle), math.sin(angle)
+        rotation = np.array([[c, -s], [s, c]])
+        local = polygon @ rotation
+        lo, hi = local.min(axis=0), local.max(axis=0)
+        pitch = spacing * math.sqrt(3) / 2
+        nx, ny = np.ceil((hi - lo) / [spacing, pitch]).astype(int) + 2
+        for shift_x, shift_y in ((0., 0.), (.5, .5), (.25, .75), (.75, .25)):
+            strips = []
+            # Bound memory on long narrow plots. Site clipping accepts boundary pivots.
+            for row in range(ny):
+                y = lo[1] + (row + shift_y) * pitch
+                x = lo[0] + (np.arange(nx) + (row % 2) * .5 + shift_x - 1) * spacing
+                xy = np.column_stack([x, np.full(nx, y)]) @ rotation.T
+                xyz = np.column_stack([xy, np.full(nx, case.heliostat.pivot_height)])
+                strips.append(xyz[site_mask(case, xyz)[0]])
+            trial = np.concatenate(strips)
+            if len(trial) > len(incumbent):
+                incumbent = trial
+            if len(incumbent) >= count:
+                return incumbent
+    return incumbent
 
 
 def default_r_max(case: Case) -> float:

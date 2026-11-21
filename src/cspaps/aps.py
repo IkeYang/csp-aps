@@ -802,6 +802,7 @@ def optimize_aims(
     spec: APSSpec | None = None,
     problem: AimProblem | None = None,
     available=None,
+    joint_trials: int | None = None,
 ) -> AimResult:
     """Choose an aim point for every heliostat at one sun state (offline / one-shot use).
 
@@ -818,5 +819,11 @@ def optimize_aims(
     prob = problem or build_problem(case, fld, sun_elevation, sun_azimuth, dni, dni_constraint,
                                     grid, spec, shading_points, available)
     res = solve(prob, method, spec, prev, prev_active)
+    if method in ("greedy", "milp") and spec.verify and prob.n:
+        from .coupled import search_joint_poses
+
+        res, cert = search_joint_poses(prob, fld, res, trials=joint_trials,
+                                      shading_points=shading_points, tighten_bound=joint_trials is None)
+        res.info["certificate"] = cert
     res.solve_time_s = _time.perf_counter() - t0
     return res
