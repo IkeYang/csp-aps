@@ -385,3 +385,18 @@ def test_formal_ranking_cross_checks_cloud_maps():
     assert c["seed"] == case.scenarios.seed + 1000 and len(c["rows"]) == 2
     assert c["fingerprint"] != f["scenario_set"].fingerprint()  # really other maps
     assert c["lead_independent_mwh"] == 0.0 and not c["winner_still_ahead"]  # identical layouts tie
+
+
+@pytest.mark.parametrize("name", ["aksai_demo", "hami_2024", "port_augusta_2024"])
+def test_site_cases_build_their_scenario_sets(name):
+    """The three site studies: weather year, initial field of N heliostats, DNI-energy-preserving scenario set."""
+    from cspaps import load_case
+    from cspaps.layout_value import baseline_layout
+
+    case = load_case(ROOT / "cases" / f"{name}.yaml")
+    hourly = sun.hourly_samples(case)
+    assert len(hourly) > 3000  # NASA POWER 2024, sun above 5 degrees
+    sset = build_scenarios(case, hourly=hourly)
+    assert sset.samples.dni_hours == pytest.approx(hourly.dni_hours, rel=1e-6)
+    assert len(sset.subset_maps()) >= 2 and all(m.unit == "factor" for m in sset.maps.values())
+    assert baseline_layout(case, case.layout_opt.n_heliostats)[0].shape == (case.layout_opt.n_heliostats, 3)

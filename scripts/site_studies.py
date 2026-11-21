@@ -5,8 +5,11 @@ field ranked too, swap polishing, denser-scenario check), the same winner / init
 the energy-only vs uniformity-weighted pre-screen layouts, and a single-instant cloud comparison.
 
     python scripts/site_studies.py [aksai_demo hami_2024 port_augusta_2024] [--out results/site_studies]
+    python scripts/site_studies.py hami_2024 --tag _uniform --map-model uniform      # design on uniform DNI
+    python scripts/site_studies.py hami_2024 --robustness hami_2024 hami_2024_uniform  # winners on two cloud-map sets
 
-Writes <out>/<case>/... run folders and <out>/site_studies.json (the numbers quoted in the README).
+Writes <out>/<case>/... run folders and <out>/site_studies.json (the numbers quoted in the README); the
+robustness check writes <out>/<case>_robustness.json.
 """
 
 from __future__ import annotations
@@ -24,8 +27,10 @@ from cspaps import workflows as wf
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def study(name: str, out: Path, n_scenarios: int, dense: int) -> dict:
+def study(name: str, out: Path, n_scenarios: int, dense: int, map_model: str | None = None) -> dict:
     case = load_case(ROOT / "cases" / f"{name}.yaml")
+    if map_model:
+        case.scenarios.map_model = map_model
     lo = case.layout_opt
     lo.refine_top, lo.formal_swap_rounds, lo.dense_check_scenarios = 3, 2, dense
     lo.review_check_hourly, lo.workers = False, 4
@@ -86,6 +91,28 @@ def study(name: str, out: Path, n_scenarios: int, dense: int) -> dict:
     }
 
 
+def robustness(name: str, keys: list[str], out: Path) -> dict:
+    """Winners of earlier runs (keys of site_studies.json) and the initial field on the case's maps and on
+    independent maps (seed + 1000): does a lead survive other cloud positions?"""
+    done = json.loads((out / "site_studies.json").read_text(encoding="utf-8"))
+    layouts = {}
+    for key in keys:
+        r = done[key]
+        layouts[key] = str(Path(r["run_dir"]) / "formal" / "values" / r["winner"].replace("+", "_plus_") / "layout.csv")
+    layouts["initial"] = "initial"
+    res = {}
+    base = load_case(ROOT / "cases" / f"{name}.yaml")
+    for seed in (base.scenarios.seed, base.scenarios.seed + 1000):
+        case = base.copy()
+        case.scenarios.seed = seed
+        case.layout_opt.workers = 4
+        lv = wf.task_layout_value(case, out, layouts)
+        res[str(seed)] = [{"name": r["name"], "value_mwh": r["value_mwh"], "energy_mwh": r["energy_mwh"],
+                           "penalty_mwh": r["penalty_mwh"]} for _, r in lv["ranking"].iterrows()]
+    (out / f"{name}_robustness.json").write_text(json.dumps(res, indent=1), encoding="utf-8")
+    return res
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("cases", nargs="*", default=["aksai_demo", "hami_2024", "port_augusta_2024"])
@@ -93,14 +120,19 @@ def main() -> None:
     p.add_argument("--scenarios", type=int, default=20)
     p.add_argument("--dense", type=int, default=40)
     p.add_argument("--tag", default="", help="suffix of the result key (keeps earlier runs of the same case)")
+    p.add_argument("--map-model", default=None, help="override scenarios.map_model (e.g. uniform)")
+    p.add_argument("--robustness", nargs="+", default=None, help="result keys whose winners are re-scored")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.robustness:
+        print(json.dumps(robustness(a.cases[0], a.robustness, out), indent=1))
+        return
     path = out / "site_studies.json"
     done = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     for name in a.cases:
         print(f"=== {name}", flush=True)
-        done[name + a.tag] = study(name, out, a.scenarios, a.dense)
+        done[name + a.tag] = study(name, out, a.scenarios, a.dense, a.map_model)
         path.write_text(json.dumps(done, indent=2, ensure_ascii=False, default=float), encoding="utf-8")
     print(path)
 

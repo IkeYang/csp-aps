@@ -101,7 +101,7 @@ engine:
   fallback: hold_or_defocus
 
 realtime:
-  start: "2024-12-15 12:30"
+  start: "2024-12-20 13:00"
   duration_min: 8
   step_s: 60
   forecast_horizon_s: 120

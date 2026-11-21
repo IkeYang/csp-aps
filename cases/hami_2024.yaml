@@ -166,8 +166,9 @@ layout_opt:
 # Modelling assumption: broken-cumulus days. Ten independent cloud-shadow maps (3 soft shadows each, radius
 # 60-160 m, transmittance 0.2-0.6) are assigned to the days in turn; each map is normalised to site mean 1, so
 # the station DNI remains the site-mean DNI and the annual DNI energy is unchanged. Cloud shadows are
-# transient: with only a few maps the layout search learns to avoid their fixed positions (see README), so
-# use many maps (>= 8) and check the ranking on independent maps (another seed).
+# transient: the layout search learns to avoid their fixed positions (README, conclusion 5) and the built-in
+# check on independent maps (layout_opt.cross_check_maps) reports it. Design the layout with
+# scenarios.map_model: uniform (or persistent maps) and use these cloud maps to test operation and uniformity.
 scenarios:
   n_scenarios: 20
   map_model: clouds
