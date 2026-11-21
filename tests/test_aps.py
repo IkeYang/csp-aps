@@ -66,7 +66,8 @@ def test_milp_and_lp_bound_on_tiny_problem(tight):
     milp = optimize_aims(tight, fld, el, az, dni, method="milp", problem=prob)
     bound = lp_upper_bound(prob)
     assert milp.feasible and greedy.feasible
-    assert milp.info["objective_absorbed_power_w"] >= greedy.info["objective_absorbed_power_w"] - 1e-6 * bound
+    if milp.info["global_optimality_proven"]:  # the exact optimum on the (enlarged) constraint set
+        assert milp.info["objective_absorbed_power_w"] >= greedy.info["objective_absorbed_power_w"] - 1e-6 * bound
     assert bound >= milp.info["objective_absorbed_power_w"] * (1 - 1e-6)
     assert greedy.info["objective_absorbed_power_w"] >= 0.85 * milp.info["objective_absorbed_power_w"]
 
@@ -115,3 +116,47 @@ def test_greedy_flux_bookkeeping(tight):
     prob = build_problem(tight, fld, el, az, dni)
     choice, _ = solve_greedy(prob, tight.aps)
     assert (prob.flux(choice) <= prob.limit * (1 + 1e-9)).all()
+
+
+@pytest.mark.parametrize("rounds", [0, 1, 2, 3])
+def test_verification_always_ends_feasible_and_labels_are_honest(tight, rounds):
+    """Audit: with too few re-solve rounds the MILP plan failed the fine-grid check yet was labelled optimal."""
+    full = build_field(tight)
+    fld = Field(full.xyz[np.flatnonzero(full.xyz[:, 1] > 60)[:14]])
+    tight.receiver.max_flux_kw_m2 = 40
+    tight.aps.n_height_levels, tight.aps.azimuth_offsets_deg = 3, [-5.0, 0.0, 5.0]
+    tight.aps.verify_max_rounds = rounds
+    ts, el, az, dni = sun_state(tight, TIME)
+    prob = build_problem(tight, fld, el, az, dni, grid=build_grid(tight.receiver))
+    optimize_aims(tight, fld, el, az, dni, method="greedy", problem=prob)  # shares hotspot points with the MILP
+    milp = optimize_aims(tight, fld, el, az, dni, method="milp", problem=prob)
+    assert milp.status in ("ok", "margin_reduced") and milp.feasible
+    if milp.info["global_optimality_proven"]:
+        assert milp.info["repair_rounds"] == 0 and milp.info["solution_class"] == "global_optimum_on_candidate_set"
+    tight.aps.verify = True
+    # an unverifiable plan is never "proven optimal"
+    tight.aps.verify_max_rounds = 0
+    tight.aps.allow_defocus = False
+    fail = optimize_aims(tight, fld, el, az, dni, method="milp", problem=prob)
+    if fail.status == "infeasible":
+        assert not fail.info["global_optimality_proven"]
+        assert fail.info["solution_class"] == "infeasible_after_verification"
+
+
+def test_shading_is_evaluated_per_candidate_aim(small_case):
+    """Each candidate aim has its own mirror normal and beam, so its own shading / blocking."""
+    from cspaps import shading, sun as sun_mod
+
+    fld = build_field(small_case)
+    ts, el, az, dni = sun_state(small_case, "2025-12-21 09:30")  # low sun: blocking depends on the aim
+    prob = build_problem(small_case, fld, el, az, dni)
+    rs = prob.rs
+    assert rs.sb_k.shape == (fld.n, prob.k)
+    np.testing.assert_allclose(rs.sb, rs.sb_k[:, rs.center_k])
+    s = sun_mod.sun_vector(el, az)
+    from cspaps import optics
+    j = 0 if rs.center_k != 0 else 1
+    normals, t, *_ = optics.heliostat_geometry(fld.xyz, rs.aim_xyz[:, j], s)
+    direct = shading.shading_blocking(fld.xyz, normals, s, t, small_case.heliostat, small_case.receiver, fld.pairs,
+                                      n_points=small_case.shading.n_points)["combined"]
+    np.testing.assert_allclose(rs.sb_k[:, j], direct)

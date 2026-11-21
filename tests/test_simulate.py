@@ -87,14 +87,18 @@ def test_sun_bins_close_to_hourly(small_case):
 
 
 def test_annual_with_aps_respects_limit(small_case):
-    small_case.receiver.max_flux_kw_m2 = 300
+    small_case.receiver.max_flux_kw_m2 = 120  # binds for centre aiming and for the APS
     fld = build_field(small_case)
     bins = sun.sun_bins(sun.hourly_samples(small_case), 4)
     center = annual(small_case, fld, samples=bins, aiming="center")
     aps = annual(small_case, fld, samples=bins, aiming="greedy")
     assert center.summary()["hours_over_flux_limit"] > 0
-    assert aps.timeseries["peak_flux_kw_m2"].max() <= 300 * 1.01
-    assert aps.energy_mwh["intercept"] < center.energy_mwh["intercept"]
+    assert aps.timeseries["peak_flux_kw_m2"].max() <= 120 * 1.01
+    # the flux limit can only cost energy relative to the same aiming without a limit (APS may beat centre
+    # aiming itself: off-centre aims can have less blocking at low sun)
+    small_case.receiver.max_flux_kw_m2 = 1e6
+    free = annual(small_case, fld, samples=bins, aiming="greedy")
+    assert aps.energy_mwh["intercept"] < free.energy_mwh["intercept"]
 
 
 def test_evaluate_accepts_explicit_sun(small_case):

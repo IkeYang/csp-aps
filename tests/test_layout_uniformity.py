@@ -94,6 +94,8 @@ def test_optimize_layout_reports_uniformity(small_case):
     cert = u["selection_certificate"]
     assert cert["upper_bound_mwh"] >= cert["objective_found_mwh"] - 1e-6 and cert["gap"] < 0.05
     assert "circ_cv_review" in res.ranking and "objective_review_mwh" in res.ranking
+    b = s["upper_bound"]
+    assert b["objective_review_mwh"] <= b["upper_bound_mwh"] and 0 <= b["gap_objective_conservative"] < 1
     assert s["status"] == "ok" and s["existence"]["optimum_exists"]
 
 

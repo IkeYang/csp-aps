@@ -476,7 +476,15 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
     final.info["certificate"] = {k: v_ for k, v_ in cert.items() if k != "history"}
     final.info["optimality_gap"] = cert.get("gap")
     final.info["upper_bound_mw"] = ub
-    if cert.get("gap") is not None:
+    if final.status == "infeasible":
+        # the plan failed the fine-grid check: a gap in the candidate model says nothing about it
+        cert["status"], cert["gap"] = "plan_failed_verification", None
+        cert["global_optimum_proven_on_candidate_set"] = False
+        final.info["certificate"] = {k: v_ for k, v_ in cert.items() if k != "history"}
+        final.info["optimality_gap"] = None
+        final.info["solution_class"] = "infeasible_after_verification"
+        final.info["global_optimality_proven"] = False
+    elif cert.get("gap") is not None:
         final.info["solution_class"] = ("global_optimum_on_candidate_set" if cert["global_optimum_proven_on_candidate_set"]
                                         else "verified_feasible_with_certified_gap")
         final.info["global_optimality_proven"] = cert["global_optimum_proven_on_candidate_set"]

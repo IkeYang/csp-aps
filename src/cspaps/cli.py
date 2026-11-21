@@ -61,6 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
                             help="uniformity weight lambda: maximise P_abs - lambda * A_H * std_H (enables uniformity)")
             sp.add_argument("--max-cv", type=float, default=None,
                             help="maximise P_abs subject to CV_2D <= this value (enables uniformity)")
+    sp = add("aps-refine", "problem 1 on nested, finer candidate grids: convergence of the certified optimum")
+    sp.add_argument("--time", required=True)
+    sp.add_argument("--levels", default="3x7,5x13,9x25", help="azimuth x height candidates per level, e.g. 3x7,5x13")
     sp = add("pareto", "power vs uniformity trade-off over the weight lambda (with optimality gaps)")
     sp.add_argument("--time", required=True)
     sp.add_argument("--lambdas", type=float, nargs="*", default=None)
@@ -134,6 +137,9 @@ def main(argv: list[str] | None = None) -> int:
         res = wf.task_aim(case, out, args.time, method=method, dni=args.dni, dni_map=args.dni_map,
                           forecast_dni_map=args.forecast_dni_map, prev_aims=args.prev_aims, tag=args.command,
                           certify=certify, progress=_progress)
+    elif args.command == "aps-refine":
+        levels = [tuple(int(v) for v in lv.lower().split("x")) for lv in args.levels.split(",") if lv.strip()]
+        res = wf.task_aps_refinement(case, out, args.time, levels=levels, progress=_progress)
     elif args.command == "pareto":
         res = wf.task_pareto(case, out, args.time, lambdas=args.lambdas, dni_map=args.dni_map,
                              certify=not args.no_certify, progress=_progress)

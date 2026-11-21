@@ -205,9 +205,18 @@ def task_aim(
         res.solve_time_s = _time.perf_counter() - t_solve
         aim, active = res.aim, res.active
     snap = evaluate(case, fld, el, az, dni_v, aim=aim, active=active, grid=grid, time=ts)
-    chk_con = res.check if res is not None and res.check is not None else snap.verify(case.receiver)
-    status = res.status if res is not None else {"ok": "ok", "margin_reduced": "margin_reduced",
-                                                 "over_limit": "infeasible"}[chk_con.status]
+    # Final check of the plan as it will be executed: the final aim points with their own shading and
+    # blocking (re-evaluated, not the solver's response model), full beams, fine grid, constraint DNI.
+    if dni_con is not None:
+        dni_check = np.maximum(np.broadcast_to(np.asarray(dni_con, dtype=float), (fld.n,)), snap.dni)
+        snap_con = evaluate(case, fld, el, az, dni_check, aim=aim, active=active, grid=grid, time=ts)
+    else:
+        snap_con = snap
+    chk_con = snap_con.verify(case.receiver)
+    status = {"ok": "ok", "margin_reduced": "margin_reduced", "over_limit": "infeasible"}[chk_con.status]
+    if res is not None and status == "infeasible" and res.info.get("solution_class") != "infeasible_after_verification":
+        res.info["solution_class"] = "infeasible_after_verification"
+        res.info["global_optimality_proven"] = False
     if res is not None and case.uniformity.enabled and not res.info.get("uniformity_met", True):
         status = "uniformity_infeasible"
     stamp = f"{ts:%Y%m%d_%H%M}_{method}"
@@ -226,6 +235,11 @@ def task_aim(
                                          for c in check_summary["top_contributors"]]
     summary = {"status": status, "aps": res.summary() if res is not None else {"method": "center"},
                "flux_check": check_summary, **snap.summary(), **_dropped_note(fld)}
+    summary["flux_check"]["basis"] = ("final aim points, shading and blocking re-evaluated for them, full beams, "
+                                      "fine grid, constraint DNI")
+    if res is not None and res.check is not None:
+        summary["solver_flux_check"] = {"status": res.check.status, "peak_flux_kw_m2": round(res.check.peak_flux_kw_m2, 2),
+                                        "basis": "solver response model (candidate aims)"}
     summary["aps"].pop("flux_check", None)
     summary["aps"].pop("certificate", None)
     if cert is not None:
@@ -262,6 +276,63 @@ def existence_statement_aps(case: Case, cert: dict) -> dict:
     return {"optimum_exists": True, "statement": statement,
             "found_mw": cert.get("objective_found_mw"), "upper_bound_mw": cert.get("upper_bound_mw"),
             "gap": cert.get("gap")}
+
+
+def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map: str | Path | None = None,
+                        dni_source: str = "site", progress: Progress | None = None) -> dict:
+    """Problem 1 on nested, increasingly fine candidate grids: how the certified optimum converges.
+
+    The certificate of ``task_aim`` holds for the discrete candidate set. Real aim
+    points are continuous (or limited by the controller resolution), so this task
+    re-solves on nested grids -- every level contains the previous one, azimuth and
+    height spacing halve -- warm-starting from the previous plan (the found value can
+    only rise) and reports the found objective and the upper bound per level.
+    """
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "aps_refinement")
+    fld = build_field(case)
+    ts, el, az, dni_model = sun_state(case, time)
+    dni_v = load_dni_map(dni_map, fld.xyz) if dni_map else dni_model
+    if dni_source == "cloud" and not dni_map:
+        from .clouds import cloud_dni_snapshot
+
+        dni_v = cloud_dni_snapshot(case, fld, ts, float(dni_model))
+    levels = levels or [(3, 7), (5, 13), (9, 25)]
+    off_max = max((abs(float(o)) for o in case.aps.azimuth_offsets_deg), default=0.0)
+    rows, prev = [], None
+    for j, (n_az, n_z) in enumerate(levels):
+        if progress:
+            progress(f"refinement level {j + 1}/{len(levels)}: {n_az} x {n_z} candidates")
+        c = case.copy()
+        c.aps.azimuth_offsets_deg = [float(v) for v in np.linspace(-off_max, off_max, n_az)] if off_max > 0 else [0.0]
+        c.aps.n_height_levels = int(n_z)
+        t_lvl = _time.perf_counter()
+        prob = build_problem(c, fld, el, az, dni_v, grid=build_grid(c.receiver))
+        init = None
+        if prev is not None:  # nested grids: the previous plan's aims are candidates of this level
+            d_az = (prob.cand_az - np.asarray(prev[0])[:, None] + 180.0) % 360.0 - 180.0
+            dist = np.abs(d_az) * 1e3 + np.abs(prob.cand_z - np.asarray(prev[1])[:, None])
+            init = np.where(prev[2], np.argmin(dist, axis=1), -1)
+        res = solve(prob, case.aps.method if case.aps.method != "center" else "greedy", c.aps, init=init)
+        budget = min(120.0, c.aps.certify_time_s * max(1.0, (prob.k / 21.0) ** 0.75))
+        res, cert = improve_and_certify(prob, res, c.aps, rounds=c.aps.certify_rounds, time_limit_s=budget)
+        prev = (res.aim[0], res.aim[1], res.active)
+        rows.append({"n_azimuth": n_az, "n_height": n_z, "n_candidates": int(prob.k),
+                     "azimuth_step_deg": (2 * off_max / (n_az - 1)) if n_az > 1 else None,
+                     "height_step_m": (c.receiver.height * c.aps.height_span / (n_z - 1)) if n_z > 1 else None,
+                     "objective_found_mw": cert.get("objective_found_mw"), "upper_bound_mw": cert["upper_bound_mw"],
+                     "gap": cert.get("gap"), "status": res.status,
+                     "power_abs_mw": res.info.get("objective_absorbed_power_w", 0.0) / 1e6,
+                     "cv_2d_H": res.info.get("cv_2d_H"), "peak_flux_kw_m2": res.check.peak_flux_kw_m2 if res.check else None,
+                     "time_s": round(_time.perf_counter() - t_lvl, 1)})
+    files = {"summary_json": out / "aps_refinement.json", "table_csv": out / "aps_refinement.csv"}
+    pd.DataFrame(rows).to_csv(files["table_csv"], index=False)
+    summary = {"time": ts.isoformat(), "levels": rows,
+               "note": "certificates hold for each discrete candidate set; nested refinement shows the convergence "
+                       "towards continuous aim points"}
+    _json(files["summary_json"], summary)
+    finish(out, "aps_refinement", summary, {"time": str(time), "levels": levels}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out}
 
 
 def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str | Path | None = None,

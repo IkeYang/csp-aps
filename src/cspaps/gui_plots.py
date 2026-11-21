@@ -357,3 +357,19 @@ def layout_tradeoff_chart(rows: list[dict], selected: float | None = None, heigh
     fig.update_yaxes(title="全年理论吸收热量 (MWhₜₕ)")
     fig.update_layout(showlegend=False)
     return _base_layout(fig, "", height)
+
+
+def refinement_chart(levels: list[dict], height: int = 320):
+    """Found objective and upper bound on nested candidate grids (convergence towards continuous aims)."""
+    k = [r["n_candidates"] for r in levels]
+    labels = [f"{r['n_azimuth']}×{r['n_height']}" for r in levels]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=k, y=[r["upper_bound_mw"] for r in levels], mode="lines+markers", name="可证上界",
+                             line=dict(color=NAVY, width=2, dash="dash"), text=labels,
+                             hovertemplate="%{text}：上界 %{y:.4f} MW<extra></extra>"))
+    fig.add_trace(go.Scatter(x=k, y=[r["objective_found_mw"] for r in levels], mode="lines+markers+text", name="本方案",
+                             line=dict(color=TEAL, width=2), text=labels, textposition="bottom right",
+                             hovertemplate="%{text}：%{y:.4f} MW<extra></extra>"))
+    fig.update_xaxes(title="每面镜的候选瞄准点数", type="log")
+    fig.update_yaxes(title="目标函数 (MW)")
+    return _base_layout(fig, "", height)

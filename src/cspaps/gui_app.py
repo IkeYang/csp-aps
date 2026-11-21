@@ -30,7 +30,7 @@ from cspaps.config import _SECTIONS, case_from_dict, load_case
 from cspaps.field import Field, build_field, save_layout_csv
 from cspaps.gui_plots import (
     bound_chart, field_map, history_chart, layout_tradeoff_chart, loss_waterfall, pareto_chart, plant_scene,
-    potential_map_chart, receiver_3d, receiver_map, receiver_rose, replay_timeline, uniformity_curves,
+    potential_map_chart, receiver_3d, receiver_map, receiver_rose, refinement_chart, replay_timeline, uniformity_curves,
 )
 from cspaps.layout_opt import validate_layout
 from cspaps.optics import footprints_at
@@ -1042,7 +1042,33 @@ def _certificate_tab(res: dict, cert: dict | None) -> None:
     st.markdown("对 x 是凹函数，且在任何可行方案处不小于目标值；在放松为 [0,1] 的分配多面体上，凹性给出")
     st.latex(r"\max_x L\;\le\;L(x_t)+\max_{y\in\Delta}\nabla L(x_t)^\top(y-x_t)")
     st.markdown("右端按定日镜可分离、直接求出。每一步 Frank–Wolfe 迭代都得到一个有效上界，取最小者。"
-                "上界对本候选瞄准点集合和约束点（求解网格与复核热点）成立；加密候选点后最优值收敛到连续瞄准问题的最优值。")
+                "上界对本候选瞄准点集合和约束点（求解网格与复核热点）成立。")
+    st.divider()
+    _section(None, "候选点加密收敛性",
+             "证书针对离散候选瞄准点。在嵌套加密的候选网格上（每级包含上一级，方位与高度步长减半）从上一级方案出发重新求解并给出上界，"
+             "观察本方案与上界随瞄准分辨率的收敛——当候选网格达到瞄准控制的指令分辨率时，证书即覆盖实际可执行的全部方案。"
+             "三级（21 / 65 / 225 个候选点）约需 4 分钟。")
+    inputs = json.loads((Path(res["run_dir"]) / "run.json").read_text(encoding="utf-8"))["arguments"]
+    _job_button("refine", "运行加密收敛分析", wf.task_aps_refinement, inputs["time"],
+                dni_map=inputs.get("dni_map"), dni_source=inputs.get("dni_source", "site"), progress=True)
+    _job_error("refine")
+    ref = st.session_state.get("res_refine")
+    if ref:
+        lv = ref["summary"]["levels"]
+        a, b = st.columns([1.3, 1])
+        with a:
+            _chart(refinement_chart(lv), "refine_chart")
+        with b:
+            st.dataframe(pd.DataFrame({
+                "候选网格": [f"{r['n_azimuth']}×{r['n_height']}" for r in lv],
+                "方位步长 (°)": [r["azimuth_step_deg"] for r in lv], "高度步长 (m)": [r["height_step_m"] for r in lv],
+                "本方案 (MW)": [round(r["objective_found_mw"], 4) for r in lv],
+                "上界 (MW)": [round(r["upper_bound_mw"], 4) for r in lv], "差距": [_pct(r["gap"], 3) for r in lv],
+                "二维 CV": [r["cv_2d_H"] for r in lv]}), hide_index=True)
+            if len(lv) > 1:
+                st.caption(f"最细网格的方案比默认网格提高 {100 * (lv[-1]['objective_found_mw'] / lv[0]['objective_found_mw'] - 1):+.2f}%；"
+                           f"上界逐级增量 " + " → ".join(f"{lv[i + 1]['upper_bound_mw'] - lv[i]['upper_bound_mw']:+.3f}"
+                                                   for i in range(len(lv) - 1)) + " MW。")
 
 
 def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
@@ -1349,12 +1375,19 @@ def _layout_results(case, res: dict) -> None:
                         "面积 $\\ge \\sqrt3 d^2/2$（Fejes Tóth），由此给出区域可容纳镜数上界。\n"
                         f"- 场地最多可容纳约 {ub.get('packing_capacity_bound')} 面镜（上界）；"
                         f"栅格 {ub.get('raster_cell_m', 0):.1f} m；采样 {ub.get('sampling', {}).get('n_states')} 个代表工况。")
-            st.dataframe(pd.DataFrame({"项目": ["本方案理论年吸收", "本方案各镜单独潜力之和", "任意布局上界", "最优性差距",
-                                              "APS 可行年吸收", "APS 口径差距"],
-                                       "值": [f"{ub.get('found_energy_mwh', 0):,.1f} MWh", f"{ub.get('layout_lone_sum_mwh', 0):,.1f} MWh",
-                                             f"{ub.get('upper_bound_mwh', 0):,.1f} MWh", _pct(ub.get("gap")),
-                                             f"{ub.get('found_aps_feasible_mwh', 0):,.1f} MWh" if ub.get("found_aps_feasible_mwh") else "—",
-                                             _pct(ub.get("gap_aps_feasible"))]}), hide_index=True)
+            items = [("本方案理论年吸收", f"{ub.get('found_energy_mwh', 0):,.1f} MWh"),
+                     ("本方案各镜单独潜力之和", f"{ub.get('layout_lone_sum_mwh', 0):,.1f} MWh"),
+                     ("任意布局、任意瞄准策略的年能量上界", f"{ub.get('upper_bound_mwh', 0):,.1f} MWh"),
+                     ("理论能量差距", _pct(ub.get("gap"))),
+                     ("受限 APS 可行年吸收", f"{ub.get('found_aps_feasible_mwh', 0):,.1f} MWh" if ub.get("found_aps_feasible_mwh") else "—"),
+                     ("APS 口径差距", _pct(ub.get("gap_aps_feasible")))]
+            if ub.get("objective_review_mwh") is not None:
+                items += [("复核目标 J（可行 APS 能量 − λ_L × 管屏间惩罚）", f"{ub['objective_review_mwh']:,.1f} MWh"),
+                          ("J 的保守差距（J ≤ 能量 ≤ 上界）", _pct(ub.get("gap_objective_conservative")))]
+            st.dataframe(pd.DataFrame({"项目": [k for k, _ in items], "值": [v for _, v in items]}), hide_index=True)
+            if ub.get("objective_review_mwh") is not None:
+                st.caption("加权目标 J 没有比能量上界更紧的通用上界：任何布局的管屏间惩罚都 ≥ 0，所以只能用 J ≤ E ≤ 上界 作保守比较，"
+                           "其中包含了为均匀受热主动放弃的能量。")
         else:
             st.info("本次运行未计算上界（布局优化设置中关闭了「可证上界」）。")
 

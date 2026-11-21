@@ -264,3 +264,19 @@ def test_bound_violation_is_reported_not_clipped(small_case):
     bad = layout_upper_bound(small_case, 10, small_case.heliostat.diagonal * 1.1, samples=smp, pmap=pm,
                              found_energy_mwh=2 * b["upper_bound_mwh"])
     assert bad["status"] == "bound_violation" and bad["gap"] < 0
+
+
+
+def test_final_check_uses_the_executed_aims_and_refinement_is_monotone(small_case, tmp_path):
+    """task_aim reports the check of the final aims (re-shaded); nested refinement never loses objective."""
+    from cspaps import workflows as wf
+
+    small_case.uniformity.enabled, small_case.uniformity.mode, small_case.uniformity.weight = True, "weighted", 0.3
+    s = wf.task_aim(small_case, tmp_path, "2025-12-21 10:00", method="greedy", certify=False)["summary"]
+    assert "final aim points" in s["flux_check"]["basis"] and "solver_flux_check" in s
+    assert s["status"] in ("ok", "margin_reduced", "uniformity_infeasible")
+    small_case.aps.certify_time_s = 4.0
+    ref = wf.task_aps_refinement(small_case, tmp_path, "2025-06-21 13:00", levels=[(3, 3), (5, 5)])["summary"]["levels"]
+    assert [r["n_candidates"] for r in ref] == [9, 25]
+    assert ref[1]["objective_found_mw"] >= ref[0]["objective_found_mw"] - 1e-9
+    assert all(r["upper_bound_mw"] >= r["objective_found_mw"] - 1e-9 for r in ref)

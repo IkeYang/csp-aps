@@ -78,7 +78,7 @@ class ResponseSet:
     sigma: np.ndarray  # (N, K) beam sigma, m
     unit_beam: np.ndarray  # (N, K) beam power at the image plane per unit DNI, W per W/m2
     unit_power: np.ndarray  # (N, K) intercepted power per unit DNI
-    sb: np.ndarray  # (N,) shading x blocking (centre-aim geometry)
+    sb: np.ndarray  # (N,) shading x blocking of the centre candidate (per candidate: sb_k)
     center_k: int
     points: np.ndarray  # (P, 3) constraint points: grid cells first, then added hotspots
     normals: np.ndarray  # (P, 3)
@@ -91,6 +91,7 @@ class ResponseSet:
     resp_peak: np.ndarray  # (N,) max of each heliostat's response
     build_time_s: float = 0.0
     version: int = 0
+    sb_k: np.ndarray | None = None  # (N, K) shading x blocking of every candidate aim (its own mirror normal / beam)
 
     @property
     def n(self) -> int:
@@ -180,14 +181,17 @@ def build_response(
     s = sun.sun_vector(sun_elevation, sun_azimuth)
     normals, t, slant, cos_inc = optics.heliostat_geometry(fld.xyz[:, None, :], aim_xyz, s)
     if case.shading.enabled and n:
-        sb = shading.shading_blocking(
-            fld.xyz, normals[:, center], s, t[:, center], hel, rec, fld.pairs,
+        # each candidate has its own mirror normal and reflected beam, so shading and blocking are evaluated
+        # per candidate (they differ by up to tens of percent at low sun near the field edge)
+        sb_k = np.stack([shading.shading_blocking(
+            fld.xyz, normals[:, j], s, t[:, j], hel, rec, fld.pairs,
             n_points=shading_points or case.shading.n_points, tower_shadow=case.shading.tower_shadow,
-        )["combined"]
+        )["combined"] for j in range(k)], axis=1)
     else:
-        sb = np.ones(n)
+        sb_k = np.ones((n, k))
+    sb = sb_k[:, center]
     sigma = optics.beam_sigma(slant, cos_inc, hel, case.sun)
-    unit_beam = hel.area * hel.reflectivity * hel.cleanliness * sb[:, None] * cos_inc * optics.attenuation(slant, case.atmosphere)
+    unit_beam = hel.area * hel.reflectivity * hel.cleanliness * sb_k * cos_inc * optics.attenuation(slant, case.atmosphere)
     unit_power = unit_beam * optics.intercept_fraction(rec, aim_xyz, t, sigma)
     if spec.auto_grid and n:
         grid = solver_grid(rec, grid, float(sigma.min()), spec.max_solver_cells)
@@ -210,7 +214,7 @@ def build_response(
     return ResponseSet(
         case, grid, float(sun_elevation), float(sun_azimuth), cand_az, cand_z, aim_xyz, t, sigma,
         unit_beam, unit_power, sb, center, grid.points.copy(), grid.normals.copy(), grid.cell_az, grid.cell_z,
-        grid.limit.copy(), grid.alpha.copy(), cells, resp, peaks, _time.perf_counter() - t0,
+        grid.limit.copy(), grid.alpha.copy(), cells, resp, peaks, _time.perf_counter() - t0, sb_k=sb_k,
     )
 
 
@@ -679,17 +683,30 @@ def solve(
     choice, extra = run(init)
     info.update(extra)
     check = None
-    rounds = added = 0
+    rounds = added = repairs = 0
     if spec.verify:
         check = prob.verify(choice)
-        while (method != "center" and not check.ok and check.hotspots and rounds < spec.verify_max_rounds):
+        # an exact re-solve per round is cheap on the small problems MILP is meant for: allow more rounds
+        max_rounds = max(spec.verify_max_rounds, 12) if method == "milp" and spec.verify_max_rounds > 0 else spec.verify_max_rounds
+        while (method != "center" and not check.ok and check.hotspots and rounds < max_rounds):
             added += prob.rs.add_points([h[0] for h in check.hotspots], [h[1] for h in check.hotspots])
             # re-solve: greedy repairs from the current plan, the others restart
             choice, extra = run(choice if method == "greedy" else None)
             info.update(extra)
             check = prob.verify(choice)
             rounds += 1
+        # A restarted exact solve can move flux to new hotspots every round (cutting planes need not converge
+        # in a fixed number of rounds). Finish with repair from the current plan: only heliostats feeding a
+        # violated point move or defocus, so the plan reaches the limit.
+        # (rule-based methods such as kfactor keep their own failure state: they are not silently replaced)
+        while (method in ("milp", "greedy") and check.status == "over_limit" and check.hotspots
+               and repairs < max(4, 2 * spec.verify_max_rounds)):
+            added += prob.rs.add_points([h[0] for h in check.hotspots], [h[1] for h in check.hotspots])
+            choice, _ = solve_greedy(prob, spec, prev_xyz, prev_active, init=choice, full_passes=0)
+            check = prob.verify(choice)
+            repairs += 1
         info["verification_rounds"] = rounds
+        info["repair_rounds"] = repairs
         info["hotspot_points_added"] = added
     uni = prob.case.uniformity
     if uni.enabled and method in ("greedy", "kfactor", "milp"):
@@ -746,9 +763,15 @@ def finalize(prob: AimProblem, method: str, choice: np.ndarray, info: dict, chec
              spec: APSSpec, t0: float) -> AimResult:
     """AimResult with status from the verified check (or the coarse peak when verification is off)."""
     uni = prob.case.uniformity
-    info.setdefault("global_optimality_proven", bool(
-        method == "milp" and info.get("milp_status") == 0 and not uni.enabled))
-    if "solution_class" not in info:
+    verified = check is not None and check.status in ("ok", "margin_reduced")
+    # "proven optimal" needs the exact solver's own optimum (no repair after it) *and* a passed fine-grid check
+    proven = bool(method == "milp" and info.get("milp_status") == 0 and not uni.enabled
+                  and not info.get("repair_rounds") and (verified or not spec.verify))
+    info["global_optimality_proven"] = proven
+    if spec.verify and check is not None and not verified:
+        info["solution_class"] = "infeasible_after_verification"
+        info["global_optimality_proven"] = False
+    elif "solution_class" not in info or info["solution_class"] == "global_optimum_on_candidate_set":
         info["solution_class"] = ("global_optimum_on_candidate_set" if info["global_optimality_proven"]
                                   else "verified_feasible_heuristic")
     if spec.verify and check is not None:

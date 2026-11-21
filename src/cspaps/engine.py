@@ -162,8 +162,11 @@ class APSEngine:
             sb = shading.shading_blocking(fld.xyz, normals, s, t, hel, rec, fld.pairs,
                                           n_points=case.shading.n_points,
                                           tower_shadow=case.shading.tower_shadow)["combined"]
+        elif self._rs is not None:
+            k = self._choice_from_plan(self._rs, aim_az, aim_z, np.ones(fld.n, bool))
+            sb = self._rs.sb_k[np.arange(fld.n), k] if self._rs.sb_k is not None else self._rs.sb
         else:
-            sb = self._rs.sb if self._rs is not None else np.ones(fld.n)
+            sb = np.ones(fld.n)
         sigma = optics.beam_sigma(slant, cos_inc, hel, case.sun)
         unit = hel.area * hel.reflectivity * hel.cleanliness * sb * cos_inc * optics.attenuation(slant, case.atmosphere)
         icpt = optics.intercept_fraction(rec, aim_xyz, t, sigma)

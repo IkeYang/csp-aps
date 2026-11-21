@@ -31,6 +31,8 @@
 
 - 只损失 0.8% 吸收功率（λ = 0.05），二维 CV 就从 1.10 降到 0.53；损失 3.8%（λ = 0.3）降到 0.26。
 - 单时刻含证书的计算约 15–20 s（4 核）；7 个 λ 的权衡曲线约 1 分钟。
+- 证书针对离散候选瞄准点（默认 21 个）。候选点加密分析（`cspaps aps-refine`）：3×7 → 5×13 → 9×25 个候选点时，本方案 21.462 → 21.562 → 21.595 MW，上界 21.487 → 21.587 → 21.611 MW，1.5° / 0.3 m 分辨率下差距 0.07%。
+- 最终状态来自对最终瞄准点重新计算阴影遮挡后的细网格复核；只有通过复核的精确法最优解才标记“已证全局最优”。
 
 **问题二**：N = 473，840 m × 780 m 矩形场地，塔周禁排半径 50 m，最小镜距 12.45 m。「标准」计算强度约 2–3 分钟。
 
@@ -136,6 +138,7 @@ cspaps layout          CASE                          # 生成镜场
 cspaps snapshot        CASE --time "2025-06-21 13:40"  # 单时刻，中心瞄准
 cspaps aps             CASE --time ... [--weight λ | --max-cv ε] [--no-certify] [--dni-map now.csv --forecast-dni-map max.csv --prev-aims last.csv]
 cspaps pareto          CASE --time ... [--lambdas 0 0.1 0.3 1]       # 功率–均匀度曲线，每点带差距
+cspaps aps-refine      CASE --time ... [--levels 3x7,5x13,9x25]      # 候选瞄准点加密收敛分析
 cspaps realtime        CASE                          # 云影回放（场景、延迟、丢失在 YAML 中设置）
 cspaps annual          CASE [--method sun_bins|sun_grid|hourly|representative_days] [--aiming center|greedy]
 cspaps optimize-layout CASE [--uniformity-weight λ_L]  # 布置优化 + 受限复核 + 上界

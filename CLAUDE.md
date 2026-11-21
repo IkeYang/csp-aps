@@ -1,6 +1,6 @@
 # Notes for working on this repo
 
-- Python package `cspaps` in `src/`, tests in `tests/`. Install with `pip install -e ".[dev]"`; run `pytest -q` (~5 min) before committing.
+- Python package `cspaps` in `src/`, tests in `tests/`. Install with `pip install -e ".[dev]"`; run `pytest -q` (~8 min) before committing.
 - Coordinates: x = East, y = North, z = Up (m), origin at the tower base. Azimuths are compass (N = 0, E = 90, clockwise). Keep this convention in every module.
 - All user inputs live in a case YAML (`cases/*.yaml`) parsed by `config.py`. New inputs = a new dataclass field with a default (the GUI form picks it up automatically; add a Chinese label in `gui_app.LABELS`). Unknown keys must keep raising errors.
 - Layers: `optics`/`shading`/`sun`/`receiver` (physics, panel limits) -> `simulate.evaluate` (one sun state, power chain `STAGES`) -> `aps` (ResponseSet + AimProblem, solvers, verification loop), `uniformity`, `certify` (upper bounds / optimality gaps for APS and layout, relaxation rounding), `engine` (online cycle), `realtime` (replay), `annual`, `layout_opt` -> `mcrt`/`soltrace` (validation only) -> `workflows` (run folders, files, plots) -> `cli` and `gui_app`.

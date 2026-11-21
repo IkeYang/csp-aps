@@ -628,7 +628,12 @@ def optimize_layout(
             bound["gap_aps_feasible"] = max(0.0, 1.0 - best.aps_energy_mwh / bound["upper_bound_mwh"])
         if lam > 0:
             bound["objective_note"] = ("energy bound; the uniformity-weighted objective J = E - lambda_L * spread "
-                                       "is <= E, so J <= this bound as well")
+                                       "is <= E, so J <= this bound as well (conservative: no tighter general bound)")
+            best_row = ranking.loc[ranking["final_rank"] == 1]
+            if len(best_row) and "objective_review_mwh" in best_row and bound.get("upper_bound_mwh"):
+                j_obj = float(best_row["objective_review_mwh"].iloc[0])
+                bound["objective_review_mwh"] = j_obj
+                bound["gap_objective_conservative"] = 1.0 - j_obj / bound["upper_bound_mwh"]
     uniformity = {"weight": lam}
     if best.n:
         say("certificate: uniformity metrics and selection bound")
