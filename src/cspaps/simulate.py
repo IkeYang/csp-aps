@@ -358,7 +358,7 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
             circ_spread = mask.sum() * np.sqrt(variance) * snap.p_absorbed / q.sum()
     row = {
         "time": ts, "sun_elevation_deg": el, "sun_azimuth_deg": az,
-        "dni_w_m2": dni_v, "p_receiver_mw": snap.p_receiver / 1e6, "p_absorbed_mw": snap.p_absorbed / 1e6,
+        "dni_w_m2": float(np.mean(dni_v)) if np.size(dni_v) else 0.0, "p_receiver_mw": snap.p_receiver / 1e6, "p_absorbed_mw": snap.p_absorbed / 1e6,
         "optical_efficiency": snap.p_receiver / snap.power["sun"].sum() if snap.power["sun"].sum() > 0 else 0.0,
         "peak_flux_kw_m2": peak, "peak_to_limit": ratio, "over_limit": over_limit,
         "n_defocused": int((~snap.active).sum()), "aps_status": status,
@@ -414,7 +414,8 @@ def annual(
     grid = grid or build_grid(case.receiver)
     samples = samples or sun.annual_samples(case, method)
     n_s = len(samples)
-    items = [(i, float(samples.elevation[i]), float(samples.azimuth[i]), float(samples.dni[i]),
+    # per-heliostat DNI when the samples carry spatial maps (each mirror reads the map at its position)
+    items = [(i, float(samples.elevation[i]), float(samples.azimuth[i]), samples.dni_at(i, fld.xyz[:, :2]),
               samples.times[i] if samples.times is not None else None) for i in range(n_s)]
     nw = min(n_workers(case.annual.workers if workers is None else workers), max(n_s, 1))
     results: list = [None] * n_s

@@ -29,8 +29,11 @@ from cspaps import workflows as wf
 from cspaps.config import _SECTIONS, case_from_dict, load_case
 from cspaps.field import Field, build_field, save_layout_csv
 from cspaps.gui_plots import (
-    bound_chart, field_map, history_chart, layout_tradeoff_chart, loss_waterfall, pareto_chart, plant_scene,
-    potential_map_chart, receiver_3d, receiver_map, receiver_rose, refinement_chart, replay_timeline, uniformity_curves,
+    aim_scene_3d, dni_map_chart, field_dni_map, field_map, flux_diff_map, history_chart, inner_gap_chart,
+    lambda_sweep_chart, layout_overlay, layout_tradeoff_chart, loss_waterfall, pareto_chart, plant_scene,
+    potential_map_chart, receiver_aims_3d, receiver_aims_map, receiver_map, receiver_rose, refinement_chart,
+    replay_timeline, scenario_contrib_chart, scenario_sky_chart, state_bars, uniformity_curves,
+    value_decomposition_chart,
 )
 from cspaps.layout_opt import validate_layout
 from cspaps.optics import footprints_at
@@ -45,7 +48,7 @@ UPLOADS = RESULTS / "_uploads"
 
 PAGES = ["总览", "瞄准优化", "布局优化", "云影回放", "光学校验", "参数设置", "运行记录", "方法与理论"]
 PAGE_LABELS = {"总览": "◎  总览", "瞄准优化": "◉  瞄准优化 · 问题一", "布局优化": "▦  布局优化 · 问题二",
-               "云影回放": "☁  云影回放", "光学校验": "◇  光学校验", "参数设置": "⚙  参数设置",
+               "云影回放": "☁  云影对比与回放", "光学校验": "◇  光学校验", "参数设置": "⚙  参数设置",
                "运行记录": "☰  运行记录", "方法与理论": "∑  方法与理论"}
 PLOTLY_CONFIG = {"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]}
 # Blocking input problems found while drawing the current page (the script reruns from the top on every
@@ -56,7 +59,7 @@ SECTION_TITLES = {
     "site": "站址", "receiver": "集热器与管屏", "heliostat": "定日镜", "sun": "太阳", "atmosphere": "大气衰减",
     "weather": "气象数据", "shading": "阴影与遮挡", "field": "镜场", "aps": "瞄准策略 APS",
     "uniformity": "吸热器均匀受热", "engine": "在线控制引擎", "realtime": "回放（云影）", "annual": "全年计算",
-    "layout_opt": "布置优化", "mcrt": "蒙特卡洛光线追迹校验",
+    "layout_opt": "布置优化", "scenarios": "年度工况与空间 DNI 地图", "mcrt": "蒙特卡洛光线追迹校验",
 }
 LABELS = {
     "site.latitude": "纬度 (°，北为正)", "site.longitude": "经度 (°，东为正)", "site.elevation_m": "海拔 (m)",
@@ -126,6 +129,20 @@ LABELS = {
     "layout_opt.shading_points": "阴影采样点数", "layout_opt.maxiter": "进化代数", "layout_opt.popsize": "种群规模系数",
     "layout_opt.seed": "随机种子", "layout_opt.workers": "并行进程 (-1 = 全部)",
     "layout_opt.refine_top": "复核前几名", "layout_opt.polish_rounds": "局部微调轮数",
+    "layout_opt.ranking": "正式排名口径", "layout_opt.aps_weight": "内层（瞄准）权重 λ_APS（空 = 沿用问题一的 λ）",
+    "layout_opt.baseline": "初始布局对照", "layout_opt.formal_swap_rounds": "正式排名后的换位轮数（按 V 接受）",
+    "layout_opt.inner_joint_trials": "每个工况的联合姿态搜索次数", "layout_opt.inner_certify_rounds": "每个工况的松弛取整次数（0 = 关）",
+    "layout_opt.inner_certify_iters": "每个工况的对偶上界迭代数", "layout_opt.dense_check_scenarios": "更密工况复核的工况数（0 = 关）",
+    "layout_opt.cross_check_maps": "云影地图：用独立云图复核胜出布局",
+    "scenarios.source": "工况来源", "scenarios.file": "工况表 CSV", "scenarios.n_scenarios": "代表工况数",
+    "scenarios.dni_bands": "每个太阳位置的 DNI 分档数", "scenarios.map_model": "空间 DNI 地图模型",
+    "scenarios.map_file": "DNI 地图库 CSV（map_id,x,y,value）", "scenarios.map_unit": "地图单位",
+    "scenarios.map_normalize": "地图归一化", "scenarios.map_assignment": "地图分配到逐时数据的规则",
+    "scenarios.map_sequence": "使用的地图及顺序（YAML 列表，空 = 全部）", "scenarios.map_include_uniform": "加入全场均匀 DNI 作兼容工况",
+    "scenarios.map_cell_m": "地图栅格尺寸 (m)", "scenarios.map_contrast": "亮暗对比 ±c", "scenarios.map_axis_deg": "亮侧方向（罗盘方位 °）",
+    "scenarios.map_edge_m": "半场分界过渡宽度 (m)", "scenarios.cloud_maps": "云影地图张数", "scenarios.cloud_n": "每张地图的云数",
+    "scenarios.cloud_radius_m": "云影半径范围 [小, 大] (m)", "scenarios.cloud_transmittance": "云影透过率范围 [小, 大]",
+    "scenarios.seed": "随机种子",
     "mcrt.rays_per_heliostat": "每面镜子光线数", "mcrt.seed": "随机种子", "mcrt.n_seeds": "重复次数（种子数）",
     "mcrt.tracking_mode": "跟踪误差 (per_ray 统计 / per_heliostat 逐镜偏置)",
 }
@@ -145,6 +162,10 @@ CHOICES = {
     "engine.fallback": ["hold_or_defocus", "defocus", "none"],
     "realtime.scenario": ["clouds", "moving_edge", "sudden_clear"],
     "mcrt.tracking_mode": ["per_ray", "per_heliostat"],
+    "layout_opt.ranking": ["aps_value", "legacy"], "layout_opt.baseline": ["initial", "none"],
+    "scenarios.source": ["weather", "file"], "scenarios.map_model": ["uniform", "half_swap", "gradient", "clouds", "file"],
+    "scenarios.map_unit": ["factor", "w_m2"], "scenarios.map_normalize": ["site_mean", "none"],
+    "scenarios.map_assignment": ["by_day", "single"],
 }
 CHOICE_LABELS = {
     "layout_opt.uniformity_metric": {"circumferential": "管屏之间（周向）", "surface": "整个考核区（二维热流）"},
@@ -170,6 +191,14 @@ CHOICE_LABELS = {
     "engine.fallback": {"hold_or_defocus": "保持安全旧方案，否则散焦", "defocus": "散焦超限贡献镜", "none": "不自动回退"},
     "receiver.flux_limit_basis": {"incident": "按入射热流限制", "absorbed": "按吸收热流限制"},
     "mcrt.tracking_mode": {"per_ray": "每条光线随机误差", "per_heliostat": "每面镜固定偏差"},
+    "layout_opt.ranking": {"aps_value": "逐工况 APS 年度价值 V(L)（推荐）", "legacy": "0.4 版复核口径"},
+    "layout_opt.baseline": {"initial": "把初始镜场一起排名", "none": "不对照"},
+    "scenarios.source": {"weather": "由站址气象年生成", "file": "导入工况表"},
+    "scenarios.map_model": {"uniform": "全场均匀（兼容）", "half_swap": "左右半场亮暗 + 互换", "gradient": "线性梯度 + 反向",
+                            "clouds": "随机云影", "file": "导入地图库"},
+    "scenarios.map_unit": {"factor": "倍数（乘工况 DNI）", "w_m2": "绝对 DNI (W/m²)"},
+    "scenarios.map_normalize": {"site_mean": "场地平均 = 1（只重新分配）", "none": "不归一化"},
+    "scenarios.map_assignment": {"by_day": "逐日轮换", "single": "只用第一张"},
 }
 HELP = {
     "site.latitude": "场址纬度，北纬为正。用于计算太阳高度角和方位角。",
@@ -213,6 +242,15 @@ HELP = {
     "field.exclusion_radius": "塔周不允许布置定日镜的半径（检修通道、塔基础等），单位米。",
     "aps.n_height_levels": "每面镜在吸热器高度方向的候选瞄准层数。层数越多越接近连续瞄准，计算越慢。",
     "aps.azimuth_offsets_deg": "候选瞄准点相对正对方位的周向偏移（度），YAML 列表，例如 [-6, 0, 6]。",
+    "layout_opt.ranking": "推荐“逐工况 APS 年度价值”：每个参与排名的布局在同一组工况上逐个求解问题一，"
+                          "按 V(L) = Σ h_s (P_s − λ_L U_s) 排名。",
+    "layout_opt.aps_weight": "内层权重决定运行时怎样瞄准（P − λ_APS·U）。与外层 λ_L 独立设置。",
+    "layout_opt.baseline": "初始镜场取最靠近塔的 N 面镜，作为同一口径下的对照布局参与排名。",
+    "scenarios.n_scenarios": "按 DNI 能量加权聚类的代表工况数，每个工况带太阳方向、代表小时数和一张场地 DNI 地图。",
+    "scenarios.map_model": "空间 DNI 的建模假设。地图在场地坐标中定义，与布局无关：同一位置读同一 DNI。",
+    "scenarios.map_contrast": "半场或梯度模型的相对亮暗差，0.3 表示亮侧 1.3 倍、暗侧 0.7 倍（归一化前）。",
+    "scenarios.map_normalize": "场地平均 = 1 时地图只在空间上重新分配气象站 DNI，场地全年 DNI 总量不变。",
+    "scenarios.map_assignment": "逐日轮换：第 k 天用第 k mod M 张地图，再在每张地图的小时中聚类代表工况。",
 }
 STATE_ZH = {"ready": "仿真计划通过复核", "fallback": "使用保守回退方案", "infeasible": "无可行运行方案",
             "pending": "待计算", "awaiting_confirmation": "待人工确认", "confirmed": "已记录人工确认", "n/a": "—",
@@ -782,9 +820,11 @@ def page_overview(case) -> None:
         st.button("进入瞄准优化 →", key="go_aps", type="primary", on_click=_goto, args=("瞄准优化",), width="stretch")
         st.markdown('<div style="height:.6rem"></div><div class="cs-flow"><div class="tag">问题二 · 电站设计</div>'
                     '<div class="h">镜场布局优化</div>'
-                    '<div class="p">给定场地范围、镜面数量与尺寸、吸热器三维位置和经纬度，寻找全年理论吸热量最大的布置。</div>'
-                    '<ul><li>用权重 λ_L 兼顾吸热器周向受热均匀，镜场环绕集热器</li><li>参数化布局 + 差分进化 + 交换选择</li>'
-                    '<li>单镜潜力 + 圆盘堆积给出任意布局的能量上界</li><li>候选方案受限 APS 复核</li></ul></div>',
+                    '<div class="p">给定场地范围、镜面数量与尺寸、吸热器三维位置、经纬度和全年空间 DNI 工况，寻找年度价值最高的布置。</div>'
+                    '<ul><li>每个工况带一张场地 DNI 地图，镜子在哪里读哪里的 DNI</li>'
+                    '<li>每个布局在每个工况下用自己的 APS 方案计分：V = Σ h (P − λ_L·U)</li>'
+                    '<li>优势分解为“更多吸热”与“更均匀受热”，导出表可独立复算</li>'
+                    '<li>初始布局对照、内层差距与任意布局上界</li></ul></div>',
                     unsafe_allow_html=True)
         st.button("进入布局优化 →", key="go_layout", type="primary", on_click=_goto, args=("布局优化",), width="stretch")
     single, opt = st.session_state.get("res_single"), st.session_state.get("res_opt")
@@ -917,6 +957,61 @@ def page_aps(case) -> None:
         else:
             _aps_results(res)
     _pareto_section(case, f"{date} {tm}", dni_src, up_now)
+    _scenario_check_section(case)
+
+
+@st.cache_data(show_spinner=False)
+def _scenario_table(case_yaml: str, base_dir: str):
+    from cspaps.scenarios import build_scenarios
+
+    case = case_from_dict(yaml.safe_load(case_yaml), base_dir=base_dir)
+    return build_scenarios(case).table()
+
+
+def _scenario_check_section(case) -> None:
+    """Task 1 for one annual scenario (sun + site DNI map) on the current field: the check of a layout score."""
+    with _card("aps_scenario"):
+        _section(4, "年度工况复核（问题二的工况与 DNI 地图）",
+                 "从年度工况集中选一个工况：太阳位置与场地 DNI 地图都来自工况集，各镜按自己的位置读 DNI。"
+                 "求解设置与布局正式排名相同，所得 P、U 与布局工作区该工况的记录逐位一致。")
+        try:
+            tbl = _scenario_table(case.to_yaml(), st.session_state["base_dir"])
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            st.error(f"无法生成工况集：{exc}")
+            return
+        c1, c2 = st.columns([1.2, 1])
+        sid = c1.selectbox("工况", list(tbl["scenario_id"]), key="scen_pick",
+                           format_func=lambda i: (lambda r: f"{i} · {r['map_id']} · 高度角 {r['elevation_deg']:.0f}° · "
+                                                            f"{r['hours']:.0f} h")(tbl.set_index("scenario_id").loc[i]))
+        c2.caption(f"共 {len(tbl)} 个工况 · 地图 {', '.join(sorted(set(tbl['map_id'])))}")
+        _job_button("scen", "▶  求解该工况", wf.task_scenario_aps, sid)
+        _job_error("scen")
+    res = st.session_state.get("res_scen")
+    if res is None:
+        return
+    from cspaps.layout_value import STATUS_ZH, eval_grid_shape
+
+    rec, fld = res["record"], res["field"]
+    p = rec.plan
+    c = res_case(res)
+    nz, na = eval_grid_shape(c)
+    grid = build_grid(c.receiver, na, nz)
+    row = res["summary"]["scenario"]
+    _kpis([("工况", rec.scenario_id, "", f"{rec.map_id} · 代表 {rec.hours:.1f} h · 太阳高度角 {rec.elevation_deg:.1f}°"),
+           ("吸收功率 P", f"{p.p_abs_w / 1e6:.3f}", "MW", STATUS_ZH.get(p.status, p.status)),
+           ("U = A_H·σ_H", f"{p.u_w / 1e6:.3f}", "MW", f"二维 CV {_format_number(p.cv_2d, 3)}"),
+           ("J = P − λ_APS·U", f"{p.objective_w / 1e6:.3f}", "MW", f"差距 ≤ {_pct(p.gap, 2)}"),
+           ("该工况贡献 h·(P − λ_L·U)", f"{row['contribution_mwh']:,.1f}", "MWhₜₕ", f"λ_L = {row['lambda_layout']:g}")])
+    l, r = st.columns(2)
+    with l:
+        _chart(field_dni_map(c, fld.xyz, fld.ids, p.dni, title=f"{rec.scenario_id} 各镜读到的 DNI", cmin=0,
+                             inactive=~p.active, height=420), "scen_dni")
+    with r:
+        _chart(receiver_aims_map(c, grid, p.flux, p.aim_azimuth, p.aim_z, p.active, fld.ids, p.dni,
+                                 title="吸热器热流与每面镜中心的瞄准点", height=420, cmin=0), "scen_rec")
+    _chart(aim_scene_3d(c, fld.xyz, p.dni, p.aim_azimuth, p.aim_z, p.active, title="三维示意（抽样光束）", cmin=0),
+           "scen_3d")
+    _show_files(res, images=[])
 
 
 def _aps_results(res: dict) -> None:
@@ -991,12 +1086,25 @@ def _aps_results(res: dict) -> None:
         elif st.button("记录为人工已确认"):
             st.session_state["single_executed"] = str(run)
             st.rerun()
-    tabs = st.tabs(["吸热器热流", "三维吸热器", "镜场", "最优性证书", "效率与损失", "逐镜方案"])
+    tabs = st.tabs(["吸热器热流与瞄准点", "三维瞄准示意", "镜场", "最优性证书", "效率与损失", "逐镜方案"])
     with tabs[0]:
-        _chart(receiver_map(case, snap.grid, snap.flux, "吸热器展开图 · 入射热流（× 为细网格复核热点）", hotspot=chk,
-                            aims=(snap.aim_azimuth[snap.active], snap.aim_z[snap.active]), height=430), "s_rec")
+        color_by = st.radio("瞄准点着色", ["该镜 DNI", "镜子到塔的距离", "送达功率"], horizontal=True, key="s_aim_color")
+        dist = np.hypot(fld.xyz[:, 0] - case.receiver.center[0], fld.xyz[:, 1] - case.receiver.center[1])
+        vals, vlab = {"该镜 DNI": (snap.dni, "DNI (W/m²)"), "镜子到塔的距离": (dist, "距塔 (m)"),
+                      "送达功率": (snap.power["intercept"] / 1e3, "送达 (kW)")}[color_by]
+        _chart(receiver_aims_map(case, snap.grid, snap.flux, snap.aim_azimuth, snap.aim_z, snap.active, fld.ids, vals, vlab,
+                                 title="吸热器展开图 · 入射热流与每面镜中心的瞄准点（× 为细网格复核热点）",
+                                 hotspot=chk, height=460), "s_rec")
+        st.caption("每个点是一面定日镜的镜面中心光线在吸热器上的落点（瞄准点），悬停查看镜子编号与坐标。"
+                   "横轴按罗盘方位展开圆柱面：北 0°、东 90°。")
     with tabs[1]:
-        _chart(receiver_3d(case, snap.grid, snap.flux), "s_rec3d")
+        l, r = st.columns(2)
+        with l:
+            _chart(aim_scene_3d(case, fld.xyz, snap.dni, snap.aim_azimuth, snap.aim_z, snap.active,
+                                title="镜面中心 → 瞄准点（抽样光束，镜子按 DNI 着色）"), "s_scene3d")
+        with r:
+            _chart(receiver_aims_3d(case, snap.grid, snap.flux, fld.xyz, snap.aim_azimuth, snap.aim_z, snap.active,
+                                    snap.dni, fld.ids, title="吸热器近景：入射热流与全部瞄准点"), "s_rec3d")
     with tabs[2]:
         color_by = st.radio("着色", ["DNI", "瞄准高度", "光学效率"], horizontal=True, key="s_field_color")
         vals, label, scale = {"DNI": (snap.dni, "DNI (W/m²)", "Blues"),
@@ -1115,12 +1223,18 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
 # --------------------------------------------------------------------------- problem 2: layout
 
 PRESETS = {
-    "fast": ("快速 · 代表工况", {"maxiter": 2, "popsize": 3, "n_sun_bins": 8, "polish_rounds": 1, "refine_top": 1,
-                                  "review_n_sun_bins": 4, "swap_rounds": 1, "review_check_hourly": False}),
-    "standard": ("标准 · 逐时理论能量复核", {"maxiter": 4, "popsize": 4, "n_sun_bins": 12, "polish_rounds": 2,
-                                      "refine_top": 2, "review_n_sun_bins": 6, "swap_rounds": 1, "review_check_hourly": True}),
-    "fine": ("精细 · 扩大搜索", {"maxiter": 10, "popsize": 6, "n_sun_bins": 24, "polish_rounds": 4,
-                                     "refine_top": 3, "review_n_sun_bins": 12, "swap_rounds": 2, "review_check_hourly": True}),
+    "fast": ("快速 · 6 个工况正式排名", {"maxiter": 2, "popsize": 3, "n_sun_bins": 8, "polish_rounds": 1, "refine_top": 1,
+                                       "review_n_sun_bins": 4, "swap_rounds": 1, "review_check_hourly": False,
+                                       "formal_swap_rounds": 0, "dense_check_scenarios": 0},
+             {"n_scenarios": 6}),
+    "standard": ("标准 · 12 个工况正式排名", {"maxiter": 4, "popsize": 4, "n_sun_bins": 12, "polish_rounds": 2,
+                                          "refine_top": 2, "review_n_sun_bins": 6, "swap_rounds": 1,
+                                          "review_check_hourly": False, "formal_swap_rounds": 1, "dense_check_scenarios": 0},
+                 {"n_scenarios": 12}),
+    "fine": ("精细 · 20 个工况 + 40 工况复核", {"maxiter": 10, "popsize": 6, "n_sun_bins": 24, "polish_rounds": 4,
+                                            "refine_top": 3, "review_n_sun_bins": 12, "swap_rounds": 2,
+                                            "review_check_hourly": True, "formal_swap_rounds": 2, "dense_check_scenarios": 40},
+             {"n_scenarios": 20}),
 }
 
 
@@ -1128,6 +1242,7 @@ def _apply_preset() -> None:
     key = st.session_state.get("layout_preset")
     if key in PRESETS:
         st.session_state["case_dict"].setdefault("layout_opt", {}).update(PRESETS[key][1])
+        st.session_state["case_dict"].setdefault("scenarios", {}).update(PRESETS[key][2])
         st.session_state["ver"] += 1
 
 
@@ -1174,8 +1289,9 @@ def _receiver_center_inputs(case) -> None:
 
 def page_layout(case) -> None:
     _hero("问题二 · 电站设计", "镜场布局优化",
-          "给定场地范围、镜面数量、镜面尺寸、吸热器三维坐标和经纬度，寻找使全年理论吸收热量最大的定日镜布置。"
-          "计算同时给出任意布局都不可能超过的能量上界：它回答“最优布置是否存在、当前方案离全局最优多远”。",
+          "给定场地范围、镜数与镜面尺寸、吸热器三维坐标、经纬度和全年空间 DNI 工况，寻找年度价值 "
+          "V(L) = Σ h_s (P_s − λ_L·U_s) 最高的定日镜布置：每个参与排名的布局在每个工况下都用自己的 APS 方案计分。"
+          "同时给出任意布局都不可能超过的上界，回答“最优布置是否存在、当前方案离全局最优多远”。",
           [case.name] if case else ["算例无效"])
     if case is None:
         st.warning("请先在「参数设置」中修正当前算例。")
@@ -1204,16 +1320,23 @@ def page_layout(case) -> None:
                                                         float(case.layout_opt.uniformity_weight), 0.05,
                                                         key=f"{ver}:layout_opt.uniformity_weight",
                                                         help=HELP["layout_opt.uniformity_weight"]))
-            st.caption("年度目标为各工况吸收功率减去均匀性惩罚后的加权和。二维指标包含管屏内部和高度方向的起伏，"
-                       "周向指标比较各管屏的平均热流。")
+            st.caption("λ_L 是外层（布局评价）权重：V(L) = Σ h_s (P_s − λ_L·U_s)。正式排名的 U_s 与问题一相同，"
+                       "是考核区二维吸收热流的 A_H·σ_H；上面的指标只用于中心瞄准初筛（周向 = 布局决定、APS 无法消除的部分）。")
+        with _card("layout_scen"):
+            _section(3, "年度工况、空间 DNI 与内层权重",
+                     "每个工况 = 太阳方向 + 代表小时数 + 一张场地 DNI 地图。镜子在哪里就读哪里的 DNI；"
+                     "每个布局在每个工况下都重新求解问题一（内层权重 λ_APS）。")
+            _scenario_inputs(case)
         with _card("layout_search"):
-            _section(3, "搜索设置", "搜索阶段按目标 J（全年理论吸收热量减周向不均匀惩罚，中心瞄准，含阴影遮挡）评价布局，"
-                     "入围方案再用受限 APS 复核。")
+            _section(4, "搜索设置", "初筛按中心瞄准的全年理论热量减周向不均匀惩罚评价参数化布局；入围布局与初始布局"
+                     "再在同一组工况上逐个求解 APS，按 V(L) 正式排名。")
             st.radio("计算强度", list(PRESETS), format_func=lambda k: PRESETS[k][0], key="layout_preset",
                      index=1, horizontal=False, on_change=_apply_preset)
             _fields("layout_opt", ["generator", "search_aiming", "refine_top", "upper_bound"])
             with st.expander("搜索范围、采样精度与计算资源"):
-                common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight", "uniformity_metric"}
+                common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight",
+                          "uniformity_metric", "ranking", "baseline", "aps_weight", "formal_swap_rounds",
+                          "dense_check_scenarios", "inner_joint_trials", "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"}
                 _fields("layout_opt", [f.name for f in dataclasses.fields(_SECTIONS["layout_opt"]) if f.name not in common])
             with st.expander("APS 复核使用的瞄准与均匀度设置"):
                 _fields("aps", ["method", "safety_margin", "n_height_levels", "azimuth_offsets_deg"])
@@ -1243,9 +1366,23 @@ def page_layout(case) -> None:
             edited, _ = _case()
             if edited and res.get("input_parameters") and edited.to_dict() != res["input_parameters"]:
                 st.info("参数已修改。当前图表、指标和导出文件对应上一次计算。重新计算可更新结果。")
-            _layout_results(completed, res)
+            f = res["result"].formal
+            if f and f.get("values"):
+                s_ = res["summary"]
+                _section(None, "正式排名 · 逐工况 APS 年度价值",
+                         f"{s_['n_heliostats']} 面镜 · {len(f['scenario_set'])} 个工况 · λ_APS = {f['settings'].lam_aps:g} · "
+                         f"λ_L = {completed.layout_opt.uniformity_weight:g} · 用时 {s_['runtime_s']:.0f} s · "
+                         f"场地校验 {'通过' if s_['status'] == 'ok' else s_['status']}")
+                _render_values(completed, f["values"], f["ranking"], f["scenario_set"], "opt", bound=res["result"].bound,
+                               dense=f.get("dense"), run_dir=res["run_dir"], swaps=f.get("swaps"),
+                               cross=f.get("cross_maps"))
+                with st.expander("初筛（中心瞄准）、搜索过程、场地潜力与周向受热"):
+                    _layout_results(completed, res)
+            else:
+                _layout_results(completed, res)
     if res is not None:
         _planning_compare(completed)
+    _value_compare_section(case)
 
 
 def _layout_results(case, res: dict) -> None:
@@ -1465,7 +1602,17 @@ def _planning_compare(case) -> None:
         site_status = {"ok": "场地约束通过", "capacity_shortfall": "镜数不足", "constraint_violation": "场地约束未通过"}
         st.write(f"{site_status[selected_validation['status']]} · {fld.n} 面镜 · 最小镜距 "
                  f"{selected_validation['min_distance_m']} m")
-        if aps_table is None:
+        formal_vals = (r.formal or {}).get("values") or {}
+        fname = f"search_{search_rank}"
+        if fname in formal_vals:
+            ft = formal_vals[fname].totals()
+            n_ok = ft["status_counts"].get("feasible", 0)
+            n_all = sum(ft["status_counts"].values())
+            st.success(f"已进入正式排名（{wf.layout_label(fname)}）：年度价值 V = {ft['value_mwh']:,.0f} MWhₜₕ，"
+                       f"{n_ok}/{n_all} 个工况可行运行。详见上方“正式排名”。")
+        elif formal_vals:
+            st.info("该布局只参加了中心瞄准初筛，没有进入正式排名。")
+        elif aps_table is None:
             st.warning("该布局仅完成搜索阶段评估，尚未进行 APS 年度复核。")
         elif feasible_states < aps_states:
             st.warning(f"APS 代表工况 {feasible_states}/{aps_states} 个满足全部通量和均匀度约束。")
@@ -1474,7 +1621,7 @@ def _planning_compare(case) -> None:
         else:
             st.success(f"APS 代表工况 {feasible_states}/{aps_states} 个满足全部约束。")
         st.caption("镜场坐标采用 x 东、y 北、z 上（m），原点为塔底。载入只切换仿真镜场，不向设备下发指令。")
-        selectable = selected_validation["status"] == "ok" and (aps_table is None or feasible_states > 0)
+        selectable = selected_validation["status"] == "ok" and (aps_table is None or feasible_states > 0 or bool(formal_vals))
         if st.button("载入此布局继续仿真", key="apply_layout", disabled=not selectable):
             path = Path(res["run_dir"]) / f"applied_layout_{pick + 1}.csv"
             save_layout_csv(fld, path)
@@ -1539,6 +1686,377 @@ def _planning_compare(case) -> None:
     with st.expander("搜索历史与全部输出"):
         _show_files(res)
 
+
+
+# --------------------------------------------------------------------------- problem 2: annual value V(L)
+
+VALUE_STATUS_ZH = {"feasible": "可行运行", "feasible_shutdown": "可行停机", "no_sun": "无日照",
+                   "no_feasible_found": "未找到可行方案", "proven_infeasible": "已证不可行", "not_solved": "未求解"}
+VALUE_STATUS_RULE = {"feasible": "计入 h·(P − λ_L·U)", "feasible_shutdown": "计 0（全部散焦也是可执行方案）",
+                     "no_sun": "计 0", "no_feasible_found": "计 0（保守：吸热器保持停机，年度价值为下界）",
+                     "proven_infeasible": "计 0（约束下无任何可运行方案）",
+                     "not_solved": "不计分：该布局年度价值不完整，不参与排名"}
+
+
+def _labels(values: dict) -> dict:
+    return {n: wf.layout_label(n) for n in values}
+
+
+def _sector_share(value, case, n_sectors: int = 12):
+    """Annual absorbed energy per receiver azimuth sector from the layout's own APS plans (flux maps)."""
+    from cspaps.layout_value import eval_grid_shape
+
+    nz, na = eval_grid_shape(case)
+    grid = build_grid(case.receiver, na, nz)
+    acc = np.zeros(na)
+    for r in value.records:
+        if r.plan.counts and r.plan.flux is not None and r.plan.flux.shape == grid.shape:
+            acc += r.hours * r.plan.flux.sum(axis=0)
+    sector = np.minimum((grid.azimuth_deg // (360.0 / n_sectors)).astype(int), n_sectors - 1)
+    tot = np.bincount(sector, weights=acc, minlength=n_sectors)
+    share = tot / tot.sum() if tot.sum() > 0 else tot
+    return list(share), list((np.arange(n_sectors) + 0.5) * 360.0 / n_sectors)
+
+
+def _value_kpis(values: dict, ranking: pd.DataFrame, bound: dict | None, sset) -> None:
+    first = ranking.iloc[0]
+    win = values[first["name"]]
+    tot = win.totals()
+    lam = tot["lambda_layout"]
+    items = [
+        ("年度价值 V（第 1 名）", _format_number(tot["value_mwh"], 0), "MWhₜₕ", wf.layout_label(first["name"]), "good"),
+        ("全年吸收热量 E", _format_number(tot["energy_mwh"], 0), "MWhₜₕ", "Σ h_s·P_s，各工况自己的 APS 方案"),
+        ("均匀性扣分 λ_L·Π", _format_number(lam * tot["penalty_mwh"], 0), "MWhₜₕ",
+         f"Π = Σ h_s·U_s = {tot['penalty_mwh']:,.0f} · λ_L = {lam:g}"),
+        ("内层求解差距（年度加权）", f"≤ {_pct(tot['inner_gap_annual'], 2)}" if tot["inner_gap_annual"] is not None else "—", "",
+         f"最大单工况 {_pct(tot['max_inner_gap'], 1)} · λ_APS = {tot['lambda_aps']:g}"),
+    ]
+    if bound and bound.get("gap_value_conservative") is not None:
+        items.append(("外层上界差距（保守）", f"≤ {_pct(bound['gap_value_conservative'], 1)}", "",
+                      f"任意布局能量上界 {bound['upper_bound_mwh']:,.0f} MWhₜₕ"))
+    items.append(("工况集", f"{len(sset)}", "个", f"地图 {', '.join(sorted(sset.subset_maps()))} · 指纹 {sset.fingerprint()[:8]}", "navy"))
+    st_ = win.settings
+    items.append(("瞄准策略（每个工况）", "APS", "",
+                  f"{'贪心' if st_.method == 'greedy' else '精确法'} + 联合姿态搜索 {st_.joint_trials} 次"
+                  + (f" + 松弛取整 {st_.certify_rounds} 次" if st_.certify_rounds else "")
+                  + f" · 候选 {len(st_.azimuth_offsets_deg)}×{st_.n_height_levels} · 网格 {st_.grid_shape[0]}×{st_.grid_shape[1]}"
+                  + f" · 设置摘要 {st_.digest()[:8]}", "navy"))
+    _kpis(items)
+
+
+def _decision_callout(values: dict, ranking: pd.DataFrame) -> None:
+    first = ranking.iloc[0]
+    ref = first["reference"]
+    lab = wf.layout_label
+    if first["name"] == ref and len(ranking) > 1:
+        second = ranking.iloc[1]
+        dv = -second["delta_value_mwh"]
+        de, du = -second["delta_energy_mwh"], -second["delta_uniformity_mwh"]
+        _callout("ok", f"{lab(first['name'])} 得分最高",
+                 f"比第 2 名 {lab(second['name'])} 多 {dv:,.1f} MWhₜₕ：其中吸热量贡献 {de:+,.1f}，更均匀受热贡献 {du:+,.1f}。")
+        return
+    row = ranking.loc[ranking["name"] == ref].iloc[0] if (ranking["name"] == ref).any() else None
+    if row is None:
+        return
+    dv, de, du = first["delta_value_mwh"], first["delta_energy_mwh"], first["delta_uniformity_mwh"]
+    source = "更多吸热" if abs(de) >= abs(du) else "更均匀受热"
+    _callout("ok", f"{lab(first['name'])} 得分最高，优势主要来自{source}",
+             f"相对 {lab(ref)}：年度价值 {dv:+,.1f} MWhₜₕ = 吸热量 {de:+,.1f} + 均匀性 {du:+,.1f}（−λ_L·ΔΠ）。"
+             "每一项都来自各布局在同一组工况上自己的 APS 方案，可在“逐工况明细”中逐项核对。")
+
+
+def _ranking_table(ranking: pd.DataFrame) -> pd.DataFrame:
+    def statuses(d):
+        return " · ".join(f"{VALUE_STATUS_ZH.get(k, k)} {v}" for k, v in d.items())
+
+    return pd.DataFrame({
+        "排名": ranking["rank"].map(lambda v: "—" if pd.isna(v) else int(v)),
+        "布局": ranking["name"].map(wf.layout_label), "镜数": ranking["n_heliostats"],
+        "年度价值 V (MWhₜₕ)": ranking["value_mwh"].round(1), "吸收热量 E (MWhₜₕ)": ranking["energy_mwh"].round(1),
+        "均匀性扣分 λ_L·Π (MWhₜₕ)": ranking["weighted_penalty_mwh"].round(1),
+        "ΔV": ranking["delta_value_mwh"].round(1), "ΔE（吸热）": ranking["delta_energy_mwh"].round(1),
+        "−λ_LΔΠ（均匀）": ranking["delta_uniformity_mwh"].round(1),
+        "内层差距": ranking["inner_gap_annual"].map(lambda g: _pct(g, 2)),
+        "工况状态": ranking["status_counts"].map(statuses),
+        "周向扣分对照 Π_circ (MWhₜₕ)": ranking["circ_penalty_mwh"].round(1)})
+
+
+def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bound: dict | None = None,
+                   dense: dict | None = None, disp: dict | None = None, run_dir=None, swaps=None,
+                   cross: dict | None = None) -> None:
+    """Formal comparison of layouts by V(L): ranking, decomposition, per-scenario plans, maps, audit."""
+    from cspaps.layout_value import compare_values, eval_grid_shape
+
+    key = f"fv_{key}"  # widget keys of this view never collide with the pre-screen view
+    labels = _labels(values)
+    _value_kpis(values, ranking, bound, sset)
+    _decision_callout(values, ranking)
+    tabs = st.tabs(["排名与优势分解", "逐工况明细", "工况与 DNI 地图", "与初始布局对照", "最优性与误差", "导出与复算"])
+    with tabs[0]:
+        a, b = st.columns([1.2, 1])
+        with a:
+            _chart(value_decomposition_chart(ranking, labels), f"{key}_decomp")
+        with b:
+            lam_now = float(ranking["lambda_layout"].iloc[0])
+            lam = st.slider("外层权重 λ_L 重新计分（不重新求解瞄准方案）", 0.0, max(2.0, 2 * lam_now), lam_now, 0.05,
+                            key=f"{key}_lam")
+            totals = {n: v.totals() for n, v in values.items()}
+            _chart(lambda_sweep_chart(totals, labels, lam, max(1.0, 2 * lam_now)), f"{key}_sweep")
+        shown = compare_values(list(values.values()), lam, reference=ranking["reference"].iloc[0]) if lam != lam_now else ranking
+        st.dataframe(_ranking_table(shown), hide_index=True)
+        st.caption("V(L) = Σ_s h_s (P_s − λ_L·U_s)。内层用 λ_APS 选瞄准方案，外层只按 λ_L 对这组方案的 P_s、U_s 重新计分，"
+                   "每个工况的惩罚只扣一次；改变 λ_L 时各直线斜率为 −Π，交点处排名互换。周向扣分仅作对照，不参与排名。")
+        if swaps:
+            st.dataframe(pd.DataFrame([{"轮次": w["round"], "布局": wf.layout_label(w["layout"]), "换位镜数": w["swapped"],
+                                        "ΔV (MWhₜₕ)": round(w["gain_value_mwh"], 2), "ΔE (MWhₜₕ)": round(w["gain_energy_mwh"], 2),
+                                        "接受": "是" if w["accepted"] else "否"} for w in swaps]), hide_index=True)
+            st.caption("换位：移出 APS 年吸热最少的镜子、换入定价最高的空闲候选镜位；只有在同一工况集上 V 提高才接受。")
+    names = list(values)
+    with tabs[1]:
+        c1, c2, c3 = st.columns(3)
+        na = c1.selectbox("布局 A", names, index=0, format_func=labels.get, key=f"{key}_la")
+        others = [n for n in names if n != na] or names
+        default_b = others.index("initial") if "initial" in others else 0
+        nb = c2.selectbox("布局 B", others, index=default_b, format_func=labels.get, key=f"{key}_lb")
+        lam = float(ranking["lambda_layout"].iloc[0])
+        ta, tb = values[na].table(lam), values[nb].table(lam)
+        _chart(scenario_contrib_chart({na: ta, nb: tb}, labels, lam), f"{key}_contrib")
+        view = pd.DataFrame({
+            "工况": ta["scenario_id"], "DNI 地图": ta["map_id"], "代表小时 h": ta["hours"].round(2),
+            "太阳 高度/方位 (°)": [f"{e:.1f} / {z:.0f}" for e, z in zip(ta["elevation_deg"], ta["azimuth_deg"])],
+            "工况 DNI": ta["dni_w_m2"].round(0),
+            "A 状态": ta["status"].map(VALUE_STATUS_ZH), "A: P (MW)": ta["p_abs_mw"].round(3), "A: U (MW)": ta["u_mw"].round(3),
+            "A: 贡献 (MWhₜₕ)": ta["contribution_mwh"].round(1),
+            "B 状态": tb["status"].map(VALUE_STATUS_ZH), "B: P (MW)": tb["p_abs_mw"].round(3), "B: U (MW)": tb["u_mw"].round(3),
+            "B: 贡献 (MWhₜₕ)": tb["contribution_mwh"].round(1),
+            "A − B (MWhₜₕ)": (ta["contribution_mwh"] - tb["contribution_mwh"]).round(1)})
+        st.dataframe(view, hide_index=True, height=320)
+        st.caption(f"A = {labels[na]}，B = {labels[nb]}。贡献 = h·(P − λ_L·U)，只对“可行运行”工况计入；其余状态见“最优性与误差”。")
+        sid = st.selectbox("查看工况", list(ta["scenario_id"]), key=f"{key}_sid",
+                           format_func=lambda i: f"{i} · {ta.set_index('scenario_id').loc[i, 'map_id']}")
+        i = sset.index(sid)
+        nz, nax = eval_grid_shape(case)
+        grid = build_grid(case.receiver, nax, nz)
+        m = sset.samples.map_of(i)
+        pa, pb = values[na].plan(sid), values[nb].plan(sid)
+        zmax = max(float(np.max(p.flux)) if p.flux is not None else 0.0 for p in (pa, pb)) / 1e3 or None
+        dmax = max(float(np.max(pa.dni)), float(np.max(pb.dni))) if pa.dni.size else None
+        l, r = st.columns(2)
+        for col, name, p in ((l, na, pa), (r, nb, pb)):
+            with col:
+                st.markdown(f"**{labels[name]}** · {VALUE_STATUS_ZH.get(p.status, p.status)}")
+                _kpis([("P", f"{p.p_abs_w / 1e6:.3f}", "MW"), ("U", f"{p.u_w / 1e6:.3f}", "MW", f"CV {_format_number(p.cv_2d, 3)}"),
+                       ("J = P − λ_APS·U", f"{p.objective_w / 1e6:.3f}", "MW", f"差距 ≤ {_pct(p.gap, 2)}"),
+                       ("峰值", f"{p.peak_flux_kw_m2:.0f}", "kW/m²", f"散焦 {p.n_defocused} 面")])
+                v = values[name]
+                _chart(field_dni_map(case, v.xyz, v.ids, p.dni, dni_map=m,
+                                     map_scale=float(sset.samples.dni[i]) if m.unit == "factor" else 1.0,
+                                     title=f"{sid} 镜场 DNI（底图为该工况的场地 DNI 地图）", cmin=0, cmax=dmax, height=400),
+                       f"{key}_dni_{name}_{sid}")
+                if p.flux is not None:
+                    _chart(receiver_aims_map(case, grid, p.flux, p.aim_azimuth, p.aim_z, p.active, v.ids, p.dni,
+                                             title="吸热器热流与瞄准点（该布局自己的 APS 方案）", zmax=zmax, height=380),
+                           f"{key}_rec_{name}_{sid}")
+    with tabs[2]:
+        tbl = sset.table()
+        a, b = st.columns([1, 1])
+        with a:
+            _chart(scenario_sky_chart(tbl), f"{key}_sky")
+        with b:
+            rec = sset.record()
+            st.markdown(f"- 工况数 **{rec['n_scenarios']}**，代表小时合计 {rec['total_hours']:,.0f} h，DNI 能量 {rec['annual_dni_kwh_m2']:,.0f} kWh/m²\n"
+                        f"- 来源：{rec.get('source', '—')}\n- 生成：{rec.get('generation', '—')}\n"
+                        f"- 地图分配：{rec.get('map_assignment', '—')}；每张地图的工况数 {rec.get('states_per_regime', '—')}\n"
+                        f"- 指纹 `{rec['fingerprint']}`：比较布局时工况集、地图、代表小时数、两项权重和求解精度都相同")
+        maps = sset.subset_maps()
+        cols = st.columns(min(3, max(len(maps), 1)))
+        any_xyz = next(iter(values.values())).xyz
+        for k, (mid, m) in enumerate(maps.items()):
+            with cols[k % len(cols)]:
+                _chart(dni_map_chart(case, m, title=f"{mid}", xyz=any_xyz), f"{key}_map_{mid}")
+                st.caption(f"{m.description} · 单位 {m.unit} · {m.normalization}")
+        st.dataframe(pd.DataFrame([{"地图": k, "单位": m.unit, "来源": m.source, "坐标系": m.crs, "插值": m.interpolation,
+                                    "归一化": m.normalization, "栅格": f"{m.x.size}×{m.y.size} · {m.cell_m:g} m",
+                                    "范围": f"{m.values.min():.3f} – {m.values.max():.3f}"} for k, m in maps.items()]),
+                     hide_index=True)
+        st.dataframe(tbl, hide_index=True, height=280)
+    with tabs[3]:
+        if "initial" not in values:
+            st.info("本次比较没有初始布局。")
+        else:
+            other = [n for n in ranking["name"] if n != "initial"]
+            pick = st.selectbox("对照的布局", other, format_func=labels.get, key=f"{key}_cmp") if other else None
+            if pick:
+                from cspaps.layout_value import displacement
+
+                d = displacement(values["initial"].xyz, values[pick].xyz)
+                ti, tp = values["initial"].totals(), values[pick].totals()
+                _kpis([("年度价值 ΔV", f"{tp['value_mwh'] - ti['value_mwh']:+,.1f}", "MWhₜₕ", f"{labels[pick]} − 初始布局"),
+                       ("吸热量 ΔE", f"{tp['energy_mwh'] - ti['energy_mwh']:+,.1f}", "MWhₜₕ"),
+                       ("均匀性 −λ_LΔΠ", f"{-ti['lambda_layout'] * (tp['penalty_mwh'] - ti['penalty_mwh']):+,.1f}", "MWhₜₕ"),
+                       ("移动的镜子", f"{d.get('n_moved', '—')}", "面",
+                        f"平均移动 {d.get('mean_move_m', 0):.1f} m · 最大 {d.get('max_move_m', 0):.0f} m" if d.get("comparable") else "")])
+                a, b = st.columns([1.3, 1])
+                with a:
+                    match = (d["match_from"], d["match_to"], d["distance_m"]) if d.get("comparable") else None
+                    _chart(layout_overlay(case, values["initial"].xyz, values[pick].xyz, match,
+                                          ("初始布局", labels[pick])), f"{key}_overlay")
+                with b:
+                    sh_p, cen = _sector_share(values[pick], case)
+                    sh_i, _ = _sector_share(values["initial"], case)
+                    _chart(receiver_rose(sh_p, cen, ("初始布局", sh_i)), f"{key}_rose")
+                    st.caption("各朝向（30° 扇区）分得的全年吸收热量占比，来自各布局自己的逐工况 APS 方案热流。")
+    with tabs[4]:
+        tables = {n: v.table() for n, v in values.items()}
+        _chart(inner_gap_chart(tables, labels), f"{key}_gap")
+        st.caption("内层差距 = 1 − 本工况方案的 J / 该工况的可证上界（联合姿态支撑平面或无遮挡能量上界）。"
+                   "差距越小，P_s、U_s 越接近该布局在这个工况下的最优运行能力。")
+        rows = []
+        for n, v in values.items():
+            tot = v.totals()
+            for stt, cnt in tot["status_counts"].items():
+                rows.append({"布局": labels[n], "状态": VALUE_STATUS_ZH.get(stt, stt), "工况数": cnt,
+                             "代表小时": tot["status_hours"].get(stt), "计入规则": VALUE_STATUS_RULE.get(stt, "")})
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        if bound:
+            st.markdown(f"**外层上界**：{bound.get('applies_to', '')}。任意 N 面镜布局、任意瞄准点的年吸收热量 ≤ "
+                        f"{bound.get('upper_bound_mwh', 0):,.0f} MWhₜₕ（单镜潜力 + 圆盘堆积，按工况地图取每个栅格的 DNI 最大值）；"
+                        f"由于 U ≥ 0，V ≤ E ≤ 上界，保守差距 {_pct(bound.get('gap_value_conservative'), 1)}。")
+        if dense:
+            d = pd.DataFrame(dense["rows"])
+            st.markdown(f"**代表工况误差**：同一布局在 {dense['n_scenarios']} 个更密工况上的复核"
+                        f"（排序{'一致' if dense['same_order'] else '不一致'}）。")
+            st.dataframe(pd.DataFrame({"布局": d["name"].map(wf.layout_label), "V（代表工况）": d["value_rep_mwh"].round(1),
+                                       "V（更密工况）": d["value_dense_mwh"].round(1), "V 误差 %": d["value_error_pct"].round(2),
+                                       "E 误差 %": d["energy_error_pct"].round(2)}), hide_index=True)
+        if cross:
+            ok = cross["winner_still_ahead"]
+            _callout("ok" if ok else "warn", "独立云图复核" + ("：胜出布局仍领先" if ok else "：胜出布局不再领先"),
+                     f"换一组随机云图（种子 {cross['seed']}）重新求解：胜出布局领先初始布局 "
+                     f"{cross['lead_formal_mwh']:+,.0f} → {cross['lead_independent_mwh']:+,.0f} MWhₜₕ。"
+                     + ("" if ok else "说明优势来自躲开固定位置的云影（对云图过拟合），不是可靠的设计结论；"
+                                      "请增加云图张数，或改用持久性的空间 DNI 地图。"))
+        st.caption("小镜场的内层（联合姿态穷举）与外层（全部候选组合）都有穷举对照测试（tests/test_layout_value.py）。"
+                   "中心瞄准的逐时复核只验证中心瞄准指标，不用于 V(L)。")
+    with tabs[5]:
+        if run_dir is not None:
+            vdir = Path(run_dir) / "formal" / "values"
+            if not vdir.exists():
+                vdir = Path(run_dir) / "values"
+            if vdir.exists():
+                for csv in sorted(vdir.glob("*/scenario_values.csv")):
+                    st.download_button(f"下载 {wf.layout_label(csv.parent.name.replace('_plus_', '+'))} 的逐工况记录",
+                                       csv.read_bytes(), file_name=f"{csv.parent.name}_scenario_values.csv",
+                                       key=f"{key}_dl_{csv.parent.name}")
+                rk = vdir / "formal_ranking.csv"
+                if rk.exists():
+                    st.download_button("下载排名表", rk.read_bytes(), file_name=rk.name, key=f"{key}_dl_rank")
+                st.caption(f"逐镜瞄准方案：{vdir}/<布局>/aims/<工况>.csv（编号、坐标、DNI、是否工作、瞄准方位与高度、吸收功率）。")
+                if st.button("仅凭导出文件复算全部得分", key=f"{key}_recompute"):
+                    lam = float(ranking["lambda_layout"].iloc[0])
+                    rec = wf.task_rescore(vdir, lam)["summary"]["layouts"]
+                    mem = {n.replace("+", "_plus_"): v.totals(lam)["value_mwh"] for n, v in values.items()}
+                    st.session_state[f"{key}_recheck"] = [
+                        {"布局": wf.layout_label(r["layout"].replace("_plus_", "+")), "复算 V": round(r["value_mwh"], 4),
+                         "界面 V": round(mem.get(r["layout"], float("nan")), 4),
+                         "一致": "✓" if abs(r["value_mwh"] - mem.get(r["layout"], np.inf)) < 1e-6 * max(1.0, abs(r["value_mwh"]))
+                         else "✗"} for r in rec]
+                if st.session_state.get(f"{key}_recheck"):
+                    st.dataframe(pd.DataFrame(st.session_state[f"{key}_recheck"]), hide_index=True)
+        st.latex(r"V(L)=\sum_s h_s\,\big(P_s-\lambda_L\,U_s\big),\qquad U_s=A_H\,\sigma_H(q_s)")
+        st.caption("复算只需 scenario_values.csv 的 hours、p_abs_mw、u_mw、status 四列和 λ_L：对 status = feasible 的行求和。")
+
+
+def _scenario_inputs(case) -> None:
+    """Scenario set, spatial DNI maps and the two weights (layout page)."""
+    from cspaps.dni_maps import model_maps
+
+    data = st.session_state["case_dict"]
+    ver = st.session_state["ver"]
+    _fields("layout_opt", ["ranking", "baseline"], n_cols=2)
+    lo_d = data.setdefault("layout_opt", {})
+    follow = st.checkbox("内层 λ_APS 沿用问题一的均匀度权重", value=case.layout_opt.aps_weight is None, key=f"{ver}:follow_aps")
+    if follow:
+        lo_d["aps_weight"] = None
+        st.caption(f"内层 λ_APS = {case.uniformity.weight if case.uniformity.enabled and case.uniformity.mode == 'weighted' else 0:g}"
+                   "（问题一的权重模式；功率模式时为 0）")
+    else:
+        lo_d["aps_weight"] = float(st.slider("内层权重 λ_APS（决定每个工况怎样瞄准）", 0.0, 2.0,
+                                             float(case.layout_opt.aps_weight or 0.0), 0.05, key=f"{ver}:aps_w"))
+    _fields("scenarios", ["n_scenarios", "map_model"], n_cols=2)
+    model = (data.get("scenarios") or {}).get("map_model", case.scenarios.map_model)
+    if model in ("half_swap", "gradient"):
+        _fields("scenarios", ["map_contrast", "map_axis_deg"] + (["map_edge_m"] if model == "half_swap" else []), n_cols=3)
+    elif model == "clouds":
+        _fields("scenarios", ["cloud_maps", "cloud_n", "cloud_radius_m", "cloud_transmittance", "seed"], n_cols=2)
+        if case.scenarios.cloud_maps < 8:
+            _callout("warn", "云影图张数偏少",
+                     "云影是转瞬即逝的：每张云图在全年按日轮换重复使用，张数少时布局搜索会“学会”躲开这几块固定位置的云，"
+                     "得到对建模假设过拟合的布局。建议 ≥ 8 张，并换一个随机种子复核排名（「两套布局逐工况对比」）。")
+    elif model == "file":
+        up = st.file_uploader("DNI 地图库 CSV（map_id,x,y,value；场地坐标，m）", type=["csv"], key="map_lib_up")
+        if up is not None and st.session_state.get("map_lib_loaded") != (up.name, up.size):
+            data.setdefault("scenarios", {})["map_file"] = str(_save_upload(up))
+            st.session_state["map_lib_loaded"] = (up.name, up.size)
+            st.session_state["ver"] += 1
+            st.rerun()
+        _fields("scenarios", ["map_unit", "map_normalize"], n_cols=2)
+    with st.expander("工况与地图的高级设置"):
+        _fields("scenarios", ["map_include_uniform", "map_assignment", "map_sequence", "map_cell_m", "dni_bands",
+                              "source", "file"] + ([] if model == "file" else ["map_normalize"]), n_cols=2)
+        _fields("layout_opt", ["formal_swap_rounds", "dense_check_scenarios", "inner_joint_trials",
+                               "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"], n_cols=2)
+    c2, _ = _case()
+    if c2 is not None:
+        try:
+            maps = model_maps(c2)
+            fld = build_field(c2)
+            cols = st.columns(min(2, len(maps)))
+            for k, (mid, m) in enumerate(list(maps.items())[:4]):
+                with cols[k % len(cols)]:
+                    _chart(dni_map_chart(c2, m, title=mid, height=260, xyz=fld.xyz), f"map_prev_{mid}_{ver}")
+        except Exception as exc:  # noqa: BLE001 - preview only
+            st.caption(f"地图预览不可用：{exc}")
+
+
+def _value_compare_section(case) -> None:
+    """Compare any two layouts of equal size on the same scenario set (formal V)."""
+    with _card("value_compare"):
+        _section(4, "两套布局逐工况对比",
+                 "选两套等镜数布局，在同一组年度空间 DNI 工况上逐个求解问题一，比较 V(L)，并说明优势来自更多吸热还是更均匀受热。")
+        opts = {"initial": "初始布局（最靠近塔的 N 面）", "opt": "本次布局优化的结果", "upload": "上传布局 CSV"}
+        c1, c2 = st.columns(2)
+        sel, ups = {}, {}
+        for col, tag in ((c1, "A"), (c2, "B")):
+            with col:
+                avail = [k for k in opts if k != "opt" or st.session_state.get("res_opt") is not None]
+                default = ("opt" if "opt" in avail else "initial") if tag == "A" else "initial"
+                sel[tag] = st.radio(f"布局 {tag}", avail, index=avail.index(default), format_func=opts.get,
+                                    key=f"vc_{tag}")
+                if sel[tag] == "upload":
+                    ups[tag] = st.file_uploader(f"布局 {tag} CSV（id,x,y[,z]）", type=["csv"], key=f"vc_up_{tag}")
+        layouts, blockers = {}, []
+        for tag in ("A", "B"):
+            if sel[tag] == "initial":
+                layouts["initial" if "initial" not in layouts else f"initial_{tag}"] = "initial"
+            elif sel[tag] == "opt":
+                layouts[f"optimized_{tag}"] = st.session_state["res_opt"]["result"].best.xyz
+            elif ups.get(tag) is None:
+                blockers.append(f"请上传布局 {tag}")
+            else:
+                layouts[f"upload_{tag}"] = str(_save_upload(ups[tag]))
+        _job_button("lv", "▶  按年度价值 V(L) 对比两套布局", wf.task_layout_value, layouts=layouts, blockers=blockers,
+                    progress=True, cancellable=True)
+        _job_error("lv")
+    res = st.session_state.get("res_lv")
+    if res is not None:
+        if not res["summary"].get("equal_heliostat_count"):
+            st.warning("两套布局镜数不同，年度价值可以比较，但不满足“等镜数”的验收口径。")
+        _render_values(res_case(res), res["values"], res["ranking"], res["scenario_set"], "lv", run_dir=res["run_dir"])
+
+
+def res_case(res: dict):
+    return load_case(Path(res["run_dir"]) / "inputs_case.yaml")
 
 
 # --------------------------------------------------------------------------- replay
@@ -1674,7 +2192,37 @@ def _ops_replay(case) -> None:
 def page_theory(case) -> None:
     _hero("方法与理论", "两个优化问题的数学表述、解的存在性与可证明上界",
           "本页说明软件求解的是什么问题、为什么最优解存在、软件如何证明给出的方案离全局最优有多远，以及模型的适用范围。")
-    t1, t2, t3, t4 = st.tabs(["光学模型", "问题一 · 瞄准优化", "问题二 · 布局优化", "适用范围"])
+    t1, t2, t3, t5, t4 = st.tabs(["光学模型", "问题一 · 瞄准优化", "问题二 · 布局优化", "年度价值 · 空间 DNI", "适用范围"])
+    with t5:
+        _section(None, "工况与空间 DNI 地图")
+        st.markdown("每个代表工况 $s$ 给出太阳方向、代表小时数 $h_s$ 和一张覆盖整个场地的 DNI 地图 $D_s(x,y)$。"
+                    "地图定义在场地坐标里（x 东、y 北，原点为塔底），与布局无关：第 $i$ 面镜读 $D_s(x_i,y_i)$，"
+                    "移动镜位就在同一张图上按新坐标重新取值。地图为规则栅格，双线性插值，栅格外取边缘值。")
+        st.latex(r"D_s(x,y)=G_s\,f_{r(s)}(x,y),\qquad \frac{1}{|\Omega|}\int_\Omega f_r\,dA=1")
+        st.markdown("$G_s$ 来自站址逐时 DNI；$f_r$ 是地图（倍数），平均为 1 时只在空间上重新分配辐照。"
+                    "逐时数据按日轮换分配到各地图 $r$，在每张地图的小时内按 DNI 能量加权聚类出代表工况，"
+                    "$G_s h_s$ 等于成员小时的 DNI 能量，因此")
+        st.latex(r"\sum_s h_s\,\overline{D_s}^{\,\Omega}=\sum_s h_s G_s=\sum_t w_t G_t")
+        _section(None, "内层：每个布局、每个工况各自求解问题一")
+        st.latex(r"a_s(L)=\arg\max_{a}\;P_s(a)-\lambda_{APS}\,U_s(a),\qquad U_s=A_H\,\sigma_H(q_s)")
+        st.markdown("$P_s$ 为该方案联合姿态下（阴影遮挡按各镜自己的姿态重算）的吸收功率，$U_s$ 为考核区二维吸收热流的面积加权"
+                    "标准差乘面积，在与布局无关的固定网格上计算；全部散焦是可行的停机方案，所以最优解存在。")
+        _section(None, "外层：同一组方案上的年度价值")
+        st.latex(r"V(L)=\sum_s h_s\big(P_s-\lambda_L U_s\big)=E(L)-\lambda_L\,\Pi(L),\qquad "
+                 r"E=\sum_s h_sP_s,\;\;\Pi=\sum_s h_sU_s")
+        st.markdown(r"- λ_L = λ_APS 时 $V=\sum_s h_s J_s$；两者不同时内层权重决定运行策略，外层权重评价它实现的功率与均匀性，"
+                    "每个工况的惩罚只扣一次。\n"
+                    r"- 方案固定时 $V$ 对 λ_L 是直线，斜率 $-\Pi$：改变 λ_L 不需要重新求解。" "\n"
+                    r"- 两个布局之差 $V_A-V_B=(E_A-E_B)-\lambda_L(\Pi_A-\Pi_B)$，前一项是“更多吸热”，后一项是“更均匀受热”。" "\n"
+                    "- 先在每个工况考核热流不均匀，再累计年度价值，不同时间的热点不会在年平均图上相互抵消。")
+        _section(None, "状态与计分")
+        st.dataframe(pd.DataFrame({"状态": [VALUE_STATUS_ZH[k] for k in VALUE_STATUS_RULE],
+                                   "计入年度价值": list(VALUE_STATUS_RULE.values())}), hide_index=True)
+        _section(None, "最优性结论的范围")
+        st.markdown("- **内层**：每个工况给出可证上界与差距（小镜场穷举联合姿态即证最优）。\n"
+                    r"- **外层**：任意 N 面镜布局、任意瞄准点，$V\le E\le$ 单镜潜力 + 圆盘堆积上界；地图下每个栅格取 DNI 最大值，"
+                    "上界只对所用工况集成立。\n"
+                    "- **采样**：在更密工况上复核胜出布局与初始布局，报告代表工况的误差与排序是否一致。")
     with t1:
         _section(None, "单镜功率链")
         st.latex(r"P_i = \mathrm{DNI}_i\,A\;\eta_{\cos}\;\rho\,c\;\eta_{shd}\;\eta_{blk}\;\eta_{att}\;\eta_{int}")
@@ -1759,11 +2307,190 @@ def page_theory(case) -> None:
                     "客户提供真实数据后直接替换即可。")
 
 
+# --------------------------------------------------------------------------- single-instant cloud comparison
+
+CLOUD_SHORT = {"clear": "① 云前 · 方案 A", "cloud_keep": "③ 云来 · 沿用 A", "cloud_aps": "④ 云来 · 重新 APS",
+               "clear_keep": "⑤ 云散 · 仍用 C", "cloud_safe": "④′ 云来 · 防云散 APS", "clear_safe": "⑤′ 云散 · 用 S"}
+
+
+def _state_numbers(s: dict, ref: dict | None = None) -> None:
+    def delta(key, digits=2, unit=""):
+        if ref is None:
+            return ""
+        d = s[key] - ref[key]
+        return f"较云前 {d:+.{digits}f}{unit}"
+
+    tone = "good" if s["flux_status"] == "ok" else ("warn" if s["flux_status"] == "margin_reduced" else "bad")
+    _kpis([
+        ("吸收热功率 P", f"{s['p_abs_mw']:.3f}", "MW", delta("p_abs_mw", 3, " MW")),
+        ("不均匀量 U = A_H·σ_H", f"{s['u_mw']:.3f}", "MW", f"二维 CV {_format_number(s['cv_2d'], 3)} · 周向 {_format_number(s['cv_circ'], 3)}"),
+        ("目标 J = P − λU", f"{s['objective_mw']:.3f}", "MW", delta("objective_mw", 3, " MW")),
+        ("峰值热流（细网格复核）", f"{s['peak_flux_kw_m2']:.0f}", "kW/m²", f"占设备上限 {100 * s['peak_to_limit']:.0f}%", tone),
+        ("工作 / 散焦镜", f"{s['n_active']} / {s['n_defocused']}", "面", f"相对方案 A 改变瞄准 {s['n_changed_vs_a']} 面"),
+    ])
+
+
+def _cloud_compare_inputs(case) -> None:
+    with _card("cloud_inputs"):
+        _section(1, "设定时刻与随机云", "云影冻结在所选时刻：先求晴空下的瞄准方案 A，再让云落到镜场上，对比“沿用 A”与“重新 APS”。")
+        default_time = pd.Timestamp(case.realtime.start)
+        c1, c2, c3, c4 = st.columns(4)
+        date = c1.date_input("日期", value=default_time.date(), key=f"cc_date:{case.name}")
+        tm = c2.time_input("当地时间", value=default_time.time(), key=f"cc_time:{case.name}", step=300)
+        n_cl = c3.number_input("云的数量", 1, 8, 2, key="cc_n")
+        seed = c4.number_input("随机种子（换一组云）", 0, 9999, 3, key="cc_seed")
+        c1, c2, c3 = st.columns(3)
+        rad = c1.slider("云影半径范围 (m)", 20, 400, (60, 140), 10, key="cc_rad")
+        tau = c2.slider("云影透过率范围", 0.0, 1.0, (0.10, 0.35), 0.05, key="cc_tau",
+                        help="云影中心处 DNI 保留的比例，0 = 完全遮挡。")
+        u = case.uniformity
+        lam0 = float(u.weight) if (u.enabled and u.mode == "weighted") else 0.0
+        lam = c3.slider("瞄准均匀度权重 λ", 0.0, 2.0, lam0, 0.05, key="cc_lam",
+                        help="问题一的目标 P − λ·A_H·σ_H；λ = 0 只追求吸收功率。")
+        _job_button("cloud", "▶  计算 云前 / 云来 / 重新 APS 对比", wf.task_cloud_compare, f"{date} {tm}",
+                    n_clouds=int(n_cl), radius_m=tuple(float(v) for v in rad), transmittance=tuple(float(v) for v in tau),
+                    seed=int(seed), lam_aps=float(lam), progress=True)
+        _job_error("cloud")
+
+
+def _cloud_results(res: dict) -> None:
+    st_ = {s["key"]: s for s in res["states"]}
+    for k, s in st_.items():
+        s["short"] = CLOUD_SHORT[k]
+    case, fld, grid = res["case"], res["field"], res["grid"]
+    summ = res["summary"]
+    a, b, c, d = st_["clear"], st_["cloud_keep"], st_["cloud_aps"], st_["clear_keep"]
+    safe, safe_clear = st_["cloud_safe"], st_["clear_safe"]
+    lam = summ["lambda_aps"]
+    cmin, cmax = 0.0, float(np.max(a["dni"])) * 1.02
+    zmax = max(float(np.max(s["flux"])) for s in res["states"]) / 1e3
+    _section(None, "云影对比结果",
+             f"{summ['time'][:16].replace('T', ' ')} · 太阳高度角 {summ['sun_elevation_deg']:.1f}° · 晴空 DNI {summ['dni_clear_w_m2']:.0f} W/m² · "
+             f"λ = {lam:g} · {summ['n_heliostats']} 面定日镜")
+    _kpis([
+        ("① 云前吸收功率", f"{a['p_abs_mw']:.2f}", "MW", f"二维 CV {_format_number(a['cv_2d'], 3)}"),
+        ("③ 云来 · 不改策略", f"{b['p_abs_mw']:.2f}", "MW",
+         f"{100 * (b['p_abs_mw'] / max(a['p_abs_mw'], 1e-9) - 1):+.1f}% · CV {_format_number(b['cv_2d'], 3)}", "warn"),
+        ("④ 云来 · 重新 APS", f"{c['p_abs_mw']:.2f}", "MW",
+         f"目标 J {c['objective_mw'] - b['objective_mw']:+.3f} MW · CV {_format_number(c['cv_2d'], 3)}", "good"),
+        ("被云遮挡", f"{summ['shaded_heliostats']}", "面", f"平均透过率 {100 * summ['mean_transmittance']:.0f}%", "navy"),
+        ("⑤ 云突然散去 · 仍用 C", f"{d['peak_flux_kw_m2']:.0f}", "kW/m²", f"占上限 {100 * d['peak_to_limit']:.0f}%",
+         "bad" if d["peak_to_limit"] > 1 else ("warn" if d["peak_to_limit"] > 0.95 else "good")),
+    ])
+    gain = c["objective_mw"] - b["objective_mw"]
+    _callout("info", "怎么读这组结果",
+             f"云遮住 {summ['shaded_heliostats']} 面镜后，沿用晴空方案的吸收功率降到 {b['p_abs_mw']:.2f} MW，受热也变得不均匀"
+             f"（CV {_format_number(a['cv_2d'], 3)} → {_format_number(b['cv_2d'], 3)}）。按云下 DNI 重新求解后，目标 J 提高 {gain:.3f} MW，"
+             f"CV 回到 {_format_number(c['cv_2d'], 3)}。如果云在执行方案 C 时突然散去，峰值为设备上限的 {100 * d['peak_to_limit']:.0f}%；"
+             f"按晴空 DNI 校核通量的方案 S 在云散后峰值为上限的 {100 * safe_clear['peak_to_limit']:.0f}%。")
+    tabs = st.tabs(["① 云来之前", "② 云来了 · DNI 变化", "③ 不改变策略", "④ 重新 APS", "⑤ 云散风险与防云散方案", "全部数值与下载"])
+    with tabs[0]:
+        _state_numbers(a)
+        l, r = st.columns([1, 1.25])
+        with l:
+            _chart(field_dni_map(case, fld.xyz, fld.ids, a["dni"], title="镜场 DNI（晴空，全场均匀）", cmin=cmin, cmax=cmax,
+                                 height=430), "cc_dni_a")
+        with r:
+            _chart(receiver_aims_map(case, grid, a["flux"], a["aim_azimuth"], a["aim_z"], a["active"], fld.ids, a["dni"],
+                                     title="吸热器展开 · 热流与每面镜中心的瞄准点（点色 = 该镜 DNI）", zmax=zmax, cmin=cmin, cmax=cmax, height=430),
+                   "cc_rec_a")
+        l, r = st.columns(2)
+        with l:
+            _chart(aim_scene_3d(case, fld.xyz, a["dni"], a["aim_azimuth"], a["aim_z"], a["active"],
+                                title="三维示意：镜面中心 → 瞄准点（抽样光束）", cmin=cmin, cmax=cmax), "cc_3d_a")
+        with r:
+            _chart(receiver_aims_3d(case, grid, a["flux"], fld.xyz, a["aim_azimuth"], a["aim_z"], a["active"], a["dni"],
+                                    fld.ids, title="吸热器近景：热流与全部瞄准点（短线指向各自的镜子）", zmax=zmax), "cc_r3d_a")
+    with tabs[1]:
+        tau = res["transmittance"]
+        _kpis([("平均 DNI（云前 → 云来）", f"{np.mean(a['dni']):.0f} → {np.mean(b['dni']):.0f}", "W/m²"),
+               ("最低 DNI", f"{np.min(b['dni']):.0f}", "W/m²", "云影中心"),
+               ("被遮挡（透过率 < 95%）", f"{summ['shaded_heliostats']}", "面", f"占 {100 * summ['shaded_heliostats'] / fld.n:.0f}%"),
+               ("云影", f"{len(res['clouds'])}", "块", " · ".join(f"r {cl.radius:.0f} m, τ {cl.transmittance:.2f}"
+                                                                  for cl in res["clouds"][:3]))])
+        l, r = st.columns(2)
+        with l:
+            _chart(field_dni_map(case, fld.xyz, fld.ids, a["dni"], title="云来之前", cmin=cmin, cmax=cmax, height=430),
+                   "cc_dni_a2")
+        with r:
+            _chart(field_dni_map(case, fld.xyz, fld.ids, b["dni"], clouds=res["clouds"], title="云来之后（虚线为云影边界）",
+                                 cmin=cmin, cmax=cmax, height=430), "cc_dni_b")
+        st.caption(f"透过率分布：最小 {tau.min():.2f}，中位 {np.median(tau):.2f}；云影边缘按平滑过渡建模。")
+    with tabs[2]:
+        _state_numbers(b, a)
+        l, r = st.columns([1.25, 1])
+        with l:
+            _chart(receiver_aims_map(case, grid, b["flux"], b["aim_azimuth"], b["aim_z"], b["active"], fld.ids, b["dni"],
+                                     title="沿用方案 A：瞄准点不变（点色 = 云下 DNI）", zmax=zmax, cmin=cmin, cmax=cmax, height=420), "cc_rec_b")
+        with r:
+            _chart(flux_diff_map(case, grid, a["flux"], b["flux"], "热流变化（云来 · 沿用 A − 云前）"), "cc_diff_ab")
+        st.caption("被遮挡镜子的光斑变暗，原本相互补齐的热流出现缺口：总吸热减少，受热不均匀度上升。")
+    with tabs[3]:
+        _state_numbers(c, a)
+        l, r = st.columns([1.25, 1])
+        with l:
+            _chart(receiver_aims_map(case, grid, c["flux"], c["aim_azimuth"], c["aim_z"], c["active"], fld.ids, c["dni"],
+                                     prev=(a["aim_azimuth"], a["aim_z"], a["active"]),
+                                     title="重新 APS：新瞄准点（白线 = 从方案 A 的移动）", zmax=zmax, cmin=cmin, cmax=cmax, height=420), "cc_rec_c")
+        with r:
+            _chart(flux_diff_map(case, grid, b["flux"], c["flux"], "热流变化（重新 APS − 沿用 A）"), "cc_diff_bc")
+        l, r = st.columns(2)
+        with l:
+            _chart(aim_scene_3d(case, fld.xyz, c["dni"], c["aim_azimuth"], c["aim_z"], c["active"],
+                                title="三维示意：云下的新方案", cmin=cmin, cmax=cmax), "cc_3d_c")
+        with r:
+            _chart(receiver_aims_3d(case, grid, c["flux"], fld.xyz, c["aim_azimuth"], c["aim_z"], c["active"], c["dni"],
+                                    fld.ids, title="吸热器近景：新瞄准点", zmax=zmax), "cc_r3d_c")
+        st.caption(f"{c['n_changed_vs_a']} 面镜子改变了瞄准点，平均移动 {c['mean_aim_shift_m']:.2f} m（吸热器表面）。"
+                   "方案 A 也参与了重新求解的比较，所以重新 APS 的目标值不会低于沿用 A。")
+    with tabs[4]:
+        l, r = st.columns(2)
+        with l:
+            st.markdown("**云突然散去，仍执行方案 C**")
+            _state_numbers(d, a)
+            _chart(receiver_aims_map(case, grid, d["flux"], d["aim_azimuth"], d["aim_z"], d["active"], fld.ids, d["dni"],
+                                     title="晴空 DNI 下执行云下方案 C", zmax=zmax, cmin=cmin, cmax=cmax, height=380, hotspot=d["hotspot"]), "cc_rec_d")
+        with r:
+            st.markdown("**防云散方案 S：通量按晴空 DNI 校核，目标按云下 DNI**")
+            _state_numbers(safe_clear, a)
+            _chart(receiver_aims_map(case, grid, safe_clear["flux"], safe_clear["aim_azimuth"], safe_clear["aim_z"],
+                                     safe_clear["active"], fld.ids, safe_clear["dni"], title="云散后执行方案 S",
+                                     zmax=zmax, cmin=cmin, cmax=cmax, height=380, hotspot=safe_clear["hotspot"]), "cc_rec_s")
+        st.caption(f"云下方案 S 的吸收功率 {safe['p_abs_mw']:.3f} MW（方案 C {c['p_abs_mw']:.3f} MW）：为云突然散去预留的代价。"
+                   "在线引擎的“含 DNI 预测”策略按同样的原则约束通量。")
+    with tabs[5]:
+        states = res["states"]
+        _chart(state_bars(states), "cc_bars")
+        tbl = pd.DataFrame([{
+            "状态": s["short"], "平均 DNI (W/m²)": round(float(np.mean(s["dni"])), 1), "吸收功率 P (MW)": round(s["p_abs_mw"], 4),
+            "截获功率 (MW)": round(s["p_int_mw"], 4), "U = A_H·σ_H (MW)": round(s["u_mw"], 4), "J = P − λU (MW)": round(s["objective_mw"], 4),
+            "二维 CV": _format_number(s["cv_2d"], 4), "周向 CV": _format_number(s["cv_circ"], 4),
+            "峰值 (kW/m²)": round(s["peak_flux_kw_m2"], 1), "占上限": f"{100 * s['peak_to_limit']:.1f}%",
+            "复核": STATE_ZH.get(s["flux_status"], s["flux_status"]) if s["flux_status"] != "over_limit" else "超限",
+            "工作镜": s["n_active"], "散焦镜": s["n_defocused"], "相对 A 改变": s["n_changed_vs_a"]} for s in states])
+        st.dataframe(tbl, hide_index=True)
+        _show_files(res, images=[])
+
+
+def _cloud_compare(case) -> None:
+    if case is None:
+        st.warning("请先在「参数设置」中修正当前算例。")
+        return
+    _cloud_compare_inputs(case)
+    res = st.session_state.get("res_cloud")
+    if res is not None:
+        _cloud_results(res)
+
+
 def page_replay(case) -> None:
-    _hero("运行仿真", "云影回放",
-          "模拟云层经过镜场时在线 APS 引擎的逐周期决策：对比中心瞄准、仅用当前 DNI、含 DNI 预测三种策略的吸热量、"
-          "超限时长、均匀度与端到端延迟。", [case.name] if case else [])
-    _ops_replay(case)
+    _hero("运行仿真", "云影与在线 APS",
+          "单时刻对比：云来之前的镜场 DNI、各定日镜中心对应的瞄准点和吸热器热流；云来以后不改策略与重新 APS 的热流、总热量和"
+          "均匀性。时序回放：在线引擎逐周期决策，对比中心瞄准、仅用当前 DNI、含 DNI 预测三种策略。", [case.name] if case else [])
+    t1, t2 = st.tabs(["单时刻云影对比", "时序回放（在线引擎）"])
+    with t1:
+        _cloud_compare(case)
+    with t2:
+        _ops_replay(case)
 
 
 # --------------------------------------------------------------------------- optics & other pages

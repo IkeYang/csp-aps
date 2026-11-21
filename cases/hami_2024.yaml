@@ -1,0 +1,185 @@
+# Hami (Xinjiang) design study: the same synthetic plant as the Aksai demo at a higher latitude.
+# Weather: NASA POWER 2024 hourly ALLSKY_SFC_SW_DNI at 42.80 N, 93.50 E, hourly averages at local interval midpoints.
+# Field and receiver are simulation inputs, not plant records. x = east, y = north, z = up (m), origin at the tower base.
+name: hami_2024
+
+site:
+  latitude: 42.8
+  longitude: 93.5
+  elevation_m: 800
+  timezone: Asia/Shanghai
+
+receiver:
+  center: [0, 0, 100]
+  diameter: 7.0
+  height: 8.0
+  max_flux_kw_m2: 1000
+  n_azimuth: 48
+  n_height: 24
+  tower_diameter: 8.0
+  absorptivity: 0.95
+  n_panels: 12
+  panel_start_azimuth_deg: -15
+
+heliostat:
+  width: 8.0
+  height: 8.0
+  pivot_height: 5.0
+  reflectivity: 0.94
+  cleanliness: 0.97
+  slope_error_mrad: 1.5
+  tracking_error_mrad: 1.0
+  focusing: slant_range
+
+sun:
+  shape: gaussian
+  sigma_mrad: 2.51
+  dni_model: meinel
+
+atmosphere:
+  model: vittitoe_biggs_clear
+
+weather:
+  source: file
+  file: hami_2024_dni.csv
+
+shading:
+  enabled: true
+  n_points: 5
+  tower_shadow: true
+
+field:
+  generator:
+    type: radial_staggered
+    r_min: 50
+    r_max: 220
+    spacing_factor: 1.1
+    radial_spacing: 0.866
+    radial_growth: 0.3
+    azimuthal_spacing: 1.2
+  boundary:
+    - [-420, -300]
+    - [420, -300]
+    - [420, 480]
+    - [-420, 480]
+  exclusion_radius: 50
+
+aps:
+  method: greedy
+  safety_margin: 0.05
+  n_height_levels: 7
+  height_span: 0.9
+  azimuth_offsets_deg: [-6, 0, 6]
+  passes: 2
+  tie_tolerance: 0.005
+  allow_defocus: true
+  verify: true
+  auto_grid: true
+  verify_max_rounds: 3
+
+uniformity:
+  enabled: true
+  mode: weighted
+  max_cv: 0.55
+  weight: 0.3
+  panels: null
+  z_range: null
+  min_load_mw: 0.0
+  mu_iters: 8
+  passes: 2
+
+engine:
+  period_s: 60
+  command_latency_s: 5
+  max_dni_age_s: 90
+  forecast_margin: 0.05
+  no_forecast_policy: clear_sky
+  stale_policy: clear_sky
+  response_refresh_deg: 0.3
+  timeout_s: 20
+  fallback: hold_or_defocus
+
+realtime:
+  start: "2024-06-10 13:00"
+  duration_min: 8
+  step_s: 60
+  forecast_horizon_s: 120
+  forecast_step_s: 15
+  scenario: clouds
+  strategies: [center, aps_reactive, aps_predictive]
+  random_clouds:
+    n: 2
+    seed: 17
+    radius_m: [70, 130]
+    transmittance: [0.1, 0.35]
+    speed_m_s: 8
+    direction_deg: 110
+    edge_m: 30
+
+annual:
+  method: sun_bins
+  n_sun_bins: 4
+  dni_bands: 2
+  workers: 1
+  year: 2024
+  day_of_month: 15
+  time_step_min: 60
+  min_sun_elevation_deg: 5
+  aiming: greedy
+
+layout_opt:
+  generator: radial_staggered
+  n_heliostats: 473
+  bounds:
+    radial_spacing: [0.866, 1.4]
+    radial_growth: [0.0, 1.0]
+    azimuthal_spacing: [1.0, 1.8]
+  fixed:
+    spacing_factor: 1.1
+  search_sampling: sun_bins
+  search_aiming: center
+  n_sun_bins: 12
+  review_sampling: sun_bins
+  review_n_sun_bins: 6
+  review_dni_bands: 1
+  review_check_hourly: true
+  maxiter: 4
+  popsize: 4
+  seed: 7
+  workers: 4
+  polish_rounds: 2
+  refine_top: 2
+  swap_rounds: 1
+  swap_fraction: 0.02
+  shading_points: 4
+  upper_bound: true
+  uniformity_weight: 0.3          # outer weight lambda_L of V(L) = sum_s h_s (P_s - lambda_L U_s)
+  ranking: aps_value              # formal ranking: every shortlisted layout gets its own APS plan per scenario
+  aps_weight: null                # inner weight lambda_APS (null = uniformity.weight of problem 1)
+  baseline: initial               # rank the initial field (the 473 heliostats above) as well
+  formal_swap_rounds: 1
+  inner_joint_trials: 2
+  inner_certify_rounds: 0
+  dense_check_scenarios: 0        # e.g. 24: re-check winner and initial field on a denser scenario set
+
+# Annual scenarios: sun direction, representative hours and a site DNI map per scenario.
+# Modelling assumption: broken-cumulus days. Ten independent cloud-shadow maps (3 soft shadows each, radius
+# 60-160 m, transmittance 0.2-0.6) are assigned to the days in turn; each map is normalised to site mean 1, so
+# the station DNI remains the site-mean DNI and the annual DNI energy is unchanged. Cloud shadows are
+# transient: with only a few maps the layout search learns to avoid their fixed positions (see README), so
+# use many maps (>= 8) and check the ranking on independent maps (another seed).
+scenarios:
+  n_scenarios: 20
+  map_model: clouds
+  cloud_maps: 10
+  cloud_n: 3
+  cloud_radius_m: [60, 160]
+  cloud_transmittance: [0.2, 0.6]
+  seed: 11
+  map_cell_m: 20
+
+mcrt:
+  rays_per_heliostat: 300
+  seed: 7
+  n_seeds: 2
+  tracking_mode: per_ray

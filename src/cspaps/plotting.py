@@ -214,3 +214,55 @@ def plot_uniformity_curve(curve: list[dict], path: str | Path | None = None):
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     return _finish(fig, path)
+
+
+def plot_cloud_compare(xyz: np.ndarray, rec: Receiver, grid: ReceiverGrid, states: list[dict],
+                       path: str | Path | None = None, boundary=None):
+    """Field DNI (top row) and receiver flux with aim points (bottom row) for each cloud-compare state."""
+    n = len(states)
+    fig, axes = plt.subplots(2, n, figsize=(4.4 * n, 7.6), squeeze=False)
+    vmax_d = max(float(np.max(s["dni"])) for s in states) or 1.0
+    vmax_f = max(float(np.max(s["flux"])) for s in states) / 1e3 or 1.0
+    for k, s in enumerate(states):
+        ax = axes[0, k]
+        sc = ax.scatter(xyz[:, 0], xyz[:, 1], s=max(1.5, min(7.0, 3000.0 / max(len(xyz), 1))), c=s["dni"],
+                        cmap="cividis", vmin=0, vmax=vmax_d)
+        off = ~np.asarray(s["active"], bool)
+        if off.any():
+            ax.scatter(xyz[off, 0], xyz[off, 1], s=10, marker="x", c="red", lw=0.8)
+        if boundary is not None:
+            b = np.asarray(list(boundary) + [boundary[0]], dtype=float)
+            ax.plot(b[:, 0], b[:, 1], "k--", lw=0.6)
+        ax.plot(rec.center[0], rec.center[1], marker="^", color="tab:red", ms=7)
+        ax.set_aspect("equal")
+        ax.set_title(f"{s.get('label_en', s['label'])}\nmean DNI {np.mean(s['dni']):.0f} W/m²", fontsize=9)
+        fig.colorbar(sc, ax=ax, shrink=0.7, label="DNI (W/m²)")
+        ax = axes[1, k]
+        _flux_axes(ax, fig, s["flux"], grid, rec, vmax=vmax_f)
+        on = np.asarray(s["active"], bool)
+        ax.scatter(np.asarray(s["aim_azimuth"])[on] % 360.0, np.asarray(s["aim_z"])[on], s=3, c="#4fc3f7",
+                   alpha=0.5, lw=0)
+        ax.set_title(f"P_abs {s['p_abs_mw']:.2f} MW, U {s['u_mw']:.2f} MW, peak {s['peak_flux_kw_m2']:.0f} kW/m²",
+                     fontsize=8.5)
+    fig.tight_layout()
+    return _finish(fig, path)
+
+
+def plot_dni_maps(maps: dict, path: str | Path | None = None, boundary=None, tower=(0.0, 0.0)):
+    """Site DNI maps (factor or W/m2) side by side."""
+    keys = list(maps)
+    n = max(len(keys), 1)
+    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4.0), squeeze=False)
+    for k, key in enumerate(keys):
+        m = maps[key]
+        ax = axes[0, k]
+        im = ax.pcolormesh(m.x, m.y, m.values, shading="nearest", cmap="cividis")
+        if boundary is not None:
+            b = np.asarray(list(boundary) + [boundary[0]], dtype=float)
+            ax.plot(b[:, 0], b[:, 1], "w--", lw=0.7)
+        ax.plot(tower[0], tower[1], marker="^", color="tab:red", ms=7)
+        ax.set_aspect("equal")
+        ax.set_title(f"{key} ({m.unit})", fontsize=9)
+        fig.colorbar(im, ax=ax, shrink=0.75)
+    fig.tight_layout()
+    return _finish(fig, path)

@@ -110,3 +110,24 @@ def test_site_change_warns_about_the_weather_file(monkeypatch, tmp_path):
     assert any("站址已修改" in m.value for m in at.markdown)
     at.button(key="clear_layout").click().run()
     assert at.session_state["case_dict"]["weather"]["source"] == "clear_sky"
+
+
+def test_daylight_saving_weather_file_loads(tmp_path):
+    """Adelaide (DST): the repeated 02:00 at the April fall-back and the skipped hour in October."""
+    import pandas as pd
+
+    from cspaps import case_from_dict, sun
+
+    times = pd.date_range("2024-04-06 22:00", "2024-04-07 06:00", freq="h").strftime("%Y-%m-%d %H:%M:%S").tolist()
+    times += pd.date_range("2024-10-06 00:00", "2024-10-06 05:00", freq="h").strftime("%Y-%m-%d %H:%M:%S").tolist()
+    path = tmp_path / "adelaide.csv"
+    pd.DataFrame({"time": times, "dni": 0.0}).to_csv(path, index=False)
+    case = case_from_dict({"site": {"latitude": -32.5, "longitude": 137.8, "timezone": "Australia/Adelaide"},
+                           "receiver": {"center": [0, 0, 60], "diameter": 6, "height": 6},
+                           "heliostat": {"width": 6, "height": 6, "pivot_height": 4},
+                           "weather": {"source": "file", "file": str(path)}, "annual": {"year": 2024}},
+                          base_dir=tmp_path)
+    series = sun.load_weather(case)
+    assert len(series) == len(times) and series.index.is_monotonic_increasing
+    idx = sun.to_times(["2024-10-06 02:30"], "Australia/Adelaide")  # does not exist: shifted forward
+    assert idx[0].hour == 3

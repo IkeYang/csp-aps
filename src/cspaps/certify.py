@@ -606,9 +606,12 @@ def lone_heliostat_energy(case, xy: np.ndarray, samples, chunk: int = 4000) -> n
         az, z = default_aim(rec, xyz)
         aim = surface_point(rec, az, z)
         e = np.zeros(len(p))
-        for el, sa, dni, w in zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h):
+        spatial = getattr(samples, "spatial", False)
+        for k, (el, sa, dni, w) in enumerate(zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h)):
             if el <= 0 or dni <= 0 or w <= 0:
                 continue
+            if spatial:  # the DNI map of the state, read at each position
+                dni = samples.dni_at(k, p)
             s = sun.sun_vector(el, sa)
             _, t, slant, cos_inc = optics.heliostat_geometry(xyz, aim, s)
             sigma = optics.beam_sigma(slant, cos_inc, hel, case.sun)
@@ -641,6 +644,8 @@ def cell_energy_upper_bound(case, centers_xy: np.ndarray, half_m: float, samples
                     with any_aim, else facing azimuths +- asin(5 sigma_max / R)), plus the 5-sigma tail at
                     the largest absorptivity of all panels.
     Shading, blocking and flux limits only remove energy, so the bound also holds with neighbours.
+    With spatial DNI maps (``samples.spatial``) the DNI of each state is replaced by the largest map
+    value anywhere in the cell (``DNIMap.box_max``), so the bound holds for every position in the cell.
     """
     from scipy.special import ndtr
 
@@ -664,8 +669,10 @@ def cell_energy_upper_bound(case, centers_xy: np.ndarray, half_m: float, samples
     starts = rec.panel_start_azimuth_deg + width * np.arange(rec.n_panels)
     tail = 2.0 * (1.0 - ndtr(TAIL_K))
     const = hel.area * hel.reflectivity * hel.cleanliness
-    states = [(float(el), float(sa), float(dni) * float(w)) for el, sa, dni, w in
-              zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h) if el > 0 and dni > 0 and w > 0]
+    states = [(k, float(el), float(sa), float(dni) * float(w)) for k, (el, sa, dni, w) in
+              enumerate(zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h))
+              if el > 0 and dni > 0 and w > 0]
+    spatial = getattr(samples, "spatial", False)
     for start in range(0, len(xy), chunk):
         p = xy[start:start + chunk]
         xyz = np.column_stack([p, np.full(len(p), hel.pivot_height)])
@@ -707,7 +714,12 @@ def cell_energy_upper_bound(case, centers_xy: np.ndarray, half_m: float, samples
             hit = np.abs(rel) <= reach[:, None] + 0.5 * width
             a_ub = np.where(hit, alpha[None, :], 0.0).max(axis=1)
         e = np.zeros(len(p))
-        for el, sa, weight in states:
+        for k, el, sa, weight in states:
+            if spatial:
+                # the largest map value anywhere in the cell (exact bound of the bilinear map) times the hours
+                m = samples.map_of(k)
+                peak = m.box_max(p, half_m)
+                weight = float(samples.weight_h[k]) * (peak * float(samples.dni[k]) if m.unit == "factor" else peak)
             s = sun.sun_vector(el, sa)
             theta_c = np.arccos(np.clip((v @ s) / np.maximum(dc, 1e-9), -1.0, 1.0))
             cos_ub = np.where(regular, np.cos(np.maximum(theta_c - delta, 0.0) / 2.0), 1.0)
@@ -769,6 +781,15 @@ def hourly_site_upper_bound(case, n_heliostats, spacing_m, hourly, pmap):
     vectors = sun.sun_vector(hourly.elevation, hourly.azimuth)
     weights = hourly.dni * hourly.weight_h
     bins = np.floor(hourly.azimuth / 15).astype(int) + 24 * np.floor(hourly.elevation / 10).astype(int)
+    spatial = getattr(hourly, "spatial", False)
+    regime = np.asarray(hourly.map_index, dtype=int) if spatial else np.zeros(len(hourly), dtype=int)
+    bins = bins + 100_000 * regime  # with spatial maps the DNI weight of a cell is the map maximum in it
+    factor_of = {}
+    if spatial:
+        centres = np.column_stack([xx.ravel(), yy.ravel()])
+        for r in np.unique(regime):
+            m = hourly.maps[int(r)]
+            factor_of[int(r)] = (m.box_max(centres, pmap.cell_m / 2.0).reshape(xx.shape), m.unit)
     envelope = np.zeros_like(distance)
     for label in np.unique(bins):
         subset = bins == label
@@ -779,7 +800,13 @@ def hourly_site_upper_bound(case, n_heliostats, spacing_m, hourly, pmap):
         length = np.linalg.norm(mean)
         angle = np.arccos(np.clip((direction @ mean) / max(length, 1e-15), -1, 1))
         dot_max = np.minimum(1.0, length * np.cos(np.maximum(0, angle - cone)))
-        envelope += mass * np.sqrt((1 + dot_max) / 2)
+        scale = 1.0
+        if spatial:
+            fmax, unit = factor_of[int(regime[subset][0])]
+            if unit != "factor":
+                raise ValueError("hourly bound needs factor maps (absolute maps come with a scenario table)")
+            scale = fmax
+        envelope += mass * scale * np.sqrt((1 + dot_max) / 2)
     h = case.heliostat
     alpha = max(case.receiver.panel_absorptivity or [case.receiver.absorptivity])
     envelope *= h.area * h.reflectivity * h.cleanliness * alpha / 1e6

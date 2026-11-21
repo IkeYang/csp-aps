@@ -15,7 +15,8 @@ from pathlib import Path
 from . import workflows as wf
 from .config import load_case
 
-BAD_STATUS = {"infeasible", "uniformity_infeasible", "capacity_shortfall", "constraint_violation", "missed_losses"}
+BAD_STATUS = {"infeasible", "uniformity_infeasible", "capacity_shortfall", "constraint_violation", "missed_losses",
+              "incomplete", "proven_infeasible", "no_feasible_found"}
 
 
 def _print(result: dict) -> int:
@@ -78,6 +79,25 @@ def build_parser() -> argparse.ArgumentParser:
                     help="lambda_L: weight of the circumferential receiver non-uniformity (0 = energy only)")
     sp = add("layout-tradeoff", "annual energy vs circumferential uniformity of the layout over lambda_L")
     sp.add_argument("--lambdas", type=float, nargs="*", default=None)
+    sp = add("scenarios", "build and save the annual scenario set (sun, hours, spatial DNI map per scenario)")
+    sp.add_argument("--n", type=int, default=None, help="number of scenarios (default scenarios.n_scenarios)")
+    sp = add("scenario-aps", "task 1 for one scenario of a scenario set on one layout (independent score check)")
+    sp.add_argument("--id", required=True, help="scenario ID, e.g. S03")
+    sp.add_argument("--scenarios", default=None, help="saved scenario-set folder (default: build from the case)")
+    sp.add_argument("--layout", default=None, help="layout CSV id,x,y[,z] or 'initial' (default: the case field)")
+    sp = add("layout-value", "rank layouts by V(L) = sum_s h_s (P_s - lambda_L U_s) with per-scenario APS")
+    sp.add_argument("--layouts", nargs="*", default=None, help="layout CSV files (and/or 'initial')")
+    sp.add_argument("--scenarios", default=None, help="saved scenario-set folder (default: build from the case)")
+    sp.add_argument("--lambda-layout", type=float, default=None, help="outer weight lambda_L (default layout_opt)")
+    sp = sub.add_parser("rescore", help="recompute V(L) from exported scenario_values.csv files for another lambda_L")
+    sp.add_argument("folder")
+    sp.add_argument("--lambda-layout", type=float, required=True)
+    sp = add("cloud-compare", "one instant before / after a cloud: keep the plan vs re-solve APS")
+    sp.add_argument("--time", required=True)
+    sp.add_argument("--clouds", type=int, default=2, help="number of cloud shadows")
+    sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--radius", type=float, nargs=2, default=[60.0, 140.0])
+    sp.add_argument("--transmittance", type=float, nargs=2, default=[0.1, 0.35])
     sp = add("uniformity", "power vs uniformity (CV) curve and edge-band bound at one instant")
     sp.add_argument("--time", required=True)
     sp.add_argument("--eps", type=float, nargs="*", default=None, help="CV targets (default: around the greedy CV)")
@@ -121,6 +141,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.case:
             cmd += ["--case", str(Path(args.case).resolve())]
         return subprocess.call(cmd)
+    if args.command == "rescore":
+        res = wf.task_rescore(args.folder, args.lambda_layout)
+        print(json.dumps(res["summary"], indent=2, ensure_ascii=False, default=str))
+        return 0
     case = load_case(args.case)
     if args.command == "engine":
         wf.engine_service(case, sys.stdin, lambda s: (sys.stdout.write(s + "\n"), sys.stdout.flush()))
@@ -158,6 +182,19 @@ def main(argv: list[str] | None = None) -> int:
         res = wf.task_fetch_weather(case, out, year=args.year)
     elif args.command == "layout-tradeoff":
         res = wf.task_layout_tradeoff(case, out, lambdas=args.lambdas, progress=_progress)
+    elif args.command == "scenarios":
+        res = wf.task_scenarios(case, out, n=args.n)
+    elif args.command == "scenario-aps":
+        res = wf.task_scenario_aps(case, out, args.id, scenarios_dir=args.scenarios, layout=args.layout)
+    elif args.command == "layout-value":
+        names = args.layouts or ["initial"]
+        layouts = {("initial" if v == "initial" else Path(v).stem): v for v in names}
+        res = wf.task_layout_value(case, out, layouts, scenarios_dir=args.scenarios, lam_layout=args.lambda_layout,
+                                   progress=_progress)
+    elif args.command == "cloud-compare":
+        res = wf.task_cloud_compare(case, out, args.time, n_clouds=args.clouds, seed=args.seed,
+                                    radius_m=tuple(args.radius), transmittance=tuple(args.transmittance),
+                                    progress=_progress)
     elif args.command == "uniformity":
         res = wf.task_uniformity(case, out, args.time, eps_values=args.eps, exact=args.exact)
     elif args.command == "validate":

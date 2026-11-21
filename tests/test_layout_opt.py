@@ -27,7 +27,9 @@ def test_optimize_layout_runs(small_case):
     assert s["n_heliostats"] == small_case.layout_opt.n_heliostats
     assert s["annual_energy_mwh_center_aiming"] > 0
     assert s["annual_energy_mwh_with_aps"] is not None
-    assert s["annual_energy_mwh_with_aps"] <= s["annual_energy_mwh_center_aiming"] * 1.001
+    # formal ranking: E of the winner's own per-scenario APS plans stays below the bound for any layout
+    assert s["annual_energy_mwh_with_aps"] <= s["upper_bound"]["upper_bound_mwh"]
+    assert s["annual_value_mwh"] <= s["annual_energy_mwh_with_aps"] + 1e-6
     assert len(res.history) >= 2
     assert res.history["energy_mwh"].is_monotonic_decreasing
     assert set(res.history["stage"]) == {"global", "local"}
@@ -43,6 +45,7 @@ def test_optimize_layout_parallel(small_case):
 
 
 def test_review_ranking_and_validation(small_case):
+    small_case.layout_opt.ranking = "legacy"  # the 0.4 constrained-APS review path
     small_case.layout_opt.refine_top = 2
     small_case.layout_opt.review_n_sun_bins = 6
     small_case.layout_opt.review_dni_bands = 2

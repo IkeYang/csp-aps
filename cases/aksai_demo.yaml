@@ -146,14 +146,33 @@ layout_opt:
   maxiter: 4
   popsize: 4
   seed: 7
-  workers: 1
+  workers: 4
   polish_rounds: 2
   refine_top: 2
   swap_rounds: 1
   swap_fraction: 0.02
   shading_points: 4
   upper_bound: true
-  uniformity_weight: 0.3
+  uniformity_weight: 0.3          # outer weight lambda_L of V(L) = sum_s h_s (P_s - lambda_L U_s)
+  ranking: aps_value              # formal ranking: every shortlisted layout gets its own APS plan per scenario
+  aps_weight: null                # inner weight lambda_APS (null = uniformity.weight of problem 1)
+  baseline: initial               # rank the initial field (the 473 heliostats above) as well
+  formal_swap_rounds: 1
+  inner_joint_trials: 2
+  inner_certify_rounds: 0
+  dense_check_scenarios: 0        # e.g. 24: re-check winner and initial field on a denser scenario set
+
+# Annual scenarios: sun direction, representative hours and a site DNI map per scenario.
+# Modelling assumption (no measured DNI network at the site): the station DNI is the site mean; on alternate
+# days the east or the west half of the site is 30 % brighter than the other half (soft edge 40 m through the
+# tower). Both maps have site mean 1, so the site's annual DNI energy equals the weather file's.
+scenarios:
+  n_scenarios: 12
+  map_model: half_swap
+  map_contrast: 0.3
+  map_axis_deg: 90
+  map_edge_m: 40
+  map_cell_m: 20
 
 mcrt:
   rays_per_heliostat: 300

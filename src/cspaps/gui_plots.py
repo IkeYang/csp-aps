@@ -375,3 +375,350 @@ def refinement_chart(levels: list[dict], height: int = 320):
     fig.update_xaxes(title="每面镜的候选瞄准点数", type="log")
     fig.update_yaxes(title="目标函数 (MW)")
     return _base_layout(fig, "", height)
+
+
+# --------------------------------------------------------------------------- aims, clouds and annual value
+
+DNI_SCALE = [[0.0, "#1f3a5f"], [0.35, "#5f7a99"], [0.6, "#b9a77a"], [0.8, "#eaa53a"], [1.0, "#d9480f"]]
+# shadow = dark slate blue, full sun = amber / orange: readable on a white background
+DIFF_SCALE = [[0.0, "#2b5d9b"], [0.5, "#f7f7f5"], [1.0, "#b8432f"]]
+
+
+def _cylinder(rec, n: int = 48):
+    th = np.linspace(0, 2 * np.pi, n)
+    return th, np.sin(th), np.cos(th)
+
+
+def _mirror_colors(values, cmin=None, cmax=None):
+    v = np.asarray(values, dtype=float)
+    lo = float(np.nanmin(v)) if cmin is None else cmin
+    hi = float(np.nanmax(v)) if cmax is None else cmax
+    return v, lo, hi if hi > lo else lo + 1.0
+
+
+def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_lines: int = 140,
+                 title: str = "", height: int = 520, cmin=None, cmax=None):
+    """Whole plant in 3-D: heliostats coloured by DNI, a sample of beams from each mirror centre to its aim point."""
+    from .receiver import surface_point
+
+    rec = case.receiver
+    cx, cy, cz = rec.center
+    xyz = np.asarray(xyz, float)
+    act = np.asarray(active, bool)
+    v, lo, hi = _mirror_colors(dni, cmin, cmax)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers", name="定日镜（按 DNI 着色）",
+                               marker=dict(size=2.8, color=v, colorscale=DNI_SCALE, cmin=lo, cmax=hi, showscale=True,
+                                           colorbar=dict(title="DNI<br>W/m²", thickness=10, len=0.55, x=1.0)),
+                               hovertemplate="x %{x:.0f} m, y %{y:.0f} m<br>DNI %{marker.color:.0f} W/m²<extra></extra>"))
+    if (~act).any():
+        k = np.flatnonzero(~act)
+        fig.add_trace(go.Scatter3d(x=xyz[k, 0], y=xyz[k, 1], z=xyz[k, 2], mode="markers", name="散焦",
+                                   marker=dict(size=3.5, color=RED, symbol="x"), hoverinfo="skip"))
+    aims = surface_point(rec, np.asarray(aim_az, float), np.asarray(aim_z, float))
+    on = np.flatnonzero(act)
+    if on.size:
+        order = on[np.argsort(np.degrees(np.arctan2(xyz[on, 0] - cx, xyz[on, 1] - cy)) % 360.0, kind="stable")]
+        pick = order[np.linspace(0, order.size - 1, min(max_lines, order.size)).astype(int)]
+        lx, ly, lz = [], [], []
+        for i in pick:
+            lx += [xyz[i, 0], aims[i, 0], None]
+            ly += [xyz[i, 1], aims[i, 1], None]
+            lz += [xyz[i, 2], aims[i, 2], None]
+        fig.add_trace(go.Scatter3d(x=lx, y=ly, z=lz, mode="lines", name=f"反射光束（抽样 {pick.size} 条）",
+                                   line=dict(color="rgba(224,155,45,0.45)", width=2), hoverinfo="skip"))
+    th, s, c = _cylinder(rec)
+    zt = np.array([0.0, cz - 0.5 * rec.height])
+    fig.add_trace(go.Surface(x=cx + rec.tower_radius * np.outer(s, np.ones(2)), y=cy + rec.tower_radius * np.outer(c, np.ones(2)),
+                             z=np.outer(np.ones_like(th), zt), showscale=False, colorscale=[[0, "#9aa7ad"], [1, "#9aa7ad"]],
+                             hoverinfo="skip", name="塔"))
+    zr = np.array([cz - 0.5 * rec.height, cz + 0.5 * rec.height])
+    fig.add_trace(go.Surface(x=cx + rec.radius * np.outer(s, np.ones(2)), y=cy + rec.radius * np.outer(c, np.ones(2)),
+                             z=np.outer(np.ones_like(th), zr), showscale=False, colorscale=[[0, AMBER], [1, AMBER]],
+                             hoverinfo="skip", name="吸热器"))
+    span = float(np.ptp(xyz[:, :2], axis=0).max()) if len(xyz) else 400.0
+    fig.update_layout(scene=dict(xaxis_title="东 x (m)", yaxis_title="北 y (m)", zaxis_title="z (m)",
+                                 aspectmode="manual", aspectratio=dict(x=1, y=1, z=max(0.25, 1.6 * cz / max(span, 1.0))),
+                                 camera=dict(eye=dict(x=-1.3, y=-1.5, z=0.8))),
+                      legend=dict(orientation="h", y=0.02))
+    return _base_layout(fig, title, height)
+
+
+def receiver_aims_3d(case: Case, grid: ReceiverGrid, flux_w_m2, xyz: np.ndarray, aim_az, aim_z, active, dni=None,
+                     ids=None, title: str = "", height: int = 520, zmax=None, stub_m: float | None = None):
+    """Receiver close-up: flux on the cylinder, every mirror's aim point and a short stub towards that mirror."""
+    from .receiver import surface_point
+
+    rec = case.receiver
+    cx, cy, _ = rec.center
+    kw = np.asarray(flux_w_m2).reshape(grid.shape) / 1e3
+    az = np.radians(np.concatenate([grid.azimuth_deg, grid.azimuth_deg[:1] + 360.0]))
+    kw2 = np.hstack([kw, kw[:, :1]])
+    zz, aa = np.meshgrid(grid.z, az, indexing="ij")
+    fig = go.Figure(go.Surface(x=cx + rec.radius * np.sin(aa), y=cy + rec.radius * np.cos(aa), z=zz, surfacecolor=kw2,
+                               colorscale=FLUX_SCALE, cmin=0, cmax=zmax, opacity=0.97, name="入射热流",
+                               colorbar=dict(title="kW/m²", thickness=10, len=0.6, x=1.02),
+                               hovertemplate="%{surfacecolor:.0f} kW/m²<extra></extra>"))
+    act = np.asarray(active, bool)
+    on = np.flatnonzero(act)
+    aims = surface_point(rec, np.asarray(aim_az, float), np.asarray(aim_z, float))
+    if on.size:
+        d = np.asarray(xyz, float)[on] - aims[on]
+        d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
+        stub = stub_m or 0.45 * rec.diameter
+        tip = aims[on] + stub * d
+        lx = np.column_stack([aims[on, 0], tip[:, 0], np.full(on.size, np.nan)]).ravel()
+        ly = np.column_stack([aims[on, 1], tip[:, 1], np.full(on.size, np.nan)]).ravel()
+        lz = np.column_stack([aims[on, 2], tip[:, 2], np.full(on.size, np.nan)]).ravel()
+        fig.add_trace(go.Scatter3d(x=lx, y=ly, z=lz, mode="lines", line=dict(color="rgba(79,195,247,0.18)", width=2),
+                                   name="来光方向（指向镜子）", hoverinfo="skip"))
+        vals = np.asarray(dni, float)[on] if dni is not None else None
+        txt = [f"镜 {int(ids[i]) if ids is not None else i + 1}<br>瞄准 方位 {np.asarray(aim_az)[i] % 360:.1f}°, 高 {np.asarray(aim_z)[i]:.2f} m"
+               + (f"<br>DNI {np.asarray(dni)[i]:.0f} W/m²" if dni is not None else "") for i in on]
+        fig.add_trace(go.Scatter3d(x=aims[on, 0], y=aims[on, 1], z=aims[on, 2], mode="markers", name="镜面中心瞄准点",
+                                   marker=dict(size=3, color=vals if vals is not None else "#4fc3f7",
+                                               colorscale=DNI_SCALE, showscale=False),
+                                   text=txt, hovertemplate="%{text}<extra></extra>"))
+    span = rec.diameter * 1.4
+    fig.update_layout(scene=dict(xaxis=dict(title="东 x", range=[cx - span, cx + span]),
+                                 yaxis=dict(title="北 y", range=[cy - span, cy + span]), zaxis_title="z (m)",
+                                 aspectmode="data", camera=dict(eye=dict(x=0.9, y=-1.6, z=0.45))),
+                      legend=dict(orientation="h", y=0.02))
+    return _base_layout(fig, title, height)
+
+
+def receiver_aims_map(case: Case, grid: ReceiverGrid, flux_w_m2, aim_az, aim_z, active, ids=None, values=None,
+                      value_label: str = "DNI (W/m²)", prev=None, title: str = "", height: int = 420, zmax=None,
+                      hotspot: dict | None = None, show_flux: bool = True, cmin=None, cmax=None):
+    """Unrolled receiver: flux heat map and every active mirror's aim point (coloured by a mirror attribute);
+    with ``prev`` = (az, z, active) the moved aims get arrows from their previous position."""
+    fig = receiver_map(case, grid, flux_w_m2, title, zmax=zmax, hotspot=hotspot, height=height) if show_flux else go.Figure()
+    if show_flux:  # flux colour bar in the upper half, mirror colour bar in the lower half
+        fig.update_traces(colorbar=dict(len=0.48, y=0.76, thickness=10), selector=dict(type="heatmap"))
+    act = np.asarray(active, bool)
+    on = np.flatnonzero(act)
+    az = np.asarray(aim_az, float) % 360.0
+    zz = np.asarray(aim_z, float)
+    ids = np.arange(1, act.size + 1) if ids is None else np.asarray(ids)
+    if prev is not None:
+        paz, pz, pact = np.asarray(prev[0], float) % 360.0, np.asarray(prev[1], float), np.asarray(prev[2], bool)
+        moved = np.flatnonzero(act & pact & ((np.abs(((paz - az + 180) % 360) - 180) > 1e-6) | (np.abs(pz - zz) > 1e-6)))
+        if moved.size:
+            # unwrap across north: draw the short way round (the segment may leave the 0-360 window)
+            end = paz[moved] + ((az[moved] - paz[moved] + 180.0) % 360.0 - 180.0)
+            lx = np.column_stack([paz[moved], end, np.full(moved.size, np.nan)]).ravel()
+            ly = np.column_stack([pz[moved], zz[moved], np.full(moved.size, np.nan)]).ravel()
+            fig.add_trace(go.Scatter(x=lx, y=ly, mode="lines", line=dict(color="rgba(255,255,255,0.35)", width=0.8),
+                                     name=f"瞄准点移动（{moved.size} 面）", hoverinfo="skip"))
+        gone = np.flatnonzero(pact & ~act)
+        if gone.size:
+            fig.add_trace(go.Scatter(x=paz[gone], y=pz[gone], mode="markers", name=f"改为散焦（{gone.size} 面）",
+                                     marker=dict(symbol="x", size=7, color=RED), hoverinfo="skip"))
+    if on.size:
+        marker = dict(size=6, line=dict(width=0.6, color="white"))
+        if values is not None:
+            v = np.asarray(values, float)[on]
+            marker.update(color=v, colorscale=DNI_SCALE, showscale=True, cmin=cmin, cmax=cmax,
+                          colorbar=dict(title=value_label, thickness=10, len=0.42, y=0.2))
+        else:
+            marker.update(color="#4fc3f7")
+        txt = [f"镜 {ids[i]}<br>方位 {az[i]:.1f}°，高 {zz[i]:.2f} m" +
+               (f"<br>{value_label} {np.asarray(values)[i]:.1f}" if values is not None else "") for i in on]
+        fig.add_trace(go.Scatter(x=az[on], y=zz[on], mode="markers", marker=marker, name="镜面中心的瞄准点",
+                                   text=txt, hovertemplate="%{text}<extra></extra>", customdata=ids[on]))
+    fig.update_xaxes(title="吸热器周向方位（°，北 0° / 东 90°）", range=[0, 360],
+                     tickvals=list(range(0, 361, 45)), ticktext=["北", "东北", "东", "东南", "南", "西南", "西", "西北", "北"])
+    fig.update_yaxes(title="高度 z (m)")
+    return _base_layout(fig, title, height)
+
+
+def flux_diff_map(case: Case, grid: ReceiverGrid, flux_from, flux_to, title: str = "", height: int = 360):
+    d = (np.asarray(flux_to) - np.asarray(flux_from)) / 1e3
+    m = float(np.abs(d).max()) or 1.0
+    fig = go.Figure(go.Heatmap(x=grid.azimuth_deg, y=grid.z, z=d, colorscale=DIFF_SCALE, zmin=-m, zmax=m,
+                               colorbar=dict(title="Δ kW/m²", thickness=12),
+                               hovertemplate="方位 %{x:.1f}°，高度 %{y:.2f} m<br>变化 %{z:+.1f} kW/m²<extra></extra>"))
+    fig.update_xaxes(title="吸热器周向方位（°）", range=[0, 360], tickvals=list(range(0, 361, 45)),
+                     ticktext=["北", "东北", "东", "东南", "南", "西南", "西", "西北", "北"])
+    fig.update_yaxes(title="高度 z (m)")
+    return _base_layout(fig, title, height)
+
+
+def field_dni_map(case: Case, xyz, ids, dni, dni_map=None, clouds=None, inactive=None, title: str = "",
+                  cmin=None, cmax=None, height: int = 480, map_scale: float = 1.0):
+    """Mirrors coloured by their DNI over an optional site raster (DNI map) and cloud outlines."""
+    rec, spec = case.receiver, case.field
+    fig = go.Figure()
+    v, lo, hi = _mirror_colors(dni, cmin, cmax)
+    if dni_map is not None:
+        fig.add_trace(go.Heatmap(x=dni_map.x, y=dni_map.y, z=dni_map.values * map_scale, colorscale=DNI_SCALE,
+                                 zmin=lo, zmax=hi, showscale=False, opacity=0.32, name="DNI 地图", hoverinfo="skip"))
+    if spec.boundary is not None:
+        b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
+        fig.add_trace(go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", line=dict(color=INK, dash="dash", width=1),
+                                 name="场地边界", hoverinfo="skip"))
+    for k, cl in enumerate(clouds or []):
+        th = np.linspace(0, 2 * np.pi, 90)
+        fig.add_trace(go.Scatter(x=cl.x + cl.radius * np.sin(th), y=cl.y + cl.radius * np.cos(th), mode="lines",
+                                 line=dict(color="#5d6d74", width=1.5, dash="dot"), name="云影边界" if k == 0 else None,
+                                 showlegend=k == 0, hoverinfo="skip"))
+    size = float(np.clip(100.0 / np.sqrt(max(len(xyz), 1)), 3, 9))
+    ids = np.asarray(ids)
+    fig.add_trace(go.Scatter(x=xyz[:, 0], y=xyz[:, 1], mode="markers", name="定日镜",
+                               marker=dict(size=size, color=v, colorscale=DNI_SCALE, cmin=lo, cmax=hi, showscale=True,
+                                           line=dict(width=0.5 if dni_map is not None else 0.3,
+                                                     color="#16232b" if dni_map is not None else "white"),
+                                           colorbar=dict(title="DNI (W/m²)", thickness=12)),
+                               customdata=ids, text=[f"镜 {i}<br>DNI {d:.0f} W/m²" for i, d in zip(ids, v)],
+                               hovertemplate="%{text}<extra></extra>"))
+    if inactive is not None and np.any(inactive):
+        k = np.flatnonzero(inactive)
+        fig.add_trace(go.Scatter(x=xyz[k, 0], y=xyz[k, 1], mode="markers", name="散焦",
+                                   marker=dict(size=size + 4, symbol="x-thin", line=dict(width=2, color=RED)),
+                                   hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=[rec.center[0]], y=[rec.center[1]], mode="markers", name="塔",
+                             marker=dict(symbol="triangle-up", size=13, color=RED), hoverinfo="skip"))
+    fig.update_xaxes(title="东向 x (m)", scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title="北向 y (m)")
+    return _base_layout(fig, title, height)
+
+
+def state_bars(states: list[dict], height: int = 340):
+    """Absorbed power, uniformity penalty and objective of the cloud-compare states."""
+    labels = [s["short"] for s in states]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=labels, y=[s["p_abs_mw"] for s in states], name="吸收功率 P", marker_color=TEAL,
+                         text=[f"{s['p_abs_mw']:.2f}" for s in states], textposition="outside"))
+    fig.add_trace(go.Bar(x=labels, y=[s["u_mw"] for s in states], name="不均匀量 U = A_H·σ_H", marker_color="#d98c7f",
+                         text=[f"{s['u_mw']:.2f}" for s in states], textposition="outside"))
+    fig.add_trace(go.Scatter(x=labels, y=[s["objective_mw"] for s in states], mode="markers+text", name="目标 J = P − λU",
+                             marker=dict(symbol="diamond", size=13, color=NAVY), text=[f"{s['objective_mw']:.2f}" for s in states],
+                             textposition="top center"))
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title="MW")
+    return _base_layout(fig, "", height)
+
+
+def value_decomposition_chart(ranking, labels: dict, height: int = 340):
+    """ΔV of every layout against the reference, split into more heat (ΔE) and more uniform heating (−λ_L ΔΠ)."""
+    names = list(ranking["name"])
+    x = [labels.get(n, n) for n in names]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=x, y=ranking["delta_energy_mwh"], name="吸热量差 ΔE", marker_color=TEAL,
+                         hovertemplate="%{x}<br>ΔE %{y:+,.1f} MWhₜₕ<extra></extra>"))
+    fig.add_trace(go.Bar(x=x, y=ranking["delta_uniformity_mwh"], name="均匀性差 −λ_L·ΔΠ", marker_color=AMBER,
+                         hovertemplate="%{x}<br>−λΔΠ %{y:+,.1f} MWhₜₕ<extra></extra>"))
+    fig.add_trace(go.Scatter(x=x, y=ranking["delta_value_mwh"], mode="markers+text", name="年度价值差 ΔV",
+                             marker=dict(symbol="diamond", size=13, color=NAVY),
+                             text=[f"{v:+,.0f}" for v in ranking["delta_value_mwh"]], textposition="top center"))
+    fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+    fig.update_layout(barmode="relative")
+    fig.update_yaxes(title=f"相对 {labels.get(ranking['reference'].iloc[0], ranking['reference'].iloc[0])} (MWhₜₕ)")
+    return _base_layout(fig, "", height)
+
+
+def lambda_sweep_chart(totals: dict, labels: dict, lam_now: float, lam_max: float = 1.0, height: int = 340):
+    """V(L) = E - lambda_L * Pi as straight lines: where they cross, the ranking changes."""
+    lams = np.linspace(0.0, max(lam_max, lam_now * 1.5, 0.1), 60)
+    fig = go.Figure()
+    palette = [TEAL, AMBER, NAVY, RED, "#7b5ea7", "#3b8bc2", "#6b8e23"]
+    for k, (name, t) in enumerate(totals.items()):
+        fig.add_trace(go.Scatter(x=lams, y=t["energy_mwh"] - lams * t["penalty_mwh"], mode="lines",
+                                 name=labels.get(name, name), line=dict(width=2.5, color=palette[k % len(palette)]),
+                                 hovertemplate="λ_L %{x:.2f}: V %{y:,.0f} MWhₜₕ<extra>" + labels.get(name, name) + "</extra>"))
+    fig.add_vline(x=lam_now, line=dict(color=MUTED, dash="dash"), annotation_text=f"当前 λ_L = {lam_now:g}")
+    fig.update_xaxes(title="外层权重 λ_L（内层瞄准方案不变）")
+    fig.update_yaxes(title="年度价值 V (MWhₜₕ)")
+    return _base_layout(fig, "", height)
+
+
+def scenario_contrib_chart(tables: dict, labels: dict, lam: float, height: int = 360):
+    """Per-scenario contributions h_s (P_s - lambda_L U_s) of several layouts."""
+    fig = go.Figure()
+    palette = [TEAL, AMBER, NAVY, RED]
+    for k, (name, t) in enumerate(tables.items()):
+        contrib = t["hours"] * (t["p_abs_mw"] - lam * t["u_mw"]) * t["counts_in_value"]
+        fig.add_trace(go.Bar(x=t["scenario_id"], y=contrib, name=labels.get(name, name),
+                             marker_color=palette[k % len(palette)],
+                             customdata=np.column_stack([t["hours"], t["p_abs_mw"], t["u_mw"], t["map_id"]]),
+                             hovertemplate="%{x} · %{customdata[3]}<br>h = %{customdata[0]:.1f} h<br>"
+                                           "P = %{customdata[1]:.3f} MW, U = %{customdata[2]:.3f} MW<br>"
+                                           "贡献 %{y:,.1f} MWhₜₕ<extra>" + labels.get(name, name) + "</extra>"))
+    fig.update_layout(barmode="group")
+    fig.update_xaxes(title="工况")
+    fig.update_yaxes(title="h·(P − λ_L·U) (MWhₜₕ)")
+    return _base_layout(fig, "", height)
+
+
+def scenario_sky_chart(table, height: int = 340):
+    """Representative sun positions sized by hours and coloured by DNI map."""
+    fig = go.Figure()
+    palette = {m: c for m, c in zip(sorted(set(table["map_id"])), [TEAL, AMBER, NAVY, RED, "#7b5ea7", "#3b8bc2"])}
+    for m, g in table.groupby("map_id", sort=False):
+        fig.add_trace(go.Scatter(x=g["azimuth_deg"], y=g["elevation_deg"], mode="markers+text", name=str(m),
+                                 text=g["scenario_id"], textposition="top center", textfont=dict(size=10),
+                                 marker=dict(size=8 + 22 * np.sqrt(g["hours"] / table["hours"].max()), color=palette[m],
+                                             opacity=0.75, line=dict(color="white", width=1)),
+                                 customdata=np.column_stack([g["hours"], g["dni_w_m2"]]),
+                                 hovertemplate="%{text}<br>方位 %{x:.0f}°，高度角 %{y:.0f}°<br>代表 %{customdata[0]:.0f} h，"
+                                               "DNI %{customdata[1]:.0f} W/m²<extra>%{fullData.name}</extra>"))
+    fig.update_xaxes(title="太阳方位角（°，北 0° / 东 90°）", range=[0, 360], tickvals=list(range(0, 361, 45)))
+    fig.update_yaxes(title="太阳高度角（°）")
+    return _base_layout(fig, "", height)
+
+
+def dni_map_chart(case: Case, dni_map, title: str = "", height: int = 330, xyz=None):
+    rec, spec = case.receiver, case.field
+    fig = go.Figure(go.Heatmap(x=dni_map.x, y=dni_map.y, z=dni_map.values, colorscale=DNI_SCALE,
+                               colorbar=dict(title="倍数" if dni_map.unit == "factor" else "W/m²", thickness=10),
+                               hovertemplate="x %{x:.0f} m, y %{y:.0f} m<br>%{z:.3f}<extra></extra>"))
+    if spec.boundary is not None:
+        b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
+        fig.add_trace(go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", line=dict(color="white", dash="dash", width=1),
+                                 hoverinfo="skip", showlegend=False))
+    if xyz is not None and len(xyz):
+        fig.add_trace(go.Scatter(x=xyz[:, 0], y=xyz[:, 1], mode="markers", hoverinfo="skip", showlegend=False,
+                                   marker=dict(size=2.5, color="rgba(255,255,255,0.6)")))
+    fig.add_trace(go.Scatter(x=[rec.center[0]], y=[rec.center[1]], mode="markers", hoverinfo="skip", showlegend=False,
+                             marker=dict(symbol="triangle-up", size=11, color=RED)))
+    fig.update_xaxes(title="东 x (m)", scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title="北 y (m)")
+    return _base_layout(fig, title, height)
+
+
+def layout_overlay(case: Case, base_xyz, new_xyz, match=None, labels=("初始布局", "优化布局"), height: int = 520):
+    """Two layouts on the site; with a matching (from, to, distance) every moved mirror gets a line."""
+    rec, spec = case.receiver, case.field
+    fig = go.Figure()
+    if spec.boundary is not None:
+        b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
+        fig.add_trace(go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", line=dict(color=INK, dash="dash", width=1),
+                                 name="场地边界", hoverinfo="skip"))
+    if match is not None:
+        fr, to, dist = match
+        moved = dist > 1e-3
+        a, bb = np.asarray(base_xyz)[fr[moved]], np.asarray(new_xyz)[to[moved]]
+        lx = np.column_stack([a[:, 0], bb[:, 0], np.full(len(a), np.nan)]).ravel()
+        ly = np.column_stack([a[:, 1], bb[:, 1], np.full(len(a), np.nan)]).ravel()
+        fig.add_trace(go.Scatter(x=lx, y=ly, mode="lines", line=dict(color="rgba(93,109,116,0.5)", width=1),
+                                 name=f"镜位移动（{int(moved.sum())} 面）", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=base_xyz[:, 0], y=base_xyz[:, 1], mode="markers", name=labels[0],
+                               marker=dict(size=6, color="rgba(0,0,0,0)", line=dict(color="#8a969c", width=1.2))))
+    fig.add_trace(go.Scatter(x=new_xyz[:, 0], y=new_xyz[:, 1], mode="markers", name=labels[1],
+                               marker=dict(size=4.5, color=TEAL)))
+    fig.add_trace(go.Scatter(x=[rec.center[0]], y=[rec.center[1]], mode="markers", name="塔",
+                             marker=dict(symbol="triangle-up", size=13, color=RED), hoverinfo="skip"))
+    fig.update_xaxes(title="东向 x (m)", scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title="北向 y (m)")
+    return _base_layout(fig, "", height)
+
+
+def inner_gap_chart(tables: dict, labels: dict, height: int = 300):
+    fig = go.Figure()
+    palette = [TEAL, AMBER, NAVY, RED]
+    for k, (name, t) in enumerate(tables.items()):
+        fig.add_trace(go.Scatter(x=t["scenario_id"], y=100 * t["inner_gap"].astype(float), mode="lines+markers",
+                                 name=labels.get(name, name), line=dict(color=palette[k % len(palette)])))
+    fig.update_yaxes(title="内层差距（%，相对该工况上界）", rangemode="tozero")
+    fig.update_xaxes(title="工况")
+    return _base_layout(fig, "", height)

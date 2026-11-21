@@ -153,3 +153,28 @@ def load_dni_map(path, xy: np.ndarray) -> np.ndarray:
         order = np.argsort(projected)
         nearest = np.interp(xy[:, :2] @ axis, projected[order], val[order])
     return np.clip(nearest, 0.0, None)
+
+
+def static_clouds(fld: Field, n: int = 2, radius_m=(60.0, 140.0), transmittance=(0.1, 0.35), seed: int = 0,
+                  edge_fraction: float = 0.3) -> list[Cloud]:
+    """Clouds whose shadows lie on the field at the moment of interest (centres drawn near random heliostats).
+
+    Used by the single-instant before/after comparison: the shadows are frozen (zero velocity).
+    """
+    rng = np.random.default_rng(int(seed))
+    if fld.n == 0 or n <= 0:
+        return []
+    out = []
+    for _ in range(int(n)):
+        r = float(rng.uniform(*radius_m))
+        base = fld.xyz[int(rng.integers(fld.n)), :2]
+        jitter = rng.normal(0.0, 0.25 * r, 2)
+        out.append(Cloud(float(base[0] + jitter[0]), float(base[1] + jitter[1]), r,
+                         float(rng.uniform(*transmittance)), 0.0, 0.0, max(1.0, edge_fraction * r)))
+    return out
+
+
+def cloud_transmittance(clouds: list[Cloud], xy: np.ndarray) -> np.ndarray:
+    """Transmittance of frozen cloud shadows at the points (1 = clear)."""
+    t0 = pd.Timestamp("2000-01-01")
+    return CloudField(clouds, t0).transmittance(np.asarray(xy, dtype=float).reshape(-1, 2), t0)

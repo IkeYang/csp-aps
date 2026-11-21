@@ -95,8 +95,20 @@ def test_optimize_layout_reports_uniformity(small_case):
     assert cert["upper_bound_mwh"] >= cert["objective_found_mwh"] - 1e-6 and cert["gap"] < 0.05
     assert "circ_cv_review" in res.ranking and "objective_review_mwh" in res.ranking
     b = s["upper_bound"]
-    assert b["objective_review_mwh"] <= b["upper_bound_mwh"] and 0 <= b["gap_objective_conservative"] < 1
+    # formal ranking: V <= E <= bound on the formal scenario set
+    assert b["value_found_mwh"] <= b["found_energy_mwh"] <= b["upper_bound_mwh"]
+    assert 0 <= b["gap_value_conservative"] < 1
     assert s["status"] == "ok" and s["existence"]["optimum_exists"]
+
+
+def test_optimize_layout_legacy_objective_bound(small_case):
+    small_case.layout_opt.ranking = "legacy"
+    small_case.layout_opt.uniformity_weight = 0.5
+    small_case.layout_opt.review_n_sun_bins = 6
+    small_case.layout_opt.review_check_hourly = False
+    s = optimize_layout(small_case).summary()
+    b = s["upper_bound"]
+    assert b["objective_review_mwh"] <= b["upper_bound_mwh"] and 0 <= b["gap_objective_conservative"] < 1
 
 
 # --------------------------------------------------------------------------- consistent candidate pricing
@@ -152,6 +164,7 @@ def test_aksai_selection_has_no_detached_heliostats():
     from .conftest import ROOT
 
     case = load_case(ROOT / "cases" / "aksai_demo.yaml")
+    case.scenarios.map_model = "uniform"  # the audit case: station DNI uniform over the site
     lo = case.layout_opt
     smp = make_samples(case, lo.search_sampling, lo.n_sun_bins, 1, seed=lo.seed)
     params = {"spacing_factor": 1.1, "radial_spacing": 0.8689, "radial_growth": 0.1831, "azimuthal_spacing": 1.0005}

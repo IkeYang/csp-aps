@@ -257,6 +257,50 @@ class LayoutOpt:
     # Azimuth sectors for the layout uniformity: 0 = the receiver panels (12 x 30 deg if fewer than 6 panels).
     # The layout decides how heat is shared between sectors / panels; the ripple inside a sector is the APS's job.
     uniformity_sectors: int = 0
+    # ---- formal ranking: V(L) = sum_s h_s (P_s - lambda_L U_s) from per-scenario APS plans (layout_value.py)
+    ranking: str = "aps_value"  # "aps_value" (per-scenario APS on the scenario set) | "legacy" (0.4 review)
+    aps_weight: float | None = None  # inner lambda_APS of P - lambda_APS U; None = uniformity.weight (weighted mode) else 0
+    baseline: str = "initial"  # "initial": the case's own field (N heliostats nearest the tower) is ranked too | "none"
+    formal_swap_rounds: int = 1  # swap rounds on the winner, accepted only if V(L) increases
+    inner_joint_trials: int = 2  # joint-pose neighbourhood trials per scenario solve
+    inner_certify_rounds: int = 0  # relaxation roundings + dual bound per scenario (0 = off; fixed iterations)
+    inner_certify_iters: int = 60  # dual / Frank-Wolfe iterations of that bound (iteration budget, reproducible)
+    dense_check_scenarios: int = 0  # re-evaluate winner and baseline on this many scenarios (0 = off)
+    # clouds maps: re-score winner and baseline on independent cloud maps (seed + 1000); transient shadows must
+    # not decide where mirrors go
+    cross_check_maps: bool = True
+
+
+@dataclass
+class ScenarioSpec:
+    """Annual operating scenarios s = (sun direction, hours h_s, site DNI map D_s(x, y)) for the layout value.
+
+    Maps are rasters in site coordinates (x east, y north, m, origin at the tower base), sampled bilinearly
+    and clamped at the raster edge. A "factor" map multiplies the scenario DNI; with ``map_normalize`` =
+    "site_mean" its mean over the site (boundary minus exclusion zone) is 1, so the map redistributes the
+    station DNI in space without changing the site's annual DNI energy.
+    """
+
+    source: str = "weather"  # "weather": representative states of the weather year | "file": scenario table CSV
+    file: str | None = None  # scenario table: scenario_id,elevation_deg,azimuth_deg,hours,dni_w_m2,map_id[,time]
+    n_scenarios: int = 20  # representative scenarios generated from the weather year
+    dni_bands: int = 1  # split each representative sun position into DNI bands
+    map_model: str = "uniform"  # uniform | half_swap | gradient | clouds | file
+    map_file: str | None = None  # map library CSV: map_id,x,y,value (regular grid or scattered points)
+    map_unit: str = "factor"  # file maps: "factor" (x scenario DNI) | "w_m2" (absolute DNI)
+    map_normalize: str = "site_mean"  # factor maps: "site_mean" | "none"
+    map_assignment: str = "by_day"  # weather scenarios: map regime of each day cycles through the maps | "single"
+    map_sequence: list[str] | None = None  # map ids used as regimes, in order (None = every map of the model)
+    map_include_uniform: bool = False  # add the uniform map as an extra regime (compatibility scenarios)
+    map_cell_m: float = 20.0  # raster resolution of modelled maps, m
+    map_contrast: float = 0.3  # half_swap / gradient: relative DNI difference, +- (0.3 = 1.3 vs 0.7)
+    map_axis_deg: float = 90.0  # compass direction towards the bright side (90 = east half brighter in map 1)
+    map_edge_m: float = 40.0  # half_swap: width of the soft transition, m
+    cloud_maps: int = 4  # clouds: number of cloud-shadow maps
+    cloud_n: int = 3  # clouds: shadows per map
+    cloud_radius_m: list[float] = dc_field(default_factory=lambda: [60.0, 160.0])
+    cloud_transmittance: list[float] = dc_field(default_factory=lambda: [0.2, 0.6])
+    seed: int = 0
 
 
 @dataclass
@@ -284,6 +328,7 @@ class Case:
     realtime: Realtime = dc_field(default_factory=Realtime)
     annual: AnnualSpec = dc_field(default_factory=AnnualSpec)
     layout_opt: LayoutOpt = dc_field(default_factory=LayoutOpt)
+    scenarios: ScenarioSpec = dc_field(default_factory=ScenarioSpec)
     mcrt: MCRTSpec = dc_field(default_factory=MCRTSpec)
     base_dir: Path = dc_field(default_factory=Path.cwd)
 
@@ -321,6 +366,7 @@ _SECTIONS = {
     "realtime": Realtime,
     "annual": AnnualSpec,
     "layout_opt": LayoutOpt,
+    "scenarios": ScenarioSpec,
     "mcrt": MCRTSpec,
 }
 
@@ -398,6 +444,39 @@ def _validate(case: Case) -> None:
         raise ValueError("layout_opt.uniformity_sectors and selection_iterations must be >= 0")
     if case.layout_opt.search_aiming not in ("auto", "center", "greedy", "kfactor"):
         raise ValueError("layout_opt.search_aiming must be auto|center|greedy|kfactor")
+    lo = case.layout_opt
+    if lo.ranking not in ("aps_value", "legacy"):
+        raise ValueError("layout_opt.ranking must be aps_value|legacy")
+    if lo.baseline not in ("initial", "none"):
+        raise ValueError("layout_opt.baseline must be initial|none")
+    if lo.aps_weight is not None and lo.aps_weight < 0:
+        raise ValueError("layout_opt.aps_weight must be >= 0")
+    if min(lo.formal_swap_rounds, lo.inner_joint_trials, lo.inner_certify_rounds, lo.inner_certify_iters,
+           lo.dense_check_scenarios) < 0:
+        raise ValueError("layout_opt formal-ranking budgets must be nonnegative")
+    sc = case.scenarios
+    if sc.source not in ("weather", "file"):
+        raise ValueError("scenarios.source must be weather|file")
+    if sc.source == "file" and not sc.file:
+        raise ValueError("scenarios.source is 'file' but scenarios.file is not set")
+    if sc.map_model not in ("uniform", "half_swap", "gradient", "clouds", "file"):
+        raise ValueError("scenarios.map_model must be uniform|half_swap|gradient|clouds|file")
+    if sc.map_model == "file" and not sc.map_file:
+        raise ValueError("scenarios.map_model is 'file' but scenarios.map_file is not set")
+    if sc.map_unit not in ("factor", "w_m2") or sc.map_normalize not in ("site_mean", "none"):
+        raise ValueError("scenarios.map_unit must be factor|w_m2 and map_normalize site_mean|none")
+    if sc.map_model == "file" and sc.map_unit == "w_m2" and sc.source != "file":
+        raise ValueError("absolute DNI maps (map_unit w_m2) need a scenario table (scenarios.source: file); "
+                         "maps assigned to weather hours must be factor maps")
+    if sc.map_assignment not in ("by_day", "single"):
+        raise ValueError("scenarios.map_assignment must be by_day|single")
+    if sc.n_scenarios < 1 or sc.dni_bands < 1 or not sc.map_cell_m > 0 or sc.cloud_maps < 1 or sc.cloud_n < 0:
+        raise ValueError("scenarios: n_scenarios, dni_bands, cloud_maps >= 1, map_cell_m > 0, cloud_n >= 0")
+    if not 0 <= sc.map_contrast < 1:
+        raise ValueError("scenarios.map_contrast must be in [0, 1)")
+    if len(sc.cloud_radius_m) != 2 or len(sc.cloud_transmittance) != 2 or min(sc.cloud_radius_m) <= 0 \
+            or not all(0 <= v <= 1 for v in sc.cloud_transmittance):
+        raise ValueError("scenarios.cloud_radius_m [lo, hi] > 0 and cloud_transmittance [lo, hi] in [0, 1]")
     if case.mcrt.tracking_mode not in ("per_ray", "per_heliostat"):
         raise ValueError("mcrt.tracking_mode must be per_ray|per_heliostat")
     if case.realtime.scenario not in ("clouds", "moving_edge", "sudden_clear"):

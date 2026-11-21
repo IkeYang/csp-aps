@@ -150,3 +150,49 @@ def test_single_result_keeps_completed_objective(monkeypatch, tmp_path):
     assert not at.exception
     assert at.session_state["res_single"]["summary"]["status"] == "uniformity_infeasible"
     assert "记录为人工已确认" not in [b.label for b in at.button]
+
+
+def test_gui_cloud_compare_and_formal_value(monkeypatch, tmp_path):
+    """Cloud before / after page, the formal layout ranking view, rescoring and the audit recomputation."""
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CSPAPS_GUI_SYNC", "1")
+    d = small_case_dict()
+    d["uniformity"] = {"enabled": True, "mode": "weighted", "weight": 0.3}
+    d["scenarios"] = {"n_scenarios": 2, "map_model": "half_swap"}
+    d["field"]["generator"]["r_max"] = 80
+    d["layout_opt"].update({"n_heliostats": 60, "refine_top": 1, "review_check_hourly": False, "swap_rounds": 0,
+                            "formal_swap_rounds": 0})
+    at = AppTest.from_file(str(Path(ROOT) / "src" / "cspaps" / "gui_app.py"), default_timeout=600)
+    at.session_state["case_dict"] = d
+    at.session_state["base_dir"] = str(ROOT)
+    at.session_state["ver"] = 1
+    at.run()
+    at.radio(key="page").set_value("云影回放").run()
+    at.button(key="btn_cloud").click().run()
+    assert not at.exception and not at.error
+    keys = [s["key"] for s in at.session_state["res_cloud"]["states"]]
+    assert keys == ["clear", "cloud_keep", "cloud_aps", "clear_keep", "cloud_safe", "clear_safe"]
+    labels = " ".join(m.value for m in at.markdown)
+    for text in ("① 云前吸收功率", "③ 云来 · 不改策略", "④ 云来 · 重新 APS", "被云遮挡"):
+        assert text in labels
+    at.radio(key="page").set_value("布局优化").run()
+    at.button(key="btn_opt").click().run()
+    assert not at.exception
+    f = at.session_state["res_opt"]["summary"]["formal"]
+    assert {r["name"] for r in f["ranking"]} >= {"initial"} and f["winner"]
+    at.slider(key="fv_opt_lam").set_value(1.0).run()
+    assert not at.exception
+    at.button(key="fv_opt_recompute").click().run()
+    assert all(r["一致"] == "✓" for r in at.session_state["fv_opt_recheck"])
+    at.button(key="btn_lv").click().run()
+    assert not at.exception
+    assert at.session_state["res_lv"]["summary"]["equal_heliostat_count"]
+    # problem 1 on one annual scenario (sun + site DNI map): the independent check of a layout score
+    at.radio(key="page").set_value("瞄准优化").run()
+    at.button(key="btn_scen").click().run()
+    assert not at.exception and not at.error
+    rec = at.session_state["res_scen"]["record"]
+    assert rec.scenario_id == "S01" and rec.plan.dni.std() > 0  # the half-swap map gives every mirror its own DNI
