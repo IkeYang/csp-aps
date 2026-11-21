@@ -143,6 +143,7 @@ def evaluate(
     with_flux: bool = True,
     time: pd.Timestamp | None = None,
     shading_points: int | None = None,
+    blockers: np.ndarray | None = None,
 ) -> Snapshot:
     """Evaluate the field for one sun state.
 
@@ -173,7 +174,7 @@ def evaluate(
         sb = shading.shading_blocking(
             fld.xyz, normals, s, t, hel, rec, fld.pairs,
             n_points=shading_points or case.shading.n_points,
-            tower_shadow=case.shading.tower_shadow,
+            tower_shadow=case.shading.tower_shadow, blockers=blockers,
         )
     else:
         sb = {"shading": np.ones(n), "blocking": np.ones(n)}
@@ -278,11 +279,11 @@ class AnnualResult:
         }
 
 
-def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading_points):
+def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading_points, blockers=None):
     """Evaluate one sun state; returns (stage power arrays, row dict)."""
     if aiming == "center":
         snap = evaluate(case, fld, el, az, dni_v, grid=grid, with_flux=with_flux, time=ts,
-                        shading_points=shading_points)
+                        shading_points=shading_points, blockers=blockers)
         peak = snap.flux.max() / 1e3
         ratio = float((snap.flux.ravel() / grid.limit).max())
         status = ""
@@ -336,10 +337,10 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
 
 
 def _annual_chunk(args):
-    case, xyz, ids, items, aiming, with_flux, shading_points = args
+    case, xyz, ids, items, aiming, with_flux, shading_points, blockers = args
     fld = Field(xyz, ids)
     grid = build_grid(case.receiver)
-    return [(i, *_annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points))
+    return [(i, *_annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points, blockers))
             for i, el, az, d, ts in items]
 
 
@@ -355,6 +356,7 @@ def annual(
     progress: Callable[[int, int], None] | None = None,
     workers: int | None = None,
     keep_state_power: bool = False,
+    blockers: np.ndarray | None = None,
 ) -> AnnualResult:
     """Annual energy on the receiver.
 
@@ -364,6 +366,8 @@ def annual(
     at every sun state. Sun states are independent and run in parallel with
     ``workers`` processes (default ``annual.workers``). ``keep_state_power``
     keeps the (states x heliostats) intercepted power in ``state_power_w``.
+    ``blockers`` (centre aiming only) limits the mirrors that shade / block others
+    (see ``shading.shading_blocking``).
     """
     from .parallel import n_workers, pool
 
@@ -381,8 +385,8 @@ def annual(
         chunks = [items[k::nw] for k in range(nw)]
         with pool(nw) as p:
             done = 0
-            for out in p.imap_unordered(_annual_chunk, [(case, fld.xyz, fld.ids, c, aiming, with_flux, shading_points)
-                                                        for c in chunks]):
+            for out in p.imap_unordered(_annual_chunk, [(case, fld.xyz, fld.ids, c, aiming, with_flux, shading_points,
+                                                         blockers) for c in chunks]):
                 for i, powers, row in out:
                     results[i] = (powers, row)
                 done += len(out)
@@ -390,7 +394,7 @@ def annual(
                     progress(done, n_s)
     else:
         for i, el, az, d, ts in items:
-            results[i] = _annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points)
+            results[i] = _annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points, blockers)
             if progress:
                 progress(i + 1, n_s)
     energy = {k: 0.0 for k in STAGES}

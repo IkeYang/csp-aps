@@ -342,7 +342,7 @@ def layout_tradeoff_chart(rows: list[dict], selected: float | None = None, heigh
     cv = [r["cv_circ_weighted"] for r in rows]
     e = [r["energy_mwh"] for r in rows]
     lam = [r["lambda"] for r in rows]
-    hover = [f"λ_L = {l:g}<br>周向 CV {c:.3f}<br>年吸收 {v:,.0f} MWh<br>北侧镜子 {100 * r['north_fraction']:.0f}%"
+    hover = [f"λ_L = {l:g}<br>管屏间 CV {c:.3f}<br>年吸收 {v:,.0f} MWh<br>北侧镜子 {100 * r['north_fraction']:.0f}%"
              for l, c, v, r in zip(lam, cv, e, rows)]
     fig = go.Figure(go.Scatter(x=cv, y=e, mode="lines+markers+text",
                                text=_sparse_labels(cv, e, [f"λ_L = {l:g}" for l in lam]),
@@ -353,7 +353,7 @@ def layout_tradeoff_chart(rows: list[dict], selected: float | None = None, heigh
         j = lam.index(selected)
         fig.add_trace(go.Scatter(x=[cv[j]], y=[e[j]], mode="markers", hoverinfo="skip",
                                  marker=dict(size=17, color="rgba(0,0,0,0)", line=dict(color=TEAL, width=3))))
-    fig.update_xaxes(title="吸热器周向热流 CV（能量加权，越小越均匀）", autorange="reversed")
+    fig.update_xaxes(title="管屏间吸热 CV（逐工况能量加权，越小越均匀）", autorange="reversed")
     fig.update_yaxes(title="全年理论吸收热量 (MWhₜₕ)")
     fig.update_layout(showlegend=False)
     return _base_layout(fig, "", height)

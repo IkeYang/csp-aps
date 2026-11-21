@@ -91,6 +91,7 @@ LABELS = {
     "aps.certify": "计算最优性证书（上界与差距）", "aps.certify_time_s": "证书迭代时限 (s)",
     "aps.certify_rounds": "松弛随机取整次数", "layout_opt.upper_bound": "计算可证上界",
     "layout_opt.uniformity_weight": "布局均匀度权重 λ_L",
+    "layout_opt.selection_iterations": "镜位定价迭代次数（搜索阶段）", "layout_opt.uniformity_sectors": "均匀度扇区数（0 = 按管屏）",
     "uniformity.enabled": "启用均匀度约束", "uniformity.max_cv": "允许二维 CV (ε)",
     "uniformity.mode": "均匀度目标模式", "uniformity.weight": "均匀度权重 λ",
     "uniformity.panels": "考核管屏 H (YAML 列表，空 = 全部)", "uniformity.z_range": "考核高度范围 [z1, z2]",
@@ -1086,11 +1087,11 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
 # --------------------------------------------------------------------------- problem 2: layout
 
 PRESETS = {
-    "fast": ("快速（约 1 分钟）", {"maxiter": 2, "popsize": 3, "n_sun_bins": 8, "polish_rounds": 1, "refine_top": 1,
+    "fast": ("快速（约 1–2 分钟）", {"maxiter": 2, "popsize": 3, "n_sun_bins": 8, "polish_rounds": 1, "refine_top": 1,
                                   "review_n_sun_bins": 4, "swap_rounds": 1}),
-    "standard": ("标准（约 2–4 分钟）", {"maxiter": 4, "popsize": 4, "n_sun_bins": 12, "polish_rounds": 2,
+    "standard": ("标准（约 3–5 分钟）", {"maxiter": 4, "popsize": 4, "n_sun_bins": 12, "polish_rounds": 2,
                                       "refine_top": 2, "review_n_sun_bins": 6, "swap_rounds": 1}),
-    "fine": ("精细（约 10–20 分钟）", {"maxiter": 10, "popsize": 6, "n_sun_bins": 24, "polish_rounds": 4,
+    "fine": ("精细（约 15–30 分钟）", {"maxiter": 10, "popsize": 6, "n_sun_bins": 24, "polish_rounds": 4,
                                      "refine_top": 3, "review_n_sun_bins": 12, "swap_rounds": 2}),
 }
 
@@ -1173,7 +1174,8 @@ def page_layout(case) -> None:
                                                         key=f"{ver}:layout_opt.uniformity_weight",
                                                         help=HELP["layout_opt.uniformity_weight"]))
             st.latex(r"\max_X\;\sum_t w_t\big[P_t(X)-\lambda_L\,A_H\,\sigma_{circ,t}(X)\big]")
-            st.caption("σ_circ：吸热器各周向列平均吸收热流的标准差（不同朝向之间的差异）；P：吸收功率；w_t：代表工况小时数。")
+            st.caption("σ_circ：吸热器各管屏（扇区）平均吸收热流的标准差，即不同朝向之间的受热差异；管屏内部的起伏由瞄准策略调平。"
+                       "P：吸收功率；w_t：代表工况小时数。")
         with _card("layout_search"):
             _section(3, "搜索设置", "搜索阶段按目标 J（全年理论吸收热量减周向不均匀惩罚，中心瞄准，含阴影遮挡）评价布局，"
                      "入围方案再用受限 APS 复核。")
@@ -1233,15 +1235,20 @@ def _layout_results(case, res: dict) -> None:
         ("最小镜距", f"{val.get('min_distance_m')}", "m", f"要求 ≥ {val.get('required_min_spacing_m')} m · 场地校验{site_status}",
          "good" if s["status"] == "ok" else "bad"),
     ] + ([
-        ("吸热器周向 CV", _format_number(uni.get("cv_circ_weighted"), 3), "", f"布局权重 λ_L = {uni.get('weight', 0):g} · 能量加权",
+        ("管屏间吸热 CV", _format_number(uni.get("cv_circ_weighted"), 3), "", f"布局权重 λ_L = {uni.get('weight', 0):g} · 逐工况能量加权",
          "good" if (uni.get("cv_circ_weighted") or 9) < 0.25 else "warn"),
         ("镜场质心偏移", f"{uni.get('centroid_offset_m', 0):.0f}", "m",
-         f"北侧镜子 {100 * uni.get('north_fraction', 0):.0f}% · 0 m 表示集热器位于镜场中心",
+         f"北侧镜子 {100 * uni.get('north_fraction', 0):.0f}% · 脱离主镜场 {uni.get('n_detached', 0)} 面 · "
+         "0 m 表示集热器位于镜场中心",
          "good" if (uni.get("centroid_offset_rel") or 9) < 0.25 else "warn"),
     ] if uni else []))
+    if uni and uni.get("n_detached"):
+        _callout("warn", f"{uni['n_detached']} 面定日镜脱离主镜场",
+                 "这些镜子与主镜场之间的距离超过中位镜距的 3 倍：" +
+                 "；".join(f"({x:.0f}, {y:.0f}) m" for x, y in uni.get("detached_xy_m", [])[:6]))
     if uni and uni.get("weight", 0) <= 0 and uni.get("north_fraction", 0) > 0.75:
         _callout("warn", "镜场集中在塔的一侧", f"{100 * uni['north_fraction']:.0f}% 的定日镜在塔北侧，吸热器南侧几乎不受热，"
-                 f"周向 CV {uni['cv_circ_weighted']:.2f}。这部分不均匀无法靠瞄准策略消除——在 ② 中提高布局均匀度权重 λ_L，"
+                 f"管屏间吸热 CV {uni['cv_circ_weighted']:.2f}。这部分不均匀无法靠瞄准策略消除——在 ② 中提高布局均匀度权重 λ_L，"
                  "让镜场环绕吸热器。")
     exist = s.get("existence") or {}
     if ub.get("status") == "bound_violation":
@@ -1286,7 +1293,7 @@ def _layout_results(case, res: dict) -> None:
                                      compare if compare and compare[1] else None), "opt_rose")
             with b:
                 st.markdown("**吸热器各朝向分得的全年吸收热量**（30° 扇区，按方位：北 0°、东 90°）")
-                st.markdown(f"- 周向 CV（逐工况、能量加权）：**{uni['cv_circ_weighted']:.3f}**；全年累计：{_format_number(uni.get('cv_circ_annual'))}\n"
+                st.markdown(f"- 管屏间吸热 CV（逐工况、能量加权）：**{uni['cv_circ_weighted']:.3f}**；全年累计：{_format_number(uni.get('cv_circ_annual'))}\n"
                             f"- 镜场能量质心距塔 **{uni['centroid_offset_m']:.0f} m**（相对平均镜距 {100 * uni['centroid_offset_rel']:.0f}%）\n"
                             f"- 北侧镜子占 {100 * uni['north_fraction']:.0f}%")
                 st.caption("圆柱外置式吸热器的每一侧只被朝向它的定日镜照射。瞄准策略可以沿高度、在小角度内调整热流，"
@@ -1316,13 +1323,14 @@ def _layout_results(case, res: dict) -> None:
             with b:
                 df = pd.DataFrame(rows)
                 st.dataframe(pd.DataFrame({"λ_L": df["lambda"], "年吸收 (MWh)": df["energy_mwh"].round(0),
-                                           "周向 CV": df["cv_circ_weighted"].round(3),
+                                           "管屏间 CV": df["cv_circ_weighted"].round(3),
                                            "北侧占比": (100 * df["north_fraction"]).round(0).astype(int).astype(str) + "%",
-                                           "质心偏移 (m)": df["centroid_offset_m"].round(0)}), hide_index=True)
+                                           "质心偏移 (m)": df["centroid_offset_m"].round(0),
+                                           "脱离主镜场": df["n_detached"] if "n_detached" in df else 0}), hide_index=True)
                 if len(rows) > 1:
                     e0 = rows[0]["energy_mwh"]
                     best = min(rows, key=lambda q: q["cv_circ_weighted"])
-                    st.caption(f"λ_L {rows[0]['lambda']:g} → {best['lambda']:g}：周向 CV {rows[0]['cv_circ_weighted']:.2f} → "
+                    st.caption(f"λ_L {rows[0]['lambda']:g} → {best['lambda']:g}：管屏间 CV {rows[0]['cv_circ_weighted']:.2f} → "
                                f"{best['cv_circ_weighted']:.2f}，全年能量 {100 * (best['energy_mwh'] / e0 - 1):+.1f}%。")
     with tabs[3]:
         _chart(plant_scene(case, r.best.xyz, values=eff, label="年均光学效率"), "opt_scene")
@@ -1381,7 +1389,7 @@ def _planning_compare(case) -> None:
         "energy_raw_aps_absorbed_mwh": "原始 APS 热量 (MWhₜₕ)", "aps_max_cv_2d": "最大二维 CV",
         "aps_max_peak_kw_m2": "最高复核通量 (kW/m²)",
         "aps_hours_uniformity_failed": "均匀度失败工况权重 (h)", "aps_states_not_ok": "未通过工况数",
-        "circ_cv_review": "周向 CV", "north_fraction": "北侧占比", "objective_review_mwh": "复核目标 J (MWhₜₕ)",
+        "circ_cv_review": "管屏间 CV", "north_fraction": "北侧占比", "objective_review_mwh": "复核目标 J (MWhₜₕ)",
     }
     view = rank[show_cols].rename(columns=display_names)
     ev = st.dataframe(view, on_select="rerun", selection_mode="single-row", key="cand_table", hide_index=True)
@@ -1673,17 +1681,19 @@ def page_theory(case) -> None:
                     "各周向列分得的功率比例为")
         st.latex(r"s_{ij}=\frac{\Phi\!\left(\tfrac{R\sin(\phi_{j+1}-\phi_i)}{\sigma_i}\right)-"
                  r"\Phi\!\left(\tfrac{R\sin(\phi_j-\phi_i)}{\sigma_i}\right)}{\Phi(R/\sigma_i)-\Phi(-R/\sigma_i)}")
-        st.markdown("APS 只能沿高度、在几度范围内移动瞄准点，可以抹平每一列内部的差异，但不能把北侧的热流搬到南侧。"
-                    "等面积列的方差分解")
-        st.latex(r"\sigma^2_{2D}=\underbrace{\sigma^2_{circ}}_{\text{由布局决定}}+"
-                 r"\underbrace{\overline{\sigma^2_{列内}}}_{\text{APS 可调}}")
+        st.markdown("APS 只能沿高度、在几度范围内移动瞄准点，大量光斑相互重叠后可以抹平每块管屏（扇区）内部的起伏，"
+                    "但不能把北侧的热流搬到南侧。按管屏分组的方差分解")
+        st.latex(r"\sigma^2_{2D}=\underbrace{\sigma^2_{circ}}_{\text{管屏之间，由布局决定}}+"
+                 r"\underbrace{\overline{\sigma^2_{管屏内}}}_{\text{APS 可调}}")
         st.markdown("说明周向部分是问题一的均匀度惩罚中任何瞄准策略都去不掉的部分。只按全年能量布置时，"
                     "高纬度场址的镜子会集中在塔北侧（余弦效率高），吸热器南侧几乎不受热。因此问题二的目标取")
         st.latex(r"\max_X\;J(X)=\sum_t w_t\Big[P_t(X)-\lambda_L\,A_H\,\sigma_{circ,t}(X)\Big]"
                  r"=\sum_t w_t\,P_t\,(1-\lambda_L\,\mathrm{CV}_{circ,t})")
         st.markdown(r"与问题一的加权目标同构，$\lambda_L$ 是布局阶段均匀性的重要性超参数；$\lambda_L=0$ 退化为只追求全年能量。"
                     r"固定生成参数时，从候选镜位中选 $N$ 个是 $\max J(x),\ \sum x=N$；$J$ 对松弛变量是凹函数，"
-                    "用交换局部搜索求解，并用 Frank–Wolfe 上界（线性子问题为取前 $N$ 大）证明选择的差距。")
+                    "用交换局部搜索求解，并用 Frank–Wolfe 上界（线性子问题为取前 $N$ 大）证明选择的差距。"
+                    "候选镜位的功率按“加入当前布局后”的阴影遮挡计算（只有已选镜子遮挡），选择与定价交替迭代，"
+                    "只接受使真实目标值提高的一步——避免把从不建造的候选镜位的遮挡算进来，选出孤立的远处镜位。")
         _section(None, "最优布置存在吗？")
         _callout(r"ok", "存在（只要镜子放得下）。", "可行集 $\\{X: x_i\\in\\Omega, \\|x_i-x_j\\|\\ge d\\}$ 是有界闭集，"
                  "即紧集；年能量与周向惩罚都对镜位连续，由 Weierstrass 定理最大值必然取到。若圆盘堆积上界表明场地容纳不下 N 面镜，"

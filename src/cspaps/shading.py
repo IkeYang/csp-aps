@@ -144,8 +144,13 @@ def shading_blocking(
     pairs: PairCache,
     n_points: int = 8,
     tower_shadow: bool = True,
+    blockers: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Per-heliostat shading, blocking and combined efficiencies.
+
+    ``blockers`` (bool, N) limits the mirrors that can shade or block others,
+    e.g. to the heliostats of a layout while the others are candidates being
+    priced "as if added": every mirror is then evaluated against the blockers only.
 
     Returns dict with 'shading', 'blocking', 'combined' efficiencies (N,) where
     combined = 1 - |shaded U blocked| / P and blocking is reported relative to
@@ -166,6 +171,9 @@ def shading_blocking(
     t_el = np.degrees(np.arcsin(np.clip(t[:, 2], -1, 1)))
     r_block = interaction_radius(helio, float(t_el.min()), dz)
     i_all, j_all = pairs.get(max(r_shade, r_block))
+    if blockers is not None:
+        keep = np.asarray(blockers, dtype=bool)[j_all]
+        i_all, j_all = i_all[keep], j_all[keep]
     rel = xyz[j_all] - xyz[i_all]
 
     keep_s = _corridor(rel, np.broadcast_to(sun_vec, rel.shape), diag, np.full(rel.shape[0], r_shade + diag))

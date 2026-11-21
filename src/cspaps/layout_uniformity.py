@@ -136,7 +136,25 @@ def build_model(case: Case, xyz: np.ndarray, samples, state_power_w: np.ndarray,
     absorbed = p[:, :, None] * shares * alpha[None, None, :]  # (S, N, C) W
     e = absorbed.sum(axis=2)
     b = absorbed[:, :, h_cols] / col_area
+    # every column takes the mean of its sector: the std over equal-area columns is then the area-weighted
+    # std of the sector means (the between-sector part that the layout decides)
+    sec = sector_of_columns(case, col_az)[h_cols]
+    avg = (sec[:, None] == sec[None, :]).astype(float)
+    avg /= avg.sum(axis=0, keepdims=True)
+    b = np.einsum("snc,cd->snd", b, avg)
     return CircModel(e, b, np.asarray(samples.weight_h, dtype=float), float(col_area * h_cols.sum()), float(lam))
+
+
+def sector_of_columns(case: Case, col_az: np.ndarray) -> np.ndarray:
+    """Sector index of each receiver column for the layout uniformity (panels, or equal sectors)."""
+    from .receiver import panel_of
+
+    rec = case.receiver
+    n = case.layout_opt.uniformity_sectors
+    if n <= 0 and rec.n_panels >= 6:
+        return panel_of(rec, col_az)
+    n = n if n > 0 else 12
+    return (((np.asarray(col_az) - rec.panel_start_azimuth_deg) % 360.0) // (360.0 / n)).astype(int)
 
 
 def _swap_gains(model: CircModel, sel: np.ndarray, g: np.ndarray):
@@ -156,41 +174,72 @@ def _swap_gains(model: CircModel, sel: np.ndarray, g: np.ndarray):
     return (model.w[:, None] * d).sum(axis=0) / 1e6  # (N,)
 
 
+def _linear_scores(model: CircModel, g: np.ndarray) -> np.ndarray:
+    """Gradient of J (MWh per heliostat) at the profile g: energy minus the linearised penalty change."""
+    d = g - g.mean(axis=1, keepdims=True)
+    std = np.sqrt((d ** 2).mean(axis=1))
+    coef = np.where(std > 0, model.lam * model.a_h / (model.n_cols * np.maximum(std, 1e-300)), 0.0)
+    return (model.w[:, None] * (model.e - coef[:, None] * np.einsum("sc,snc->sn", d, model.b))).sum(axis=0) / 1e6
+
+
 def _objective_fast(model: CircModel, p: np.ndarray, g: np.ndarray) -> float:
     """J (MWh) from the per-state absorbed power p (S,) and the column profile g (S, C_H)."""
     return float((model.w * (p - model.lam * model.a_h * g.std(axis=1))).sum() / 1e6)
 
 
 def select(model: CircModel, n_select: int, init: np.ndarray | None = None, max_swaps: int | None = None,
-           top: int = 8) -> tuple[np.ndarray, dict]:
-    """Exchange local search for max J over subsets of size n_select (starts from the top energies).
+           top: int = 8, polish: bool = False, polish_pool: int = 300) -> tuple[np.ndarray, dict]:
+    """Swap local search for max J over subsets of size n_select.
 
-    Each round ranks additions and removals by their marginal gain, evaluates the
-    best ``top`` x ``top`` pairs exactly (incremental O(S C) per pair) and applies
-    the best improving swap; it stops at a swap-local optimum.
+    Energy only (lambda_L = 0): the N largest energies, or with ``init`` and
+    ``max_swaps`` at most that many best-for-worst swaps from ``init``.
+    Otherwise each round short-lists additions / removals by their single-move
+    gain and by the linearised objective (in which the penalty change of a swap
+    inside one sector cancels), evaluates the short-listed pairs exactly
+    (incremental O(S C) per pair) and applies the best improving swap. With
+    ``polish`` it then tries, for every selected heliostat, every one of the
+    ``polish_pool`` best-ranked replacements exactly, until no swap improves.
     """
     t0 = _time.perf_counter()
     n = model.n
     n_select = min(int(n_select), n)
     energy = (model.w[:, None] * model.e).sum(axis=0)
-    if init is None:
-        sel = np.zeros(n, dtype=bool)
-        sel[np.argsort(-energy, kind="stable")[:n_select]] = True
-    else:
-        sel = np.asarray(init, dtype=bool).copy()
-    if model.lam <= 0 or n_select in (0, n):
-        return sel, {"swaps": 0, "time_s": round(_time.perf_counter() - t0, 3)}
+    top_n = np.zeros(n, dtype=bool)
+    top_n[np.argsort(-energy, kind="stable")[:n_select]] = True
+    if n_select in (0, n) or (model.lam <= 0 and (init is None or max_swaps is None)):
+        return top_n, {"swaps": 0, "time_s": round(_time.perf_counter() - t0, 3)}
+    sel = top_n if init is None else np.asarray(init, dtype=bool).copy()
+    max_swaps = max_swaps if max_swaps is not None else 4 * n_select
+    if model.lam <= 0:  # damped energy-only step: best unused for worst used, at most max_swaps
+        add = np.flatnonzero(~sel)
+        rem = np.flatnonzero(sel)
+        add = add[np.argsort(-energy[add], kind="stable")]
+        rem = rem[np.argsort(energy[rem], kind="stable")]
+        k = 0
+        while k < min(max_swaps, add.size, rem.size) and energy[add[k]] > energy[rem[k]] * (1 + 1e-12):
+            sel[add[k]], sel[rem[k]] = True, False
+            k += 1
+        return sel, {"swaps": k, "time_s": round(_time.perf_counter() - t0, 3)}
     p = model.e @ sel.astype(float)
     g = model.profile(sel)
     cur = _objective_fast(model, p, g)
-    max_swaps = max_swaps if max_swaps is not None else 4 * n_select
     swaps = 0
+
+    def apply(a: int, r: int) -> None:
+        nonlocal p, g, swaps
+        sel[a], sel[r] = True, False
+        p = p + model.e[:, a] - model.e[:, r]
+        g = g + model.b[:, a] - model.b[:, r]
+        swaps += 1
+
     while swaps < max_swaps:
         gains = _swap_gains(model, sel, g)
-        add = np.flatnonzero(~sel)
-        rem = np.flatnonzero(sel)
-        add = add[np.argsort(-gains[add])[:top]]
-        rem = rem[np.argsort(-gains[rem])[:top]]
+        lin = _linear_scores(model, g)
+        add_all = np.flatnonzero(~sel)
+        rem_all = np.flatnonzero(sel)
+        # screen with single-move gains and with the linearised objective, then evaluate pairs exactly
+        add = np.union1d(add_all[np.argsort(-gains[add_all])[:top]], add_all[np.argsort(-lin[add_all])[:top]])
+        rem = np.union1d(rem_all[np.argsort(-gains[rem_all])[:top]], rem_all[np.argsort(lin[rem_all])[:top]])
         best, pair = 1e-9 * max(abs(cur), 1.0), None
         for a in add:
             pa, ga = p + model.e[:, a], g + model.b[:, a]
@@ -199,13 +248,30 @@ def select(model: CircModel, n_select: int, init: np.ndarray | None = None, max_
                 if v > best:
                     best, pair = v, (a, r)
         if pair is None:
-            break
-        a, r = pair
-        sel[a], sel[r] = True, False
-        p = p + model.e[:, a] - model.e[:, r]
-        g = g + model.b[:, a] - model.b[:, r]
+            if not polish:
+                break
+            # full pass: for each selected heliostat (worst linear score first) the best replacement
+            lin = _linear_scores(model, g)
+            pool = np.flatnonzero(~sel)
+            pool = pool[np.argsort(-lin[pool])[:polish_pool]]
+            improved = False
+            for r in np.flatnonzero(sel)[np.argsort(lin[sel])]:
+                pool = pool[~sel[pool]]
+                if pool.size == 0 or swaps >= max_swaps:
+                    break
+                pp = (p - model.e[:, r])[None, :] + model.e[:, pool].T  # (A, S)
+                gg = (g - model.b[:, r])[None] + np.moveaxis(model.b[:, pool], 1, 0)  # (A, S, C)
+                j = (model.w[None, :] * (pp - model.lam * model.a_h * gg.std(axis=2))).sum(axis=1) / 1e6
+                k = int(np.argmax(j))
+                if j[k] > cur + 1e-9 * max(abs(cur), 1.0):
+                    apply(int(pool[k]), int(r))
+                    cur = float(j[k])
+                    improved = True
+            if not improved:
+                break
+            continue
+        apply(*pair)
         cur += best
-        swaps += 1
     return sel, {"swaps": swaps, "time_s": round(_time.perf_counter() - t0, 3)}
 
 
@@ -250,6 +316,22 @@ def selection_bound(model: CircModel, n_select: int, sel: np.ndarray, max_iter: 
             "model": "candidate positions of this generator parameter vector, centre aim, shading in the candidate field"}
 
 
+def detached_heliostats(xyz: np.ndarray, factor: float = 3.0) -> np.ndarray:
+    """Indices of heliostats outside the largest cluster (link length = factor x median neighbour distance)."""
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    xy = np.asarray(xyz, dtype=float).reshape(-1, 3)[:, :2]
+    if len(xy) < 3:
+        return np.zeros(0, dtype=int)
+    tree = cKDTree(xy)
+    nn = tree.query(xy, k=2)[0][:, 1]
+    graph = tree.sparse_distance_matrix(tree, factor * float(np.median(nn)), output_type="coo_matrix")
+    _, label = connected_components(graph, directed=False)
+    main = np.argmax(np.bincount(label))
+    return np.flatnonzero(label != main)
+
+
 def layout_metrics(case: Case, xyz: np.ndarray, samples, state_power_w: np.ndarray, lam: float,
                    grid: ReceiverGrid | None = None, n_sectors: int = 12) -> dict:
     """Energy, circumferential penalty / CV and the field balance around the tower for one layout."""
@@ -271,6 +353,7 @@ def layout_metrics(case: Case, xyz: np.ndarray, samples, state_power_w: np.ndarr
     share = sector_energy / sector_energy.sum() if sector_energy.sum() > 0 else sector_energy
     phi = heliostat_azimuth(rec, np.asarray(xyz))
     north = int(((phi >= 270) | (phi < 90)).sum())
+    detached = detached_heliostats(np.asarray(xyz))
     return {
         "uniformity_weight": lam,
         "energy_mwh": t["energy_mwh"], "circ_spread_mwh": t["spread_mwh"], "objective_mwh": t["objective_mwh"],
@@ -279,6 +362,7 @@ def layout_metrics(case: Case, xyz: np.ndarray, samples, state_power_w: np.ndarr
         "centroid_offset_m": float(np.hypot(*centroid)), "centroid_xy_m": [float(centroid[0]), float(centroid[1])],
         "centroid_offset_rel": float(np.hypot(*centroid) / r_mean) if r_mean > 0 else None,
         "north_fraction": north / max(len(phi), 1),
+        "n_detached": int(detached.size), "detached_xy_m": np.asarray(xyz)[detached, :2].round(2).tolist(),
         "sector_share": [float(v) for v in share],
         "sector_center_deg": [float(k * 360.0 / n_sectors) for k in range(n_sectors)],
     }

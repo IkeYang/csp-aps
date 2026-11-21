@@ -95,3 +95,77 @@ def test_optimize_layout_reports_uniformity(small_case):
     assert cert["upper_bound_mwh"] >= cert["objective_found_mwh"] - 1e-6 and cert["gap"] < 0.05
     assert "circ_cv_review" in res.ranking and "objective_review_mwh" in res.ranking
     assert s["status"] == "ok" and s["existence"]["optimum_exists"]
+
+
+# --------------------------------------------------------------------------- consistent candidate pricing
+
+def test_pricing_against_the_selection_is_exact(small_case):
+    """With the selected heliostats as the only blockers, each selected heliostat gets its real power."""
+    smp = _samples(small_case, 4)
+    xyz = generate(small_case, "radial_staggered", {"radial_spacing": 0.9, "radial_growth": 0.2,
+                                                    "azimuthal_spacing": 1.1, "spacing_factor": 1.1})
+    rng = np.random.default_rng(1)
+    sel = np.zeros(len(xyz), dtype=bool)
+    sel[rng.choice(len(xyz), 120, replace=False)] = True
+    priced = annual(small_case, Field(xyz), samples=smp, aiming="center", with_flux=False, blockers=sel,
+                    keep_state_power=True)
+    alone = annual(small_case, Field(xyz[sel]), samples=smp, aiming="center", with_flux=False, keep_state_power=True)
+    np.testing.assert_allclose(priced.state_power_w[:, sel], alone.state_power_w, rtol=1e-12, atol=1e-9)
+    dense = annual(small_case, Field(xyz), samples=smp, aiming="center", with_flux=False, keep_state_power=True)
+    assert np.all(priced.heliostat_energy_mwh >= dense.heliostat_energy_mwh - 1e-9)  # fewer blockers, never less
+
+
+@pytest.mark.parametrize("lam", [0.0, 0.3, 1.0])
+def test_consistent_selection_is_swap_optimal_and_compact(small_case, lam):
+    """At its own prices no single swap improves the selection, passes never lose, and no group is detached."""
+    from cspaps.layout_opt import select_consistent
+
+    smp = _samples(small_case, 6)
+    xyz = generate(small_case, "radial_staggered", {"radial_spacing": 0.87, "radial_growth": 0.2,
+                                                    "azimuthal_spacing": 1.0, "spacing_factor": 1.1})
+    sel, info = select_consistent(small_case, xyz, smp, 120, lam, shading_points=4, iterations=8, polish=True)
+    assert sel.sum() == 120
+    hist = info["objective_history_mwh"]
+    assert all(b >= a for a, b in zip(hist, hist[1:]))  # damped passes: no cycling
+    assert lu.detached_heliostats(xyz[sel]).size == 0
+    priced = annual(small_case, Field(xyz), samples=smp, aiming="center", with_flux=False, blockers=sel,
+                    keep_state_power=True, shading_points=4)
+    m = lu.build_model(small_case, xyz, smp, priced.state_power_w, lam)
+    cur, p, g = m.objective(sel), m.e @ sel, m.profile(sel)
+    add = np.flatnonzero(~sel)
+    best = -np.inf
+    for r in np.flatnonzero(sel):  # exhaustive single-swap neighbourhood
+        pp = (p - m.e[:, r])[None, :] + m.e[:, add].T
+        gg = (g - m.b[:, r])[None] + np.moveaxis(m.b[:, add], 1, 0)
+        best = max(best, ((m.w[None, :] * (pp - lam * m.a_h * gg.std(axis=2))).sum(axis=1) / 1e6).max())
+    if lam > 0:
+        assert best <= cur + 1e-6 * abs(cur)
+
+
+def test_aksai_selection_has_no_detached_heliostats():
+    """Regression (audit): dense-field pricing pulled 3 heliostats 85 m beyond the north edge of the field."""
+    from cspaps import load_case
+    from cspaps.layout_opt import make_samples, select_consistent
+
+    from .conftest import ROOT
+
+    case = load_case(ROOT / "cases" / "aksai_demo.yaml")
+    lo = case.layout_opt
+    smp = make_samples(case, lo.search_sampling, lo.n_sun_bins, 1, seed=lo.seed)
+    params = {"spacing_factor": 1.1, "radial_spacing": 0.8689, "radial_growth": 0.1831, "azimuthal_spacing": 1.0005}
+    xyz = generate(case, "radial_staggered", params)
+    dense = annual(case, Field(xyz), samples=smp, aiming="center", with_flux=False, shading_points=lo.shading_points,
+                   keep_state_power=True)
+    old, _ = lu.select(lu.build_model(case, xyz, smp, dense.state_power_w, 0.3), 473)
+    assert lu.detached_heliostats(xyz[old]).size == 3  # the reported defect
+    new, info = select_consistent(case, xyz, smp, 473, 0.3, lo.shading_points, iterations=6, dense=dense, polish=True)
+    assert lu.detached_heliostats(xyz[new]).size == 0
+
+    def real(sel):
+        a = annual(case, Field(xyz[sel]), samples=smp, aiming="center", with_flux=False,
+                   shading_points=lo.shading_points, keep_state_power=True)
+        return lu.layout_metrics(case, xyz[sel], smp, a.state_power_w, 0.3)["objective_mwh"]
+
+    assert real(new) > real(old)
+    r = np.hypot(xyz[new, 0], xyz[new, 1])
+    assert r.max() < 260

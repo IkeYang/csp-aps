@@ -102,6 +102,7 @@ def evaluate_layout(
     shading_points: int | None = None,
     aiming: str = "center",
     lam: float | None = None,
+    polish: bool = False,
 ) -> LayoutEval:
     """Generate candidates, choose N of them and score the layout.
 
@@ -122,19 +123,16 @@ def evaluate_layout(
         return LayoutEval(params, 0, xyz, 0.0)
     keep_power = lam > 0
     center_all = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
-                        shading_points=shading_points, workers=1, keep_state_power=keep_power)
+                        shading_points=shading_points, workers=1, keep_state_power=True)
     cand_xyz, cand_e = xyz, center_all.heliostat_energy_mwh
     n_cand = len(xyz)
     selected = bool(n_select and n_cand > n_select)
     sel_info = None
     if selected:
-        if lam > 0:
-            model = lu.build_model(case, xyz, samples, center_all.state_power_w, lam)
-            sel, sel_info = lu.select(model, n_select)
-            keep = np.flatnonzero(sel)
-        else:
-            # Center-aim single-mirror potential cheaply seeds a fixed-size candidate layout.
-            keep = np.sort(np.argsort(-center_all.heliostat_energy_mwh, kind="stable")[:n_select])
+        iters = case.layout_opt.selection_iterations
+        sel, sel_info = select_consistent(case, xyz, samples, n_select, lam, shading_points,
+                                          max(iters, 6) if polish else iters, dense=center_all, polish=polish)
+        keep = np.flatnonzero(sel)
         xyz = xyz[keep]
     center_res = (annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
                          shading_points=shading_points, workers=1, keep_state_power=keep_power)
@@ -154,6 +152,62 @@ def evaluate_layout(
                       search_aiming=aiming, uniformity=uni, selection=sel_info)
 
 
+def select_consistent(case: Case, xyz: np.ndarray, samples: sun.Samples, n_select: int, lam: float,
+                      shading_points: int | None = None, iterations: int = 4,
+                      dense: AnnualResult | None = None, polish: bool = False) -> tuple[np.ndarray, dict]:
+    """Choose N of the candidate positions with candidate powers that are consistent with the choice.
+
+    Pricing every candidate inside the full candidate field charges it shading
+    and blocking from candidates that are never built. That penalty depends on
+    the local candidate density -- heaviest in the densest rings, lightest at
+    generator zone changes and outer rings -- so it can make far, isolated
+    positions look better than closer ones. Instead: price all candidates with
+    only the selected heliostats as blockers (selected ones get their real
+    power, the others their power if added) and reselect from the current
+    selection. A pass is kept only if the objective on the real powers improves;
+    otherwise the number of allowed changes is halved (damping), so the passes
+    cannot cycle. ``polish`` adds the full swap neighbourhood (review stage).
+    """
+    from . import layout_uniformity as lu
+
+    fld = Field(xyz)
+
+    def price(blockers):
+        return annual(case, fld, samples=samples, aiming="center", with_flux=False, shading_points=shading_points,
+                      workers=1, keep_state_power=True, blockers=blockers).state_power_w
+
+    power = dense.state_power_w if dense is not None and dense.state_power_w is not None else price(None)
+    sel, info0 = lu.select(lu.build_model(case, xyz, samples, power, lam), n_select)
+    swaps, history, converged = info0["swaps"], [], False
+    if iterations <= 0:
+        return sel, {"swaps": swaps, "iterations": 0, "converged": False, "objective_history_mwh": [],
+                     "pricing": "candidate field (no re-pricing)"}
+    power = price(sel)
+    model = lu.build_model(case, xyz, samples, power, lam)
+    val = model.objective(sel)  # the selected heliostats' powers are their real powers
+    history.append(round(val, 3))
+    max_change = n_select
+    for _ in range(int(iterations)):
+        cand, info = lu.select(model, n_select, init=sel, max_swaps=max_change, polish=polish)
+        if np.array_equal(cand, sel):
+            converged = True
+            break
+        c_power = price(cand)
+        c_model = lu.build_model(case, xyz, samples, c_power, lam)
+        c_val = c_model.objective(cand)
+        if c_val > val + 1e-9 * max(abs(val), 1.0):
+            sel, power, model, val = cand, c_power, c_model, c_val
+            swaps += info["swaps"]
+            history.append(round(val, 3))
+        else:
+            max_change = max(1, int(np.sum(cand != sel)) // 4)  # half of the attempted swaps
+            if int(np.sum(cand != sel)) <= 2:
+                converged = True
+                break
+    return sel, {"swaps": swaps, "iterations": len(history), "converged": converged,
+                 "objective_history_mwh": history, "pricing": "candidates priced against the selected layout"}
+
+
 def layout_tradeoff(case: Case, kind: str, params: dict, samples: sun.Samples, n_select: int, lambdas,
                     shading_points: int | None = None, certify: bool = True) -> list[dict]:
     """Annual energy vs circumferential uniformity of the layout for several lambda_L (fixed generator)."""
@@ -163,11 +217,12 @@ def layout_tradeoff(case: Case, kind: str, params: dict, samples: sun.Samples, n
     cand = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=False,
                   shading_points=shading_points, workers=1, keep_state_power=True)
     rows = []
-    prev = None
     for lam in sorted(float(v) for v in lambdas):
-        model = lu.build_model(case, xyz, samples, cand.state_power_w, lam)
-        sel, info = lu.select(model, n_select, init=prev)
-        prev = sel
+        sel, info = select_consistent(case, xyz, samples, n_select, lam, shading_points,
+                                      max(case.layout_opt.selection_iterations, 6), dense=cand, polish=True)
+        model = lu.build_model(case, xyz, samples, annual(
+            case, Field(xyz), samples=samples, aiming="center", with_flux=False, shading_points=shading_points,
+            workers=1, keep_state_power=True, blockers=sel).state_power_w, lam)
         lay = xyz[sel]
         res = annual(case, Field(lay), samples=samples, aiming="center", with_flux=False,
                      shading_points=shading_points, workers=1, keep_state_power=True)
@@ -175,7 +230,7 @@ def layout_tradeoff(case: Case, kind: str, params: dict, samples: sun.Samples, n
         row = {"lambda": lam, "energy_mwh": res.summary()["absorbed_energy_mwh"],
                "cv_circ_weighted": met["cv_circ_weighted"], "centroid_offset_m": met["centroid_offset_m"],
                "north_fraction": met["north_fraction"], "objective_mwh": met["objective_mwh"],
-               "sector_share": met["sector_share"], "swaps": info["swaps"], "xyz": lay}
+               "sector_share": met["sector_share"], "n_detached": met["n_detached"], "swaps": info["swaps"], "xyz": lay}
         if certify and lam > 0:
             row["selection_gap"] = lu.selection_bound(model, n_select, sel, max_iter=120, time_limit_s=5.0)["gap"]
         rows.append(row)
@@ -429,8 +484,9 @@ def optimize_layout(
     rows = []
     for rank, (_, row) in enumerate(top.iterrows(), start=1):
         params = {**spec.fixed, **{k: float(row[k]) for k in names}}
+        say(f"review {rank}/{len(top)}: selecting the positions (full swap neighbourhood)")
         ev = evaluate_layout(case, kind, params, samples, spec.n_heliostats, spec.shading_points,
-                             aiming=search_aiming)
+                             aiming=search_aiming, polish=True)
         info = {**{k: params[k] for k in names}, "search_rank": rank, "n_heliostats": ev.n,
                 "n_candidates": ev.n_candidates, "search_aiming": search_aiming,
                 "energy_search_objective_mwh": ev.energy_mwh,
@@ -497,10 +553,14 @@ def optimize_layout(
             if stop():
                 break
             sel = {tuple(np.round(p, 6)) for p in cur_xyz}
-            unused = np.array([i for i, p in enumerate(best.candidates_xyz) if tuple(np.round(p, 6)) not in sel])
+            in_layout = np.array([tuple(np.round(p, 6)) in sel for p in best.candidates_xyz])
+            unused = np.flatnonzero(~in_layout)
             if unused.size == 0:
                 break
-            add = unused[np.argsort(-best.candidate_energy[unused])[:m]]
+            # price unused candidates as if added to the current layout (not inside the full candidate field)
+            price = annual(case, Field(best.candidates_xyz), samples=samples, aiming="center", with_flux=False,
+                           shading_points=spec.shading_points, workers=1, blockers=in_layout).heliostat_energy_mwh
+            add = unused[np.argsort(-price[unused])[:m]]
             drop = np.argsort(cur_res.heliostat_energy_mwh)[:len(add)]
             new_xyz = np.vstack([np.delete(cur_xyz, drop, axis=0), best.candidates_xyz[add]])
             say(f"swap round {r + 1}: trying {len(add)} swaps")
@@ -576,13 +636,17 @@ def optimize_layout(
                     shading_points=spec.shading_points, keep_state_power=True)
         uniformity.update(lu.layout_metrics(case, best.xyz, review_center, rc.state_power_w, lam, grid))
         if lam > 0 and best.candidates_xyz is not None and spec.n_heliostats:
-            cand = annual(case, Field(best.candidates_xyz), samples=samples, aiming="center", with_flux=False,
-                          shading_points=spec.shading_points, workers=1, keep_state_power=True)
-            model = lu.build_model(case, best.candidates_xyz, samples, cand.state_power_w, lam, grid)
             key = {tuple(np.round(p, 6)) for p in best.xyz}
             sel = np.array([tuple(np.round(p, 6)) in key for p in best.candidates_xyz])
+            cand = annual(case, Field(best.candidates_xyz), samples=samples, aiming="center", with_flux=False,
+                          shading_points=spec.shading_points, workers=1, keep_state_power=True, blockers=sel)
+            model = lu.build_model(case, best.candidates_xyz, samples, cand.state_power_w, lam, grid)
             if sel.sum() == min(spec.n_heliostats, len(sel)):
-                uniformity["selection_certificate"] = lu.selection_bound(model, int(sel.sum()), sel)
+                cert = lu.selection_bound(model, int(sel.sum()), sel)
+                cert["model"] = ("candidate positions of this generator parameter vector, centre aim, "
+                                 "shading / blocking priced against the final layout")
+                uniformity["selection_certificate"] = cert
+        uniformity["selection"] = best.selection
         best.uniformity = uniformity
     return LayoutOptResult(best, history, ranking, samples, _time.perf_counter() - t0, validation, swaps,
                            review_aps if use_aps else review_center, capacity, evals, bound, pmap)

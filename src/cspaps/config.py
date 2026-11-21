@@ -247,6 +247,12 @@ class LayoutOpt:
     # lambda_L: weight of the circumferential (layout-determined) non-uniformity of the receiver flux.
     # Objective J = sum_t w_t [P_abs,t - lambda_L * A_H * sigma_circ,t]; 0 = annual energy only.
     uniformity_weight: float = 0.0
+    # Fixed-point passes that re-price every candidate against the selected layout (only the selected
+    # heliostats shade / block) and reselect; stops when the selection no longer changes.
+    selection_iterations: int = 2  # search stage; the review stage uses at least 6 plus the full swap polish
+    # Azimuth sectors for the layout uniformity: 0 = the receiver panels (12 x 30 deg if fewer than 6 panels).
+    # The layout decides how heat is shared between sectors / panels; the ripple inside a sector is the APS's job.
+    uniformity_sectors: int = 0
 
 
 @dataclass
@@ -374,6 +380,8 @@ def _validate(case: Case) -> None:
             raise ValueError(f"layout_opt.{name} must be sun_bins|sun_grid|hourly")
     if case.layout_opt.uniformity_weight < 0:
         raise ValueError("layout_opt.uniformity_weight must be >= 0")
+    if case.layout_opt.uniformity_sectors < 0 or case.layout_opt.selection_iterations < 0:
+        raise ValueError("layout_opt.uniformity_sectors and selection_iterations must be >= 0")
     if case.layout_opt.search_aiming not in ("auto", "center", "greedy", "kfactor"):
         raise ValueError("layout_opt.search_aiming must be auto|center|greedy|kfactor")
     if case.mcrt.tracking_mode not in ("per_ray", "per_heliostat"):
