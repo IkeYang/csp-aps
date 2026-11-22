@@ -73,7 +73,57 @@ $$
 邀请只了解镜场、辐照度和接收器基本概念的工程师，给出场地资料与示例文件，由其独立完成以下任务。测试时记录完成时间、误操作、需要求助的位置及其对结果的解释。
 
 - [ ] 能从首页选对任务，用示例完成一次单时刻计算，并指出最热点的位置和剩余热流裕度。
+  界面自动化验收：`tests/test_first_user_acceptance.py::test_task1_home_example_single_instant_hotspot_and_margin` 通过（真人验收仍按本节方法进行）。
 - [ ] 能导入自己的 DNI 表，从预览中找到错误行，修正后继续计算。
+  界面自动化验收：`tests/test_first_user_acceptance.py::test_task2_dni_table_with_a_bad_row_is_found_and_fixed` 通过（真人验收仍按本节方法进行）。
 - [ ] 能导入两个布局和同一组年度地图，指出胜出布局、实际年吸热量、年度综合得分，以及对分差贡献最大的工况。
+  界面自动化验收：`tests/test_first_user_acceptance.py::test_task3_two_layouts_same_maps_winner_energy_score_and_top_scenario` 通过（真人验收仍按本节方法进行）。
 - [ ] 能说明提高“受热均匀”偏好后改变了哪项结果，并找到此次计算使用的参数、数据来源和求解范围。
+  界面自动化验收：`tests/test_first_user_acceptance.py::test_task4_preference_change_and_where_the_basis_is` 通过（真人验收仍按本节方法进行）。
 - [ ] 能区分“本次未找到可行方案”“已证无可行方案”和“可行停机”，并决定下一步是延长计算、核对约束，还是接受停机。
+  界面自动化验收：`tests/test_first_user_acceptance.py::test_task5_shutdown_proven_infeasible_and_not_found_are_told_apart` 通过（真人验收仍按本节方法进行）。
+
+## 实施记录（0.6.0）
+
+本节记录方案各条的实现位置与验收证据。推导见[模型说明 0.6 节](MODEL.md)，数值见 [README 0.6.0](../README.md)。
+
+### 第一次打开与操作流程
+
+| 方案要求 | 实现 | 验收 |
+|---|---|---|
+| 首页两个任务入口、示例与模板 | `gui_app.page_overview`：`home_aps_demo` / `home_aps_own` / `home_layout_demo` / `home_layout_own`；示例标记“演示数据”；模板含两行样例和单位（`TEMPLATES`） | 验收任务 1、3 |
+| 先确认场地 | 比较页第 1 步：`gui_plots.site_preview`（北向箭头、米制比例尺、塔、禁排区、场界、点镜核对）；`field.site_mask` 报告被过滤的镜子；站址改动后提示气象文件仍属原站址（比较页与搜索页） | `test_site_change_warns_about_the_weather_file` |
+| 日照落在哪些镜子上 | DNI 定义首次出现即写明；工况清单逐行预览地图、点镜看插值 DNI（`_scenario_browser`）；只有站址气象时显示“本次按全场相同日照估算”；测点范围外的镜子标红并说明外推 | 验收任务 2、3 |
+| 用工程语言设置目标 | 一个偏好滑块同时设 λ_APS 与 λ_L（`_preference_controls`），硬约束单独显示；单工况试算（`task_preference_trial`）；高级设置可分开两个权重 | 验收任务 4、`test_shared_lambda_is_the_default` |
+| 知道正在算什么 | 开算前汇总（`_run_summary`）；逐工况进度“APS scenarios B: 8/20”并可取消，已完成工况保留；参数改动后“需要重新计算” | `test_cancelled_evaluation_reports_coverage_and_pending_rank`、验收任务 4 |
+| 读懂结果再导出 | 单时刻：先给吸收功率、热点管屏与余量（`_aps_headline`）；年度：A/B 并列（`_ab_block`）、按分差贡献排序的工况、本次计算的口径、工况状态说明；导出可复算 | 验收任务 1、3、5，`test_exports_recompute_every_score` |
+| 错误表 | DNI 表逐行报错并高亮（`clouds.check_dni_table`）；清单中找不到的地图指出工况名和文件名（`scenarios.check_scenario_table`）；占用裕度时“项目允许使用上限的 95%，当前为 98%”并提供重新计算入口；未找到 / 已证无解 / 可行停机分开显示下一步 | 验收任务 2、5 |
+
+### 先修正会改变排名的计算
+
+| 方案要求 | 实现 | 验收 |
+|---|---|---|
+| 实际小时与能量权重分开 | `annual.representative_dni: time_mean`（默认），工况表记录 `actual_hours` | `test_actual_hours_and_energy_weight_are_recorded_separately` |
+| 严格裕度 | 年度与单时刻都只认细网格复核 `ok`；求解器最后从当前方案修复（`aps.solve`） | `test_single_mirror_boundary_case_uses_the_margin_everywhere`、`test_near_limit_plan_keeps_its_power_after_the_final_repair` |
+| 状态与覆盖率 | 六种状态分别计分；取消后报告覆盖率、排名待定 | `test_status_accounting_rules`、`test_cancelled_evaluation_reports_coverage_and_pending_rank` |
+| 上下午热点分别扣分 | U_s 在每个工况的二维热流上计算，再按小时累加 | `test_opposite_hotspots_are_penalised_in_each_scenario` |
+| 选错址的例子 | `cases/wrong_site`（随软件包分发，`scripts/make_wrong_site_example.py` 生成）：72.817 / 59.142 与 41.449 / 84.785，逐工况独立枚举核对 | `test_wrong_site_example_reproduces_the_plan_table`、验收任务 3 |
+
+三个演示站址的吸热器峰值不到上限的 20%。此时功率与不均匀量对 DNI 一次齐次，两种小时口径的 V 逐位相同：阿克塞仍为 28,976.2 MWhₜₕ，只是小时数改报为实际小时。
+
+### 怎样判断算法值得升级
+
+| 方案要求 | 实现 | 结果（阿克塞 473 面镜） |
+|---|---|---|
+| 量出解离上界多远、区间重叠的布局加预算 | 单时刻差距旁写出候选集与时刻；年度价值区间 [Σ h J, Σ h UB]（等权重），重叠时提示（`compare_values.interval_overlaps_leader`） | `test_value_interval_brackets_the_found_value` |
+| 同条件比较内层求解器 | `benchmark.inner_benchmark`：贪心、固定响应 0/1 规划、子场分解（新方法 `aps.method: subfield`）、贪心 + 松弛取整，同一公共上界 | λ = 0.3 时平均差距依次为 0.23%、0.22%、0.22%、0.06%，平均用时 6.9、40.6、6.6、23.9 s；限值起作用时四者相同，差距 ≤ 0.025% |
+| 外层对比多起点自由镜位 | `benchmark.outer_benchmark`：差分进化与多起点自由镜位，同一 300 s 预算、两个种子，训练与留出工况集上的正式 V | 差分进化训练 / 留出 29,388 / 29,049，自由镜位 29,172 / 28,961，初始镜场 29,106 / 28,929；全部满足场界与最小镜距 |
+| 光线追迹复核四类工况 | `validation.py`、`task_validation_suite`、界面「光学校验 → 压力工况复核」，同时导出逐镜 DNI 的 SolTrace 算例 | 功率差 ≤ 0.15%；峰值差：低太阳 −5.1%、云影边缘 −0.9%、高负荷 +4.6%、逼近限制 −0.1%；逼近限制时追迹峰值为上限的 0.884 ± 0.009 |
+
+复现：`python scripts/solver_benchmark.py`；界面「光学校验」的“压力工况复核”和“求解器对比”两个标签页可以对任意算例运行同样的比较。
+
+### 尚未完成
+
+- 真人首次使用验收：五项任务都已有界面自动化测试，但方案要求记录工程师的完成时间、误操作和求助位置，这需要真人参与。
+- SolTrace 实跑：每个复核工况都已导出 SolTrace 算例与驱动脚本，本环境没有 SolTrace，相对 SolTrace 的偏差仍沿用基线审计的数字。
+

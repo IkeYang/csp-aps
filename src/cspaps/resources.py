@@ -11,3 +11,9 @@ def demo_case_path() -> Path:
     """The Aksai demo case: the repository copy in a source checkout, else the packaged copy."""
     repo = Path(__file__).resolve().parents[2] / "cases" / "aksai_demo.yaml"
     return repo if repo.exists() else DATA / "aksai_demo.yaml"
+
+
+def example_path(name: str) -> Path:
+    """An example case shipped with the program (repository copy first), e.g. "wrong_site/wrong_site.yaml"."""
+    repo = Path(__file__).resolve().parents[2] / "cases" / name
+    return repo if repo.exists() else DATA / name

@@ -73,6 +73,7 @@ class ScenarioSet:
             "elevation_deg": np.round(s.elevation, 6), "azimuth_deg": np.round(s.azimuth, 6),
             "hours": np.round(s.weight_h, 6), "dni_w_m2": np.round(s.dni, 6),
             "map_id": [self.map_id(i) for i in range(len(self))],
+            "actual_hours": np.round(s.actual_hours, 6),
             "dni_energy_kwh_m2": np.round(s.dni * s.weight_h / 1e3, 6),
         })
         if s.members is not None:
@@ -94,6 +95,7 @@ class ScenarioSet:
         hours = self.table().groupby("map_id")["hours"].sum().to_dict()
         energy = self.table().groupby("map_id")["dni_energy_kwh_m2"].sum().to_dict()
         return {"fingerprint": self.fingerprint(), "n_scenarios": len(self), "total_hours": float(self.samples.weight_h.sum()),
+                "actual_hours": float(np.sum(self.samples.actual_hours)),
                 "annual_dni_kwh_m2": round(self.samples.dni_hours, 3), "maps": used,
                 "hours_per_map": {k: round(v, 3) for k, v in hours.items()},
                 "dni_energy_per_map_kwh_m2": {k: round(v, 3) for k, v in energy.items()},
@@ -183,7 +185,7 @@ def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | 
         if k <= 0:
             continue
         sub = hourly.subset(np.flatnonzero(reg == r))
-        bins = sun.sun_bins(sub, int(k), seed=spec.seed, dni_bands=bands)
+        bins = sun.sun_bins(sub, int(k), seed=spec.seed, dni_bands=bands, weighting=case.annual.representative_dni)
         parts.append(bins)
         map_index += [r] * len(bins)
         # an hour of this regime with the closest sun direction (illustration only)
@@ -197,7 +199,8 @@ def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | 
     members = np.concatenate([p.members if p.members is not None else np.zeros(len(p), int) for p in parts])
     map_list = [maps[m] for m in regimes]
     samples = sun.Samples(cat("elevation"), cat("azimuth"), cat("dni"), cat("weight_h"), None, "scenarios",
-                          members, map_list, np.asarray(map_index, dtype=int), None)
+                          members, map_list, np.asarray(map_index, dtype=int), None,
+                          np.concatenate([p.actual_hours for p in parts]))
     order = np.lexsort((samples.azimuth, samples.map_index))
     samples = samples.subset(order)
     examples = [examples[j] for j in order]
@@ -206,6 +209,11 @@ def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | 
     meta = {"source": "weather year: " + (str(case.weather.file) if case.weather.source == "file"
                                           else f"clear sky ({case.sun.dni_model})"),
             "generation": f"DNI-energy-weighted k-means per map regime, {bands} DNI band(s)",
+            "representative_dni": case.annual.representative_dni,
+            "hours_basis": ("actual hours of the merged records, time-average DNI"
+                            if case.annual.representative_dni == "time_mean"
+                            else "irradiance-equivalent hours, energy-weighted DNI"),
+            "actual_hours_total": round(float(np.sum(hourly.weight_h)), 3),
             "map_model": spec.map_model, "map_assignment": spec.map_assignment, "regimes": regimes,
             "states_per_regime": {m: int(k) for m, k in zip(regimes, k_r)},
             "hourly_dni_kwh_m2": round(hourly.dni_hours, 3), "n_hours": len(hourly),
@@ -215,36 +223,73 @@ def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | 
 
 def _quantise(samples: sun.Samples) -> None:
     """Round the scenario table to its saved precision, so a saved and reloaded set is identical."""
-    for name in ("elevation", "azimuth", "dni", "weight_h"):
-        setattr(samples, name, np.round(np.asarray(getattr(samples, name), dtype=float), 6))
+    for name in ("elevation", "azimuth", "dni", "weight_h", "hours"):
+        if getattr(samples, name) is not None:
+            setattr(samples, name, np.round(np.asarray(getattr(samples, name), dtype=float), 6))
+
+
+def check_scenario_table(case, df: pd.DataFrame, maps: dict[str, DNIMap], map_file: str = "地图库") -> list[dict]:
+    """Problems of a scenario table, one entry per scenario and field (nothing raised).
+
+    Columns: scenario_id, hours (h), dni_w_m2 (W/m2), map_id, and either elevation_deg + azimuth_deg or a
+    local ``time`` from which the sun direction is computed for the site. Every message names the scenario.
+    """
+    out = []
+    has_angles = {"elevation_deg", "azimuth_deg"} <= set(df.columns)
+    need = ["scenario_id", "hours", "dni_w_m2", "map_id"]
+    missing = [c for c in need if c not in df.columns]
+    if not has_angles and "time" not in df.columns:
+        missing.append("elevation_deg + azimuth_deg 或 time")
+    if missing:
+        return [{"scenario": None, "field": ", ".join(missing),
+                 "message": f"工况表缺少列：{', '.join(missing)}。需要 scenario_id、太阳方向（elevation_deg、azimuth_deg，°）"
+                            "或当地时间 time、hours（代表小时，h）、dni_w_m2（W/m²）、map_id。"}]
+    ids = df["scenario_id"].astype(str)
+    for sid in ids[ids.duplicated()].unique():
+        out.append({"scenario": sid, "field": "scenario_id", "message": f"工况名 {sid} 重复出现，请让每个工况名唯一。"})
+    numeric = [("hours", "h", True), ("dni_w_m2", "W/m²", True)]
+    if has_angles:
+        numeric += [("elevation_deg", "°", False), ("azimuth_deg", "°", False)]
+    for col, unit, nonneg in numeric:
+        num = pd.to_numeric(df[col], errors="coerce")
+        bad = num.isna() | (num < 0 if nonneg else False)
+        for i in np.flatnonzero(bad.to_numpy()):
+            out.append({"scenario": ids.iloc[i], "field": col,
+                        "message": f"工况 {ids.iloc[i]} 的 {col} 是 {df[col].iloc[i]}。请输入{'非负' if nonneg else ''}数，单位 {unit}。"})
+    if not has_angles:
+        t = pd.to_datetime(df["time"], errors="coerce")
+        for i in np.flatnonzero(t.isna().to_numpy()):
+            out.append({"scenario": ids.iloc[i], "field": "time",
+                        "message": f"工况 {ids.iloc[i]} 的时间 {df['time'].iloc[i]} 无法识别，请写成 2024-06-21 13:00（当地时间）。"})
+    known = set(maps) | {"uniform"}
+    for i, m in enumerate(df["map_id"].astype(str)):
+        if m not in known:
+            out.append({"scenario": ids.iloc[i], "field": "map_id",
+                        "message": f"工况 {ids.iloc[i]} 引用的地图 {m} 在{map_file}中找不到。请重新选择地图文件，或改正工况表里的地图名。"})
+    return out
 
 
 def load_table(case, path, maps: dict[str, DNIMap] | None = None) -> ScenarioSet:
-    """Scenario table CSV: scenario_id,elevation_deg,azimuth_deg,hours,dni_w_m2,map_id[,time]."""
+    """Scenario table CSV: scenario_id, elevation_deg + azimuth_deg (or a local ``time``), hours, dni_w_m2,
+    map_id [, actual_hours, hourly_members]."""
     maps = dict(maps if maps is not None else model_maps(case))
     df = pd.read_csv(path)
-    need = {"scenario_id", "elevation_deg", "azimuth_deg", "hours", "dni_w_m2", "map_id"}
-    if not need <= set(df.columns):
-        raise ValueError(f"{path}: scenario table needs columns {sorted(need)}")
-    if df["scenario_id"].astype(str).duplicated().any():
-        raise ValueError(f"{path}: scenario IDs must be unique")
+    problems = check_scenario_table(case, df, maps, case.scenarios.map_file or "地图库")
+    if problems:
+        raise ValueError(f"{Path(path).name}: " + " ".join(p["message"] for p in problems[:5]))
     if "uniform" in set(df["map_id"].astype(str)) and "uniform" not in maps:
         maps["uniform"] = uniform_map()
-    unknown = sorted(set(df["map_id"].astype(str)) - set(maps))
-    if unknown:
-        raise ValueError(f"{path}: unknown map ids {unknown}; available {sorted(maps)}")
-    for col in ("elevation_deg", "azimuth_deg", "hours", "dni_w_m2"):
-        if not np.isfinite(df[col].to_numpy(float)).all():
-            raise ValueError(f"{path}: column {col} must be finite")
-    if (df["hours"] < 0).any() or (df["dni_w_m2"] < 0).any():
-        raise ValueError(f"{path}: hours and DNI must be nonnegative")
+    if not {"elevation_deg", "azimuth_deg"} <= set(df.columns):  # sun direction from the local time at the site
+        el, az = sun.solar_position(sun.to_times(df["time"].astype(str), case.site.timezone), case.site)
+        df["elevation_deg"], df["azimuth_deg"] = el, az
     order = list(dict.fromkeys(df["map_id"].astype(str)))
     map_list = [maps[m] for m in order]
     idx = np.array([order.index(m) for m in df["map_id"].astype(str)], dtype=int)
     samples = sun.Samples(df["elevation_deg"].to_numpy(float), df["azimuth_deg"].to_numpy(float),
                           df["dni_w_m2"].to_numpy(float), df["hours"].to_numpy(float), None, "scenario_table",
                           df["hourly_members"].to_numpy(int) if "hourly_members" in df else None, map_list, idx,
-                          [str(v) for v in df["scenario_id"]])
+                          [str(v) for v in df["scenario_id"]],
+                          df["actual_hours"].to_numpy(float) if "actual_hours" in df else None)
     _quantise(samples)
     examples = list(df["example_time"].fillna("")) if "example_time" in df else (
         list(df["time"].fillna("")) if "time" in df else None)
@@ -261,7 +306,8 @@ def load_folder(folder) -> ScenarioSet:
     samples = sun.Samples(df["elevation_deg"].to_numpy(float), df["azimuth_deg"].to_numpy(float),
                           df["dni_w_m2"].to_numpy(float), df["hours"].to_numpy(float), None, "scenarios",
                           df["hourly_members"].to_numpy(int) if "hourly_members" in df else None,
-                          [maps[m] for m in order], idx, [str(v) for v in df["scenario_id"]])
+                          [maps[m] for m in order], idx, [str(v) for v in df["scenario_id"]],
+                          df["actual_hours"].to_numpy(float) if "actual_hours" in df else None)
     meta_path = folder / "scenario_set.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     examples = list(df["example_time"].fillna("")) if "example_time" in df else None

@@ -653,7 +653,8 @@ def scenario_contrib_chart(tables: dict, labels: dict, lam: float, height: int =
 def scenario_sky_chart(table, height: int = 340):
     """Representative sun positions sized by hours and coloured by DNI map."""
     fig = go.Figure()
-    palette = {m: c for m, c in zip(sorted(set(table["map_id"])), [TEAL, AMBER, NAVY, RED, "#7b5ea7", "#3b8bc2"])}
+    colors = [TEAL, AMBER, NAVY, RED, "#7b5ea7", "#3b8bc2"]
+    palette = {m: colors[k % len(colors)] for k, m in enumerate(sorted(set(table["map_id"])))}
     for m, g in table.groupby("map_id", sort=False):
         fig.add_trace(go.Scatter(x=g["azimuth_deg"], y=g["elevation_deg"], mode="markers+text", name=str(m),
                                  text=g["scenario_id"], textposition="top center", textfont=dict(size=10),
@@ -721,4 +722,121 @@ def inner_gap_chart(tables: dict, labels: dict, height: int = 300):
                                  name=labels.get(name, name), line=dict(color=palette[k % len(palette)])))
     fig.update_yaxes(title="内层差距（%，相对该工况上界）", rangemode="tozero")
     fig.update_xaxes(title="工况")
+    return _base_layout(fig, "", height)
+
+
+def _nice_length(span: float) -> float:
+    target = max(span, 1.0) / 5.0
+    for v in (10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000):
+        if v >= target * 0.6:
+            return float(v)
+    return float(10 ** np.floor(np.log10(target)))
+
+
+def add_north_and_scale(fig, xs, ys):
+    """North arrow (paper corner) and a metric scale bar in data coordinates (equal axis scale)."""
+    xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+    x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+    span = max(x1 - x0, y1 - y0, 1.0)
+    length = _nice_length(span)
+    bx, by = x0 + 0.04 * span, y0 - 0.06 * span
+    fig.add_trace(go.Scatter(x=[bx, bx + length], y=[by, by], mode="lines+text", line=dict(color=INK, width=4),
+                             text=["", f"{length:g} m"], textposition="middle right", hoverinfo="skip",
+                             showlegend=False, name="比例尺"))
+    fig.add_annotation(x=0.985, y=0.97, xref="paper", yref="paper", ax=0, ay=36, axref="pixel", ayref="pixel",
+                       showarrow=True, arrowhead=2, arrowsize=1.4, arrowwidth=2.5, arrowcolor=INK, text="")
+    fig.add_annotation(x=0.985, y=0.995, xref="paper", yref="paper", text="<b>北 N</b>", showarrow=False,
+                       font=dict(size=12, color=INK))
+    return fig
+
+
+def site_preview(case: Case, layouts: dict, selected: int | None = None, title: str = "", height: int = 520):
+    """Plan view to confirm the site: boundary, tower, exclusion zone, one or more layouts, north arrow and scale.
+
+    ``layouts`` maps a label to (xyz, ids); markers carry the heliostat ID (customdata) for click selection.
+    """
+    rec, spec = case.receiver, case.field
+    fig = go.Figure()
+    xs, ys = [rec.center[0]], [rec.center[1]]
+    if spec.boundary is not None:
+        b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
+        fig.add_trace(go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", line=dict(color=INK, dash="dash", width=1),
+                                 name="场地边界", hoverinfo="skip"))
+        xs += list(b[:, 0])
+        ys += list(b[:, 1])
+    if spec.exclusion_radius > 0:
+        th = np.linspace(0, 2 * np.pi, 180)
+        fig.add_trace(go.Scatter(x=rec.center[0] + spec.exclusion_radius * np.sin(th),
+                                 y=rec.center[1] + spec.exclusion_radius * np.cos(th), mode="lines",
+                                 line=dict(color=RED, dash="dot", width=1), name="塔周禁排区", hoverinfo="skip"))
+    palette = [TEAL, AMBER, NAVY, "#7b5ea7"]
+    hel = case.heliostat
+    for k, (label, (xyz, ids)) in enumerate(layouts.items()):
+        xyz = np.asarray(xyz, float)
+        ids = np.asarray(ids)
+        xs += list(xyz[:, 0])
+        ys += list(xyz[:, 1])
+        size = float(np.clip(110.0 / np.sqrt(max(len(xyz), 1)), 4, 11))
+        fig.add_trace(go.Scatter(
+            x=xyz[:, 0], y=xyz[:, 1], mode="markers", name=label, customdata=ids,
+            marker=dict(size=size, color=palette[k % 4], symbol="square", line=dict(width=0.5, color="white")),
+            text=[f"{label} · 镜 {i}<br>x {p[0]:.2f} m，y {p[1]:.2f} m，z {p[2]:.2f} m<br>镜面 {hel.width:g} × {hel.height:g} m"
+                  for i, p in zip(ids, xyz)], hovertemplate="%{text}<extra></extra>"))
+        if selected is not None and np.any(ids == selected):
+            j = int(np.flatnonzero(ids == selected)[0])
+            fig.add_trace(go.Scatter(x=[xyz[j, 0]], y=[xyz[j, 1]], mode="markers", showlegend=False, hoverinfo="skip",
+                                     marker=dict(size=size + 12, color="rgba(0,0,0,0)", line=dict(width=2.5, color="magenta"))))
+    fig.add_trace(go.Scatter(x=[rec.center[0]], y=[rec.center[1]], mode="markers", name="塔（原点）",
+                             marker=dict(symbol="triangle-up", size=14, color=RED), hoverinfo="skip"))
+    add_north_and_scale(fig, xs, ys)
+    fig.update_xaxes(title="东向 x (m)", scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title="北向 y (m)")
+    return _base_layout(fig, title, height)
+
+
+def dni_points_preview(case: Case, points: np.ndarray, values: np.ndarray, xyz: np.ndarray, dni_at_mirrors: np.ndarray,
+                       inside: np.ndarray, bad_points: np.ndarray | None = None, height: int = 460):
+    """Measured DNI points, the DNI interpolated to every mirror and the mirrors outside the measured area."""
+    fig = go.Figure()
+    lo = float(min(np.min(values) if len(values) else 0, np.min(dni_at_mirrors) if len(dni_at_mirrors) else 0))
+    hi = float(max(np.max(values) if len(values) else 1, np.max(dni_at_mirrors) if len(dni_at_mirrors) else 1))
+    fig.add_trace(go.Scatter(x=xyz[:, 0], y=xyz[:, 1], mode="markers", name="定日镜（插值 DNI）",
+                             marker=dict(size=6, color=dni_at_mirrors, colorscale=DNI_SCALE, cmin=lo, cmax=hi,
+                                         showscale=True, colorbar=dict(title="DNI (W/m²)", thickness=11)),
+                             text=[f"插值 DNI {d:.0f} W/m²" + ("" if ok else "<br>测点范围外：取最近测点值")
+                                   for d, ok in zip(dni_at_mirrors, inside)], hovertemplate="%{text}<extra></extra>"))
+    out = np.flatnonzero(~np.asarray(inside, bool))
+    if out.size:
+        fig.add_trace(go.Scatter(x=xyz[out, 0], y=xyz[out, 1], mode="markers", name=f"测点范围外（{out.size} 面，外推）",
+                                 marker=dict(size=11, color="rgba(0,0,0,0)", line=dict(width=1.5, color=RED)),
+                                 hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=points[:, 0], y=points[:, 1], mode="markers", name="测点",
+                             marker=dict(size=12, symbol="diamond", color=values, colorscale=DNI_SCALE, cmin=lo,
+                                         cmax=hi, line=dict(width=1.2, color=INK)),
+                             text=[f"测点 DNI {v:.0f} W/m²" for v in values], hovertemplate="%{text}<extra></extra>"))
+    if bad_points is not None and len(bad_points):
+        fig.add_trace(go.Scatter(x=bad_points[:, 0], y=bad_points[:, 1], mode="markers", name="有错误的测点",
+                                 marker=dict(size=14, symbol="x", color=RED), hoverinfo="skip"))
+    rec = case.receiver
+    fig.add_trace(go.Scatter(x=[rec.center[0]], y=[rec.center[1]], mode="markers", name="塔",
+                             marker=dict(symbol="triangle-up", size=13, color=RED), hoverinfo="skip"))
+    add_north_and_scale(fig, np.concatenate([xyz[:, 0], points[:, 0]]), np.concatenate([xyz[:, 1], points[:, 1]]))
+    fig.update_xaxes(title="东向 x (m)", scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title="北向 y (m)")
+    return _base_layout(fig, "", height)
+
+
+def ab_compare_chart(rows: list[dict], height: int = 300):
+    """Side by side: annual heat, uniformity penalty and score of the compared layouts."""
+    fig = go.Figure()
+    names = [r["label"] for r in rows]
+    fig.add_trace(go.Bar(x=names, y=[r["energy_mwh"] for r in rows], name="年吸热量 E (MWh)", marker_color=TEAL,
+                         text=[f"{r['energy_mwh']:,.1f}" for r in rows], textposition="outside"))
+    fig.add_trace(go.Bar(x=names, y=[r["weighted_penalty_mwh"] for r in rows], name="均匀性扣分 λΠ (MWh 等效)",
+                         marker_color="#d98c7f", text=[f"{r['weighted_penalty_mwh']:,.1f}" for r in rows],
+                         textposition="outside"))
+    fig.add_trace(go.Bar(x=names, y=[r["value_mwh"] for r in rows], name="综合得分 V (MWh 等效)", marker_color=NAVY,
+                         text=[f"{r['value_mwh']:,.1f}" for r in rows], textposition="outside"))
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title="MWh / MWh 等效")
     return _base_layout(fig, "", height)

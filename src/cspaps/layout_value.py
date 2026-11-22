@@ -96,18 +96,21 @@ class InnerSettings:
 
 
 def inner_weight(case: Case) -> float:
+    """Operating weight lambda_APS: by default the same lambda as the evaluation (one preference for both
+    layers); ``layout_opt.aps_weight`` sets it separately (advanced)."""
     lo = case.layout_opt
-    if lo.aps_weight is not None:
-        return float(lo.aps_weight)
-    u = case.uniformity
-    return float(u.weight) if (u.enabled and u.mode == "weighted") else 0.0
+    return float(lo.uniformity_weight if lo.aps_weight is None else lo.aps_weight)
 
 
 def eval_grid_shape(case: Case) -> tuple[int, int]:
-    """Receiver grid fine enough for the smallest beam any allowed position can produce (layout independent)."""
+    """Receiver grid fine enough for the smallest beam any allowed position can produce (layout independent).
+
+    With ``aps.auto_grid`` off the configured receiver grid is used as it is."""
     from .optics import beam_sigma
 
     rec, hel = case.receiver, case.heliostat
+    if not case.aps.auto_grid:
+        return int(rec.n_height), int(rec.n_azimuth)
     r_min = max(case.field.exclusion_radius, rec.radius + hel.diagonal)
     slant = math.hypot(max(r_min - rec.radius, 1.0), rec.center[2] - hel.pivot_height)
     sigma = float(beam_sigma(np.array([slant]), np.array([1.0]), hel, case.sun)[0])
@@ -123,7 +126,7 @@ def eval_grid_shape(case: Case) -> tuple[int, int]:
 
 def inner_settings(case: Case, lam_aps: float | None = None) -> InnerSettings:
     lo, aps, u = case.layout_opt, case.aps, case.uniformity
-    method = aps.method if aps.method in ("greedy", "milp") else "greedy"
+    method = aps.method if aps.method in ("greedy", "milp", "subfield") else "greedy"
     return InnerSettings(
         lam_aps=float(inner_weight(case) if lam_aps is None else lam_aps), method=method,
         joint_trials=int(lo.inner_joint_trials), certify_rounds=int(lo.inner_certify_rounds),
@@ -235,6 +238,8 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
                           np.zeros(grid.shape) if keep_flux else None, _time.perf_counter() - t0)
     prob = build_problem(c, fld, elevation, azimuth, dni_v, dni_constraint, grid=grid)
     res = solve(prob, settings.method, c.aps)
+    solver_info = {k: res.info[k] for k in ("subfield_serial_s", "subfield_parallel_s", "milp_status",
+                                             "final_repair_rounds") if k in res.info}
     initial = res.choice.copy()
     dual = None
     if settings.certify_rounds > 0 and (prob.k + 1) ** min(prob.n, 20) > c.aps.coupled_exact_limit:
@@ -258,7 +263,10 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     chk = res.check
     upper = cert.get("upper_bound_mw")
     info = {"bound_status": cert["status"], "evaluated_joint_poses": cert.get("evaluated_joint_poses"),
-            "raw_power_w": float(thermal["power_w"]), "raw_spread_w": float(thermal["spread_w"])}
+            "raw_power_w": float(thermal["power_w"]), "raw_spread_w": float(thermal["spread_w"]), **solver_info}
+    if chk is not None:
+        info.update(hotspot_panel=int(chk.hotspot_panel), hotspot_azimuth_deg=float(chk.hotspot_azimuth_deg),
+                    hotspot_z_m=float(chk.hotspot_z), peak_to_limit=float(chk.peak_ratio))
     if dual is not None:
         info["dual_bound_mw"] = dual.get("upper_bound_mw")
         info["dual_gap"] = dual.get("gap")
@@ -285,6 +293,8 @@ class ScenarioRecord:
     azimuth_deg: float
     dni_w_m2: float  # scenario DNI (site mean for normalised factor maps)
     plan: PlanResult
+    actual_hours: float | None = None  # real time the scenario stands for (h); hours is the weight of V
+    map_digest: str | None = None  # content hash of the DNI map (identifies the exact map used)
 
     def row(self, lam_aps: float, lam_l: float) -> dict:
         p = self.plan
@@ -307,6 +317,9 @@ class ScenarioRecord:
             "p_intercepted_mw": p.p_int_w / 1e6, "p_region_mw": p.p_h_w / 1e6, "cv_2d": p.cv_2d,
             "circ_u_mw": p.circ_u_w / 1e6, "peak_flux_kw_m2": p.peak_flux_kw_m2, "peak_to_allowed": p.peak_ratio,
             "flux_status": p.flux_status, "n_active": p.n_active, "n_defocused": p.n_defocused,
+            "peak_to_limit": p.info.get("peak_to_limit"), "hotspot_panel": p.info.get("hotspot_panel"),
+            "hotspot_azimuth_deg": p.info.get("hotspot_azimuth_deg"), "hotspot_z_m": p.info.get("hotspot_z_m"),
+            "dni_map_digest": self.map_digest, "actual_hours": self.actual_hours,
             "solve_time_s": round(p.solve_time_s, 3),
         }
 
@@ -321,9 +334,12 @@ def annual_value(table: pd.DataFrame, lam_l: float) -> dict:
     u = np.where(counts, table["u_mw"].to_numpy(float), 0.0)
     e = float(h @ p)
     pen = float(h @ u)
-    complete = not bool((table["status"] == "not_solved").any())
+    solved = ~(table["status"] == "not_solved").to_numpy()
+    complete = bool(solved.all())
     return {"value_mwh": e - lam_l * pen if complete else float("nan"), "energy_mwh": e, "penalty_mwh": pen,
-            "complete": complete}
+            "complete": complete, "value_partial_mwh": e - lam_l * pen,
+            "n_scenarios": int(len(table)), "n_solved": int(solved.sum()),
+            "coverage": float(solved.mean()), "hours_coverage": float(h[solved].sum() / h.sum()) if h.sum() > 0 else 1.0}
 
 
 @dataclass
@@ -354,11 +370,17 @@ class LayoutValue:
         status = t["status"].value_counts().to_dict() if len(t) else {}
         hours = t.groupby("status")["hours"].sum().to_dict() if len(t) else {}
         fe = t[t["counts_in_value"]] if len(t) else t
-        ub = fe["upper_bound_mw"].fillna(0.0).to_numpy(float) if len(fe) else np.zeros(0)
         jj = fe["j_inner_mw"].to_numpy(float) if len(fe) else np.zeros(0)
         hh = fe["hours"].to_numpy(float) if len(fe) else np.zeros(0)
-        inner_ub = float(hh @ ub)
         inner_j = float(hh @ jj)
+        # upper bound on sum_s h_s max_a J_s (this layout, this candidate model): every scenario with a bound adds
+        # h max(UB, 0); proven infeasible and sunless scenarios add 0; an unsolved scenario leaves it open
+        bounded = t["status"].isin(("feasible", "feasible_shutdown", "no_feasible_found")) if len(t) else t
+        ub_all = (t.loc[bounded, "upper_bound_mw"].astype(float).clip(lower=0.0) if len(t) else pd.Series(dtype=float))
+        inner_ub = (float((t.loc[bounded, "hours"] * ub_all).sum()) if len(t) and ub_all.notna().all()
+                    else float("nan"))
+        if len(t) and (t["status"] == "not_solved").any():
+            inner_ub = float("nan")
         e_circ = float((t["hours"] * t["circ_u_mw"] * t["counts_in_value"]).sum()) if len(t) else 0.0
         energy = v["energy_mwh"]
         cv_w = (float((t["hours"] * t["p_abs_mw"] * t["cv_2d"].fillna(0)).sum() / max((t["hours"] * t["p_abs_mw"]).sum(), 1e-12))
@@ -367,9 +389,15 @@ class LayoutValue:
             "name": self.name, "n_heliostats": self.n, "value_mwh": v["value_mwh"], "energy_mwh": energy,
             "penalty_mwh": v["penalty_mwh"], "weighted_penalty_mwh": lam * v["penalty_mwh"],
             "complete": v["complete"], "lambda_aps": self.lam_aps, "lambda_layout": lam,
+            "value_partial_mwh": v["value_partial_mwh"], "n_scenarios": v["n_scenarios"], "n_solved": v["n_solved"],
+            "coverage": v["coverage"], "hours_coverage": v["hours_coverage"],
+            "ranking_status": "ranked" if v["complete"] else "pending",
             "status_counts": status, "status_hours": {k: round(float(x), 3) for k, x in hours.items()},
             "inner_objective_mwh": inner_j, "inner_upper_bound_mwh": inner_ub,
             "inner_gap_annual": (1.0 - inner_j / inner_ub) if inner_ub > 0 else None,
+            # with equal weights V is the hour sum of J_s, so [V, sum h UB_s] brackets the layout's best value
+            "value_interval_mwh": ([inner_j, inner_ub] if abs(lam - self.lam_aps) < 1e-12 and np.isfinite(inner_ub)
+                                   else None),
             "max_inner_gap": float(t["inner_gap"].dropna().max()) if len(t) and t["inner_gap"].notna().any() else None,
             "circ_penalty_mwh": e_circ, "cv_2d_power_weighted": cv_w,
             "scenario_fingerprint": self.scenario_fingerprint, "settings_digest": self.settings.digest(),
@@ -462,7 +490,8 @@ def solve_scenario(case: Case, fld: Field, sset, i: int, settings: InnerSettings
     plan = solve_instant(case, fld, float(s.elevation[i]), float(s.azimuth[i]), sset.dni_at(i, fld.xyz[:, :2]),
                          settings, grid, keep_flux)
     return ScenarioRecord(sset.ids[i], sset.map_id(i), float(s.weight_h[i]), float(s.elevation[i]),
-                          float(s.azimuth[i]), float(s.dni[i]), plan)
+                          float(s.azimuth[i]), float(s.dni[i]), plan, float(s.actual_hours[i]),
+                          sset.samples.map_of(i).digest())
 
 
 def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout", ids=None,
@@ -482,19 +511,29 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
     nw = min(n_workers(case.layout_opt.workers if workers is None else workers), max(n_s, 1))
     results: list = [None] * n_s
     stop = cancel or (lambda: False)
-    if nw > 1 and n_s > 1:
-        order = np.argsort(-sset.samples.weight_h * sset.samples.dni)  # big scenarios first, spread over workers
-        chunks = [[int(i) for i in order[k::nw]] for k in range(nw)]
-        with pool(nw) as p:
+    if stop():  # cancelled before this layout started: every scenario is reported as not solved
+        n_s_run = 0
+    else:
+        n_s_run = n_s
+    if nw > 1 and n_s_run > 1:
+        order = [int(i) for i in np.argsort(-sset.samples.weight_h * sset.samples.dni)]  # big scenarios first
+        p = pool(nw)
+        try:
             done = 0
-            for out in p.imap_unordered(_scenario_chunk, [(case, xyz, ids, sset, c, settings, keep_flux)
-                                                          for c in chunks]):
+            for out in p.imap_unordered(_scenario_chunk, [(case, xyz, ids, sset, [i], settings, keep_flux)
+                                                          for i in order]):
                 for i, rec in out:
                     results[i] = rec
-                done += len(out)
+                    done += 1
                 if progress:
                     progress(f"APS scenarios {name}: {done}/{n_s}")
-    else:
+                if stop():
+                    p.terminate()  # keep what is finished; the rest is reported as not solved
+                    break
+        finally:
+            p.close()
+            p.join()
+    elif n_s_run:
         fld = Field(xyz, ids)
         grid = build_grid(case.receiver, settings.grid_shape[1], settings.grid_shape[0])
         for i in range(n_s):
@@ -511,7 +550,8 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
             plan = PlanResult("not_solved", 0.0, 0.0, 0.0, 0.0, None, None, 0.0, 0.0, None, None, None, False, 0.0,
                               0.0, "unverified", 0, n, z, z, z, np.zeros(n, bool), z, None, 0.0)
             results[i] = ScenarioRecord(sset.ids[i], sset.map_id(i), float(s.weight_h[i]), float(s.elevation[i]),
-                                        float(s.azimuth[i]), float(s.dni[i]), plan)
+                                        float(s.azimuth[i]), float(s.dni[i]), plan, float(s.actual_hours[i]),
+                                        sset.samples.map_of(i).digest())
     return LayoutValue(name, xyz, ids, results, settings.lam_aps, lam_l, sset.fingerprint(), settings,
                        _time.perf_counter() - t0, dict(tags or {}))
 
@@ -536,6 +576,17 @@ def compare_values(values: list[LayoutValue], lam_l: float | None = None, refere
     df["delta_energy_mwh"] = df["energy_mwh"] - ref["energy_mwh"]
     df["delta_uniformity_mwh"] = -lam * (df["penalty_mwh"] - ref["penalty_mwh"])
     df["reference"] = ref_name
+    # bound intervals (equal weights): a layout whose upper end reaches the leader's found value could still win
+    # with a larger inner budget -- these get more budget before the ranking is called final
+    lead_lo = df.loc[0, "value_mwh"] if bool(df.loc[0, "rankable"]) else float("nan")
+
+    def overlap(row):
+        iv = row["value_interval_mwh"]
+        if row.name == 0 or iv is None or not np.isfinite(lead_lo):
+            return None
+        return bool(iv[1] >= lead_lo)
+
+    df["interval_overlaps_leader"] = df.apply(overlap, axis=1)
     return df
 
 

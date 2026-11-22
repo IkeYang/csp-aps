@@ -27,10 +27,13 @@ from cspaps import workflows as wf
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def study(name: str, out: Path, n_scenarios: int, dense: int, map_model: str | None = None) -> dict:
+def study(name: str, out: Path, n_scenarios: int, dense: int, map_model: str | None = None,
+          cloud_maps: int | None = None) -> dict:
     case = load_case(ROOT / "cases" / f"{name}.yaml")
     if map_model:
         case.scenarios.map_model = map_model
+    if cloud_maps:
+        case.scenarios.cloud_maps = cloud_maps
     lo = case.layout_opt
     lo.refine_top, lo.formal_swap_rounds, lo.dense_check_scenarios = 3, 2, dense
     lo.review_check_hourly, lo.workers = False, 4
@@ -122,6 +125,7 @@ def main() -> None:
     p.add_argument("--tag", default="", help="suffix of the result key (keeps earlier runs of the same case)")
     p.add_argument("--map-model", default=None, help="override scenarios.map_model (e.g. uniform)")
     p.add_argument("--robustness", nargs="+", default=None, help="result keys whose winners are re-scored")
+    p.add_argument("--cloud-maps", type=int, default=None, help="override scenarios.cloud_maps")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -132,7 +136,7 @@ def main() -> None:
     done = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     for name in a.cases:
         print(f"=== {name}", flush=True)
-        done[name + a.tag] = study(name, out, a.scenarios, a.dense, a.map_model)
+        done[name + a.tag] = study(name, out, a.scenarios, a.dense, a.map_model, a.cloud_maps)
         path.write_text(json.dumps(done, indent=2, ensure_ascii=False, default=float), encoding="utf-8")
     print(path)
 

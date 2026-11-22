@@ -156,7 +156,7 @@ layout_opt:
   upper_bound: true
   uniformity_weight: 0.3          # outer weight lambda_L of V(L) = sum_s h_s (P_s - lambda_L U_s)
   ranking: aps_value              # formal ranking: every shortlisted layout gets its own APS plan per scenario
-  aps_weight: null                # inner weight lambda_APS (null = uniformity.weight of problem 1)
+  aps_weight: null                # operating weight lambda_APS (null = the same lambda as uniformity_weight)
   baseline: initial               # rank the initial field (the 473 heliostats above) as well
   formal_swap_rounds: 1
   inner_joint_trials: 2

@@ -214,7 +214,7 @@ def task_aim(
         prob = build_problem(case, fld, el, az, dni_v, dni_con, grid=grid)
         res = solve(prob, method, case.aps, prev, prev_active)
         proposal_check = res.check
-        if do_certify and method in ("greedy", "kfactor", "milp") and fld.n:
+        if do_certify and method in ("greedy", "kfactor", "milp", "subfield") and fld.n:
             if progress:
                 progress("certifying: upper bound and relaxation rounding")
             initial = res.choice.copy()
@@ -271,6 +271,20 @@ def task_aim(
                                          for c in check_summary["top_contributors"]]
     summary = {"status": status, "aps": res.summary() if res is not None else {"method": "center"},
                "flux_check": check_summary, **snap.summary(), **_dropped_note(fld)}
+    margin = case.aps.safety_margin
+    summary["margin_check"] = {"allowed_fraction": 1.0 - margin, "peak_fraction": chk_con.peak_ratio,
+                               "within_margin": chk_con.status == "ok", "within_limit": chk_con.status != "over_limit",
+                               "hotspot_panel": int(chk_con.hotspot_panel),
+                               "hotspot_azimuth_deg": chk_con.hotspot_azimuth_deg, "hotspot_z_m": chk_con.hotspot_z}
+    if method != "center":
+        # reference for the result sentence: the same instant and DNI with every mirror on the centre point
+        from .receiver import default_aim
+
+        snap_c = evaluate(case, fld, el, az, dni_v, aim=default_aim(case.receiver, fld.xyz), grid=grid, time=ts)
+        chk_c = snap_c.verify(case.receiver)
+        summary["center_reference"] = {"absorbed_power_mw": snap_c.p_absorbed / 1e6,
+                                       "peak_flux_kw_m2": chk_c.peak_flux_kw_m2, "peak_fraction": chk_c.peak_ratio,
+                                       "status": chk_c.status}
     summary["flux_check"]["basis"] = ("final aim points, shading and blocking re-evaluated for them, full beams, "
                                       "fine grid, constraint DNI")
     if res is not None and proposal_check is not None:
@@ -718,6 +732,118 @@ def task_soltrace_export(case: Case, base: str | Path, time, method: str = "cent
     return {"summary": _clean(res["summary"]), "files": res["files"], "run_dir": out}
 
 
+def task_validation_suite(case: Case, base: str | Path, keys=None, rays: int | None = None, seeds: int | None = None,
+                          year: int = 2025, soltrace: bool = True, progress: Progress | None = None) -> dict:
+    """Ray-trace checks of the stress states (low sun, cloud edge, high-load mixed aiming, near the limit).
+
+    Physical error (analytic vs MCRT on the same plan and grid) and the solver gap are reported separately;
+    every plan is also exported for SolTrace (per-mirror DNI as a reflectivity factor)."""
+    from .soltrace import export_plan
+    from .validation import SUITE, compare_state, row, suite_states
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "validation_suite")
+    say = progress or (lambda m: None)
+    fld = build_field(case)
+    keys = tuple(keys or SUITE)
+    states = suite_states(case, fld, keys, year=year, progress=say)
+    grid = build_grid(case.receiver)
+    results, rows, files = [], [], {}
+    for st_ in states:
+        say(f"ray trace {st_.key}")
+        r = compare_state(st_, fld, rays=rays, seeds=seeds, grid=build_grid(st_.case.receiver))
+        maps = r.pop("maps")
+        header = (f"kW/m2; {st_.key}; grid {grid.azimuth_deg.size} azimuth x {grid.z.size} height; rows = height "
+                  f"bottom->top, columns = azimuth from N clockwise; MCRT seeds {r['physical']['mcrt']['seeds']}, "
+                  f"{r['physical']['mcrt']['rays_per_heliostat']} rays/heliostat")
+        for k in ("analytic", "mcrt"):
+            fp = out / f"{st_.key}_{k}_kw_m2.csv"
+            np.savetxt(fp, maps[f"{k}_w_m2"] / 1e3, delimiter=",", fmt="%.4f", header=header)
+            files[f"{st_.key}_{k}_csv"] = fp
+        fp = out / f"{st_.key}_limit_kw_m2.csv"
+        np.savetxt(fp, maps["limit_w_m2"] / 1e3, delimiter=",", fmt="%.4f", header=header.replace(st_.key, f"{st_.key} limit"))
+        files[f"{st_.key}_limit_csv"] = fp
+        png = out / f"{st_.key}_flux_compare.png"
+        plot_flux_compare(maps["analytic_w_m2"], maps["mcrt_w_m2"], build_grid(st_.case.receiver), st_.case.receiver, png,
+                          labels=(f"Analytic, {st_.key}", f"MCRT ({len(r['physical']['mcrt']['seeds'])} seeds)"))
+        files[f"{st_.key}_png"] = png
+        if soltrace:
+            p = st_.plan
+            ex = export_plan(st_.case, fld, st_.time, st_.elevation, st_.azimuth, st_.dni, (p.aim_azimuth, p.aim_z),
+                             p.active, out / "soltrace" / st_.key, method=f"suite:{st_.key}", with_mcrt=False)
+            r["soltrace_export"] = {"folder": str(out / "soltrace" / st_.key), "next_step": ex["summary"]["next_step"],
+                                    "dni_per_mirror": ex["summary"]["dni_w_m2"]["per_mirror"]}
+        r["maps_files"] = {k: str(v) for k, v in files.items() if k.startswith(st_.key)}
+        r["_maps"] = maps
+        results.append(r)
+        rows.append(row(r))
+    table = pd.DataFrame(rows)
+    files["summary_csv"] = out / "validation_suite.csv"
+    table.to_csv(files["summary_csv"], index=False, encoding="utf-8-sig")
+    files["summary_json"] = out / "validation_suite.json"
+    summary = {"states": [{k: v for k, v in r.items() if k != "_maps"} for r in results], "table": rows,
+               "conventions": {"physical_error": "analytic minus MCRT on the same plan, grid and DNI per mirror",
+                               "solver_gap": "(upper bound - objective) / upper bound on the candidate set, analytic model",
+                               "mcrt_within_limit": "MCRT mean map + 2 standard errors <= the limit (same grid)",
+                               "dni": "clear-sky model of the case (not the weather record); cloud edge scales it per mirror"}}
+    _json(files["summary_json"], summary)
+    finish(out, "validation_suite", {"table": rows}, {"keys": list(keys), "rays": rays, "seeds": seeds, "year": year}, t0)
+    return {"summary": _clean(summary), "table": table, "maps": {r["key"]: r["_maps"] for r in results},
+            "files": files, "run_dir": out}
+
+
+def task_solver_benchmark(case: Case, base: str | Path, part: str = "inner", n_states: int = 6, budget_s: float = 60.0,
+                          seeds=(1, 2), limit_factor: float | None = None, methods=None,
+                          max_evals: int | None = None, lam_aps: float | None = None,
+                          progress: Progress | None = None) -> dict:
+    """Solvers under the same conditions: inner (task 1 on the largest scenarios) and / or outer (layout search).
+
+    ``limit_factor`` scales every flux limit (e.g. 0.45) so that the limits bind; the record says so."""
+    from . import benchmark as bm
+    from .validation import tighten_limits
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "solver_benchmark")
+    say = progress or (lambda m: None)
+    c = tighten_limits(case, float(limit_factor)) if limit_factor else case
+    summary: dict = {"case": case.name, "budget_s": budget_s, "limit_factor": limit_factor,
+                     "max_flux_kw_m2": c.receiver.max_flux_kw_m2, "lambda_aps": lam_aps}
+    files = {}
+    result: dict = {}
+    if part in ("inner", "both"):
+        fld = build_field(c)
+        states = bm.inner_states(c, fld, n_states)
+        df = bm.inner_benchmark(c, fld, states, methods or bm.INNER_METHODS, budget_s, lam_aps=lam_aps, progress=say)
+        agg = bm.inner_summary(df)
+        files["inner_csv"] = out / "inner_benchmark.csv"
+        files["inner_summary_csv"] = out / "inner_benchmark_summary.csv"
+        df.to_csv(files["inner_csv"], index=False, encoding="utf-8-sig")
+        agg.to_csv(files["inner_summary_csv"], index=False, encoding="utf-8-sig")
+        summary["inner"] = {"n_heliostats": fld.n, "states": [s["label"] for s in states],
+                            "summary": agg.to_dict("records"), "runs": df.to_dict("records")}
+        result["inner"], result["inner_summary"] = df, agg
+    if part in ("outer", "both"):
+        r = bm.outer_benchmark(c, methods or bm.OUTER_METHODS, tuple(seeds), budget_s, max_evals=max_evals, progress=say)
+        files["outer_csv"] = out / "layout_benchmark.csv"
+        files["outer_summary_csv"] = out / "layout_benchmark_summary.csv"
+        r["runs"].to_csv(files["outer_csv"], index=False, encoding="utf-8-sig")
+        r["summary"].to_csv(files["outer_summary_csv"], index=False, encoding="utf-8-sig")
+        for name, xyz in r["layouts"].items():
+            fp = out / f"layout_{name}.csv"
+            save_layout_csv(Field(xyz), fp)
+            files[f"layout_{name}"] = fp
+        summary["outer"] = {"runs": r["runs"].to_dict("records"), "summary": r["summary"].to_dict("records"),
+                            "train": r["train"], "held_out": r["held_out"], "seeds": r["seeds"],
+                            "settings_digest": r["settings_digest"], "n_heliostats": c.layout_opt.n_heliostats}
+        result["outer"], result["outer_summary"] = r["runs"], r["summary"]
+    files["summary_json"] = out / "solver_benchmark.json"
+    _json(files["summary_json"], summary)
+    finish(out, "solver_benchmark", {"part": part}, {"part": part, "n_states": n_states, "budget_s": budget_s,
+                                                       "seeds": list(seeds), "limit_factor": limit_factor,
+                                                       "lambda_aps": lam_aps}, t0)
+    return {"summary": _clean(summary), **result, "files": files, "run_dir": out}
+
+
 def task_shading_check(case: Case, base: str | Path) -> dict:
     """Corridor screening vs brute force on the advisor's four stress cases."""
     from . import optics
@@ -768,10 +894,12 @@ def task_sunbins(case: Case, base: str | Path, n_bins: int | None = None, check:
     t0 = _time.perf_counter()
     out = out_dir(base, case, "sunbins")
     hourly = sun.hourly_samples(case)
-    bins = sun.sun_bins(hourly, n_bins or case.annual.n_sun_bins, dni_bands=case.annual.dni_bands)
+    bins = sun.sun_bins(hourly, n_bins or case.annual.n_sun_bins, dni_bands=case.annual.dni_bands,
+                        weighting=case.annual.representative_dni)
     files = {"bins_csv": out / "sun_bins.csv", "bins_png": out / "sun_bins.png", "summary_json": out / "sun_bins.json"}
     pd.DataFrame({"elevation_deg": bins.elevation, "azimuth_deg": bins.azimuth, "dni_w_m2": bins.dni,
-                  "weight_h": bins.weight_h, "dni_energy_kwh_m2": bins.dni * bins.weight_h / 1e3,
+                  "weight_h": bins.weight_h, "actual_hours": bins.actual_hours,
+                  "dni_energy_kwh_m2": bins.dni * bins.weight_h / 1e3,
                   "hourly_members": bins.members}).to_csv(files["bins_csv"], index=False)
     plot_sun_bins(hourly, bins, files["bins_png"])
     summary = {"n_hourly_samples": len(hourly), "n_bins": len(bins), "annual_dni_kwh_m2": round(hourly.dni_hours, 1),
@@ -784,8 +912,9 @@ def task_sunbins(case: Case, base: str | Path, n_bins: int | None = None, check:
                  "runtime_s": _time.perf_counter() - t}]
         variants = [("sun_bins", k) for k in (20, 30, 40)] + [("sun_grid", None)]
         for name, k in variants:
-            smp = sun.sun_bins(hourly, k) if name == "sun_bins" else sun.sun_grid(
-                hourly, case.annual.grid_elevation_step_deg, case.annual.grid_azimuth_step_deg)
+            smp = sun.sun_bins(hourly, k, weighting=case.annual.representative_dni) if name == "sun_bins" else sun.sun_grid(
+                hourly, case.annual.grid_elevation_step_deg, case.annual.grid_azimuth_step_deg,
+                weighting=case.annual.representative_dni)
             t = _time.perf_counter()
             e = annual(case, fld, samples=smp, with_flux=False, workers=1).energy_mwh["intercept"]
             rows.append({"method": name if k is None else f"{name}_{k}", "n_states": len(smp), "energy_mwh": e,
@@ -833,6 +962,8 @@ def layout_label(name: str) -> str:
     """Display name of a formal-ranking layout (search_2+swap1 -> 搜索候选 2 + 换位 1)."""
     if name in LAYOUT_NAMES_ZH:
         return LAYOUT_NAMES_ZH[name]
+    if len(name) == 1 and name.isalpha():
+        return f"布局 {name}"
     if name.startswith("search_"):
         base, _, swap = name.partition("+swap")
         txt = f"搜索候选 {base.removeprefix('search_')}"
@@ -961,9 +1092,7 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
     lam = case.layout_opt.uniformity_weight if lam_layout is None else float(lam_layout)
     layouts = layouts or {"initial": "initial"}
     values, notes = {}, {}
-    for name, src in layouts.items():
-        if cancel and cancel():
-            break
+    for name, src in layouts.items():  # a cancelled run keeps every layout; unsolved scenarios are marked
         xyz, ids, note = _layout_source(case, src)
         notes[name] = note
         values[name] = evaluate_layout_value(case, xyz, sset, name, ids=ids, settings=settings, lam_layout=lam,
@@ -1108,3 +1237,40 @@ def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, ra
                                            "radius_m": list(radius_m), "transmittance": list(transmittance)}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out, "states": states, "field": fld,
             "grid": grid, "transmittance": tau, "clouds": cl, "case": case}
+
+
+def task_preference_trial(case: Case, base: str | Path, scenario_id: str | None = None, lambdas=(0.0, None),
+                          layout="initial", scenarios_dir=None) -> dict:
+    """Try the preference on one scenario: the same layout solved with each lambda (None = the case's lambda).
+
+    Returns absorbed power, hottest flux, uniformity (CV, U) and objective for every lambda, so a user sees
+    what moving the "more heat <-> more uniform heating" slider changes before running the whole year.
+    """
+    from .layout_value import inner_settings, solve_scenario
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "preference_trial")
+    sset = _scenario_set_for(case, scenarios_dir)
+    if scenario_id is None:  # the scenario with the most DNI energy
+        scenario_id = sset.ids[int(np.argmax(sset.samples.dni * sset.samples.weight_h))]
+    i = sset.index(scenario_id)
+    xyz, ids, note = _layout_source(case, layout)
+    fld = Field(xyz, ids)
+    rows = []
+    for lam in lambdas:
+        lam = case.layout_opt.uniformity_weight if lam is None else float(lam)
+        st = inner_settings(case, lam)
+        rec = solve_scenario(case, fld, sset, i, st, keep_flux=False)
+        p = rec.plan
+        rows.append({"lambda": lam, "status": p.status, "p_abs_mw": p.p_abs_w / 1e6, "u_mw": p.u_w / 1e6,
+                     "cv_2d": p.cv_2d, "peak_flux_kw_m2": p.peak_flux_kw_m2, "peak_to_limit": p.info.get("peak_to_limit"),
+                     "hotspot_panel": p.info.get("hotspot_panel"), "objective_mw": p.objective_w / 1e6,
+                     "n_defocused": p.n_defocused, "inner_gap": p.gap})
+    summary = {"status": "done", "scenario_id": scenario_id, "map_id": sset.map_id(i),
+               "hours": float(sset.samples.weight_h[i]), "layout": note, "n_heliostats": fld.n,
+               "max_flux_kw_m2": case.receiver.max_flux_kw_m2, "safety_margin": case.aps.safety_margin,
+               "trials": rows}
+    files = {"summary_json": out / "preference_trial.json"}
+    _json(files["summary_json"], summary)
+    finish(out, "preference_trial", summary, {"scenario_id": scenario_id, "lambdas": list(lambdas)}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out}

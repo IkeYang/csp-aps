@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
                         ("aps", "control engine, one instant: optimise and verify aim points")]:
         sp = add(name, help_)
         sp.add_argument("--time", required=True, help='local time, e.g. "2025-06-21 13:40"')
-        sp.add_argument("--method", choices=["center", "kfactor", "greedy", "milp"], default=None)
+        sp.add_argument("--method", choices=["center", "kfactor", "greedy", "milp", "subfield"], default=None)
         sp.add_argument("--dni", type=float, default=None, help="uniform DNI override (W/m2)")
         sp.add_argument("--dni-map", default=None, help="CSV x,y,dni: measured DNI at the heliostats")
         sp.add_argument("--forecast-dni-map", default=None, help="CSV x,y,dni: highest DNI expected before the next update")
@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("realtime", "replay real-time APS under cloud shadows (scenario from the case)")
     sp = add("annual", "annual energy on the receiver")
     sp.add_argument("--method", choices=["sun_bins", "sun_grid", "representative_days", "hourly"], default=None)
-    sp.add_argument("--aiming", choices=["center", "kfactor", "greedy", "milp"], default=None)
+    sp.add_argument("--aiming", choices=["center", "kfactor", "greedy", "milp", "subfield"], default=None)
     sp = add("optimize-layout", "optimise the field layout for constrained annual energy")
     sp.add_argument("--uniformity-weight", type=float, default=None,
                     help="lambda_L: weight of the circumferential receiver non-uniformity (0 = energy only)")
@@ -89,6 +89,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--layouts", nargs="*", default=None, help="layout CSV files (and/or 'initial')")
     sp.add_argument("--scenarios", default=None, help="saved scenario-set folder (default: build from the case)")
     sp.add_argument("--lambda-layout", type=float, default=None, help="outer weight lambda_L (default layout_opt)")
+    sp = add("validation-suite", "ray-trace checks: low sun, cloud edge, high-load mixed aiming, near the flux limit")
+    sp.add_argument("--states", nargs="*", default=None,
+                    choices=["low_sun", "cloud_edge", "mixed_high_load", "near_limit"])
+    sp.add_argument("--rays", type=int, default=None, help="MCRT rays per heliostat (default mcrt.rays_per_heliostat)")
+    sp.add_argument("--seeds", type=int, default=None, help="independent MCRT seeds (default mcrt.n_seeds)")
+    sp.add_argument("--no-soltrace", action="store_true", help="skip the SolTrace export of every plan")
+    sp = add("solver-benchmark", "solvers under the same budget: task-1 methods (inner) or layout searches (outer)")
+    sp.add_argument("--part", choices=["inner", "outer", "both"], default="inner")
+    sp.add_argument("--states", type=int, default=6, help="inner: number of scenarios (largest h x DNI first)")
+    sp.add_argument("--budget", type=float, default=60.0, help="wall-time budget per method (and seed), s")
+    sp.add_argument("--seeds", type=int, nargs="*", default=[1, 2], help="outer: random seeds")
+    sp.add_argument("--limit-factor", type=float, default=None, help="scale every flux limit (make them bind)")
+    sp.add_argument("--weight", type=float, default=None, help="inner lambda_APS (default: the case's)")
     sp = sub.add_parser("rescore", help="recompute V(L) from exported scenario_values.csv files for another lambda_L")
     sp.add_argument("folder")
     sp.add_argument("--lambda-layout", type=float, required=True)
@@ -204,6 +217,12 @@ def main(argv: list[str] | None = None) -> int:
         res = wf.task_soltrace_export(case, out, args.time, args.method, args.rays, args.seeds)
     elif args.command == "shading-check":
         res = wf.task_shading_check(case, out)
+    elif args.command == "validation-suite":
+        res = wf.task_validation_suite(case, out, keys=args.states, rays=args.rays, seeds=args.seeds,
+                                       soltrace=not args.no_soltrace, progress=_progress)
+    elif args.command == "solver-benchmark":
+        res = wf.task_solver_benchmark(case, out, args.part, args.states, args.budget, tuple(args.seeds),
+                                       limit_factor=args.limit_factor, lam_aps=args.weight, progress=_progress)
     elif args.command == "sunbins":
         res = wf.task_sunbins(case, out, n_bins=args.bins, check=args.check)
     else:  # pragma: no cover

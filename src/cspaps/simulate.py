@@ -293,12 +293,14 @@ class AnnualResult:
             "hours_uniformity_failed": round(uniformity_failed, 2),
             "hours_flux_or_verification_failed": round(flux_failed, 2),
             "feasible_sun_states": int(feasible.sum()),
-            "peak_basis": "verified fine grid" if self.aiming != "center" else "coarse grid",
+            "peak_basis": ("verified fine grid" if self.aiming != "center" or self.sampling.get("flux_checked", True)
+                           else "coarse grid (not checked)"),
             "runtime_s": round(self.runtime_s, 2),
         }
 
 
-def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading_points, blockers=None):
+def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading_points, blockers=None,
+                  check_flux=True):
     """Evaluate one sun state; returns (stage power arrays, row dict)."""
     if aiming == "center":
         snap = evaluate(case, fld, el, az, dni_v, grid=grid, with_flux=with_flux, time=ts,
@@ -306,6 +308,10 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
         peak = snap.flux.max() / 1e3
         ratio = float((snap.flux.ravel() / grid.limit).max())
         status = ""
+        if with_flux and check_flux and snap.beams is not None and len(snap.beams["power"]):
+            # feasibility from the fine-grid check with full beams (the coarse map can miss narrow peaks)
+            chk = snap.verify(case.receiver, max_cells=case.aps.verify_max_cells)
+            peak, ratio, status = chk.peak_flux_kw_m2, chk.peak_ratio, chk.status
         uniformity_status = "not_checked"
         cv_2d = cv_circ = cv_height = power_h_mw = float("nan")
     else:
@@ -326,7 +332,12 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
         power_h_mw = res.info.get("power_H_mw", float("nan"))
     flux_on = with_flux or aiming != "center"
     over_limit = bool(flux_on and ratio > 1.0 + 1e-9)
-    flux_feasible = (status in ("ok", "margin_reduced") if aiming != "center" else (with_flux and not over_limit))
+    # one feasibility rule everywhere: the safety margin is part of the constraint, so a plan that uses part of
+    # the margin ("margin_reduced": within the hard limit, above (1 - margin) x limit) is not counted as feasible
+    allowed = 1.0 - case.aps.safety_margin
+    margin_used = bool(flux_on and ratio > allowed + 1e-9)
+    checked = aiming != "center" or (with_flux and check_flux)
+    flux_feasible = bool(checked and (status == "ok" if status else (with_flux and not margin_used)))
     if case.uniformity.enabled and flux_on:
         mask = region_of_grid(case, grid, case.uniformity)
         metrics = uniformity_metrics(snap.absorbed_flux, grid.to_map(mask))
@@ -360,7 +371,7 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
         "time": ts, "sun_elevation_deg": el, "sun_azimuth_deg": az,
         "dni_w_m2": float(np.mean(dni_v)) if np.size(dni_v) else 0.0, "p_receiver_mw": snap.p_receiver / 1e6, "p_absorbed_mw": snap.p_absorbed / 1e6,
         "optical_efficiency": snap.p_receiver / snap.power["sun"].sum() if snap.power["sun"].sum() > 0 else 0.0,
-        "peak_flux_kw_m2": peak, "peak_to_limit": ratio, "over_limit": over_limit,
+        "peak_flux_kw_m2": peak, "peak_to_limit": ratio, "over_limit": over_limit, "margin_used": margin_used,
         "n_defocused": int((~snap.active).sum()), "aps_status": status,
         "flux_feasible": bool(flux_feasible), "uniformity_status": uniformity_status,
         "uniformity_cv_2d": cv_2d, "uniformity_cv_circ": cv_circ, "uniformity_cv_height": cv_height,
@@ -374,11 +385,11 @@ def _annual_state(case, fld, grid, el, az, dni_v, ts, aiming, with_flux, shading
 
 
 def _annual_chunk(args):
-    case, xyz, ids, items, aiming, with_flux, shading_points, blockers = args
+    case, xyz, ids, items, aiming, with_flux, shading_points, blockers, check_flux = args
     fld = Field(xyz, ids)
     grid = build_grid(case.receiver)
-    return [(i, *_annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points, blockers))
-            for i, el, az, d, ts in items]
+    return [(i, *_annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points, blockers,
+                               check_flux)) for i, el, az, d, ts in items]
 
 
 def annual(
@@ -394,6 +405,7 @@ def annual(
     workers: int | None = None,
     keep_state_power: bool = False,
     blockers: np.ndarray | None = None,
+    check_flux: bool = True,
 ) -> AnnualResult:
     """Annual energy on the receiver.
 
@@ -404,7 +416,9 @@ def annual(
     ``workers`` processes (default ``annual.workers``). ``keep_state_power``
     keeps the (states x heliostats) intercepted power in ``state_power_w``.
     ``blockers`` (centre aiming only) limits the mirrors that shade / block others
-    (see ``shading.shading_blocking``).
+    (see ``shading.shading_blocking``). ``check_flux`` (centre aiming with flux maps): verify every state on
+    the fine grid for the feasibility columns; False skips the check (energy / spread studies) and then no
+    state counts as flux-feasible.
     """
     from .parallel import n_workers, pool
 
@@ -424,7 +438,7 @@ def annual(
         with pool(nw) as p:
             done = 0
             for out in p.imap_unordered(_annual_chunk, [(case, fld.xyz, fld.ids, c, aiming, with_flux, shading_points,
-                                                         blockers) for c in chunks]):
+                                                         blockers, check_flux) for c in chunks]):
                 for i, powers, row in out:
                     results[i] = (powers, row)
                 done += len(out)
@@ -432,7 +446,8 @@ def annual(
                     progress(done, n_s)
     else:
         for i, el, az, d, ts in items:
-            results[i] = _annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points, blockers)
+            results[i] = _annual_state(case, fld, grid, el, az, d, ts, aiming, with_flux, shading_points, blockers,
+                                       check_flux)
             if progress:
                 progress(i + 1, n_s)
     energy = {k: 0.0 for k in STAGES}
@@ -450,6 +465,7 @@ def annual(
         eff = np.where(per_sun > 0, per_rec / per_sun, 0.0)
     res = AnnualResult(energy, per_rec, eff, pd.DataFrame(rows), method, aiming, _time.perf_counter() - t0)
     res.sampling = sun.sampling_record(case, samples, aiming)
+    res.sampling["flux_checked"] = bool(aiming != "center" or (with_flux and check_flux))
     if keep_state_power:
         res.state_power_w = (np.stack([powers["intercept"] for powers, _ in results]) if results
                              else np.zeros((0, fld.n)))
