@@ -271,6 +271,20 @@ def task_aim(
                                          for c in check_summary["top_contributors"]]
     summary = {"status": status, "aps": res.summary() if res is not None else {"method": "center"},
                "flux_check": check_summary, **snap.summary(), **_dropped_note(fld)}
+    margin = case.aps.safety_margin
+    summary["margin_check"] = {"allowed_fraction": 1.0 - margin, "peak_fraction": chk_con.peak_ratio,
+                               "within_margin": chk_con.status == "ok", "within_limit": chk_con.status != "over_limit",
+                               "hotspot_panel": int(chk_con.hotspot_panel),
+                               "hotspot_azimuth_deg": chk_con.hotspot_azimuth_deg, "hotspot_z_m": chk_con.hotspot_z}
+    if method != "center":
+        # reference for the result sentence: the same instant and DNI with every mirror on the centre point
+        from .receiver import default_aim
+
+        snap_c = evaluate(case, fld, el, az, dni_v, aim=default_aim(case.receiver, fld.xyz), grid=grid, time=ts)
+        chk_c = snap_c.verify(case.receiver)
+        summary["center_reference"] = {"absorbed_power_mw": snap_c.p_absorbed / 1e6,
+                                       "peak_flux_kw_m2": chk_c.peak_flux_kw_m2, "peak_fraction": chk_c.peak_ratio,
+                                       "status": chk_c.status}
     summary["flux_check"]["basis"] = ("final aim points, shading and blocking re-evaluated for them, full beams, "
                                       "fine grid, constraint DNI")
     if res is not None and proposal_check is not None:
@@ -836,6 +850,8 @@ def layout_label(name: str) -> str:
     """Display name of a formal-ranking layout (search_2+swap1 -> 搜索候选 2 + 换位 1)."""
     if name in LAYOUT_NAMES_ZH:
         return LAYOUT_NAMES_ZH[name]
+    if len(name) == 1 and name.isalpha():
+        return f"布局 {name}"
     if name.startswith("search_"):
         base, _, swap = name.partition("+swap")
         txt = f"搜索候选 {base.removeprefix('search_')}"
@@ -964,9 +980,7 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
     lam = case.layout_opt.uniformity_weight if lam_layout is None else float(lam_layout)
     layouts = layouts or {"initial": "initial"}
     values, notes = {}, {}
-    for name, src in layouts.items():
-        if cancel and cancel():
-            break
+    for name, src in layouts.items():  # a cancelled run keeps every layout; unsolved scenarios are marked
         xyz, ids, note = _layout_source(case, src)
         notes[name] = note
         values[name] = evaluate_layout_value(case, xyz, sset, name, ids=ids, settings=settings, lam_layout=lam,
@@ -1111,3 +1125,40 @@ def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, ra
                                            "radius_m": list(radius_m), "transmittance": list(transmittance)}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out, "states": states, "field": fld,
             "grid": grid, "transmittance": tau, "clouds": cl, "case": case}
+
+
+def task_preference_trial(case: Case, base: str | Path, scenario_id: str | None = None, lambdas=(0.0, None),
+                          layout="initial", scenarios_dir=None) -> dict:
+    """Try the preference on one scenario: the same layout solved with each lambda (None = the case's lambda).
+
+    Returns absorbed power, hottest flux, uniformity (CV, U) and objective for every lambda, so a user sees
+    what moving the "more heat <-> more uniform heating" slider changes before running the whole year.
+    """
+    from .layout_value import inner_settings, solve_scenario
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "preference_trial")
+    sset = _scenario_set_for(case, scenarios_dir)
+    if scenario_id is None:  # the scenario with the most DNI energy
+        scenario_id = sset.ids[int(np.argmax(sset.samples.dni * sset.samples.weight_h))]
+    i = sset.index(scenario_id)
+    xyz, ids, note = _layout_source(case, layout)
+    fld = Field(xyz, ids)
+    rows = []
+    for lam in lambdas:
+        lam = case.layout_opt.uniformity_weight if lam is None else float(lam)
+        st = inner_settings(case, lam)
+        rec = solve_scenario(case, fld, sset, i, st, keep_flux=False)
+        p = rec.plan
+        rows.append({"lambda": lam, "status": p.status, "p_abs_mw": p.p_abs_w / 1e6, "u_mw": p.u_w / 1e6,
+                     "cv_2d": p.cv_2d, "peak_flux_kw_m2": p.peak_flux_kw_m2, "peak_to_limit": p.info.get("peak_to_limit"),
+                     "hotspot_panel": p.info.get("hotspot_panel"), "objective_mw": p.objective_w / 1e6,
+                     "n_defocused": p.n_defocused, "inner_gap": p.gap})
+    summary = {"status": "done", "scenario_id": scenario_id, "map_id": sset.map_id(i),
+               "hours": float(sset.samples.weight_h[i]), "layout": note, "n_heliostats": fld.n,
+               "max_flux_kw_m2": case.receiver.max_flux_kw_m2, "safety_margin": case.aps.safety_margin,
+               "trials": rows}
+    files = {"summary_json": out / "preference_trial.json"}
+    _json(files["summary_json"], summary)
+    finish(out, "preference_trial", summary, {"scenario_id": scenario_id, "lambdas": list(lambdas)}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out}

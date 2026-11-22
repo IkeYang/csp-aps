@@ -228,25 +228,60 @@ def _quantise(samples: sun.Samples) -> None:
             setattr(samples, name, np.round(np.asarray(getattr(samples, name), dtype=float), 6))
 
 
+def check_scenario_table(case, df: pd.DataFrame, maps: dict[str, DNIMap], map_file: str = "地图库") -> list[dict]:
+    """Problems of a scenario table, one entry per scenario and field (nothing raised).
+
+    Columns: scenario_id, hours (h), dni_w_m2 (W/m2), map_id, and either elevation_deg + azimuth_deg or a
+    local ``time`` from which the sun direction is computed for the site. Every message names the scenario.
+    """
+    out = []
+    has_angles = {"elevation_deg", "azimuth_deg"} <= set(df.columns)
+    need = ["scenario_id", "hours", "dni_w_m2", "map_id"]
+    missing = [c for c in need if c not in df.columns]
+    if not has_angles and "time" not in df.columns:
+        missing.append("elevation_deg + azimuth_deg 或 time")
+    if missing:
+        return [{"scenario": None, "field": ", ".join(missing),
+                 "message": f"工况表缺少列：{', '.join(missing)}。需要 scenario_id、太阳方向（elevation_deg、azimuth_deg，°）"
+                            "或当地时间 time、hours（代表小时，h）、dni_w_m2（W/m²）、map_id。"}]
+    ids = df["scenario_id"].astype(str)
+    for sid in ids[ids.duplicated()].unique():
+        out.append({"scenario": sid, "field": "scenario_id", "message": f"工况名 {sid} 重复出现，请让每个工况名唯一。"})
+    numeric = [("hours", "h", True), ("dni_w_m2", "W/m²", True)]
+    if has_angles:
+        numeric += [("elevation_deg", "°", False), ("azimuth_deg", "°", False)]
+    for col, unit, nonneg in numeric:
+        num = pd.to_numeric(df[col], errors="coerce")
+        bad = num.isna() | (num < 0 if nonneg else False)
+        for i in np.flatnonzero(bad.to_numpy()):
+            out.append({"scenario": ids.iloc[i], "field": col,
+                        "message": f"工况 {ids.iloc[i]} 的 {col} 是 {df[col].iloc[i]}。请输入{'非负' if nonneg else ''}数，单位 {unit}。"})
+    if not has_angles:
+        t = pd.to_datetime(df["time"], errors="coerce")
+        for i in np.flatnonzero(t.isna().to_numpy()):
+            out.append({"scenario": ids.iloc[i], "field": "time",
+                        "message": f"工况 {ids.iloc[i]} 的时间 {df['time'].iloc[i]} 无法识别，请写成 2024-06-21 13:00（当地时间）。"})
+    known = set(maps) | {"uniform"}
+    for i, m in enumerate(df["map_id"].astype(str)):
+        if m not in known:
+            out.append({"scenario": ids.iloc[i], "field": "map_id",
+                        "message": f"工况 {ids.iloc[i]} 引用的地图 {m} 在{map_file}中找不到。请重新选择地图文件，或改正工况表里的地图名。"})
+    return out
+
+
 def load_table(case, path, maps: dict[str, DNIMap] | None = None) -> ScenarioSet:
-    """Scenario table CSV: scenario_id,elevation_deg,azimuth_deg,hours,dni_w_m2,map_id[,time]."""
+    """Scenario table CSV: scenario_id, elevation_deg + azimuth_deg (or a local ``time``), hours, dni_w_m2,
+    map_id [, actual_hours, hourly_members]."""
     maps = dict(maps if maps is not None else model_maps(case))
     df = pd.read_csv(path)
-    need = {"scenario_id", "elevation_deg", "azimuth_deg", "hours", "dni_w_m2", "map_id"}
-    if not need <= set(df.columns):
-        raise ValueError(f"{path}: scenario table needs columns {sorted(need)}")
-    if df["scenario_id"].astype(str).duplicated().any():
-        raise ValueError(f"{path}: scenario IDs must be unique")
+    problems = check_scenario_table(case, df, maps, case.scenarios.map_file or "地图库")
+    if problems:
+        raise ValueError(f"{Path(path).name}: " + " ".join(p["message"] for p in problems[:5]))
     if "uniform" in set(df["map_id"].astype(str)) and "uniform" not in maps:
         maps["uniform"] = uniform_map()
-    unknown = sorted(set(df["map_id"].astype(str)) - set(maps))
-    if unknown:
-        raise ValueError(f"{path}: unknown map ids {unknown}; available {sorted(maps)}")
-    for col in ("elevation_deg", "azimuth_deg", "hours", "dni_w_m2"):
-        if not np.isfinite(df[col].to_numpy(float)).all():
-            raise ValueError(f"{path}: column {col} must be finite")
-    if (df["hours"] < 0).any() or (df["dni_w_m2"] < 0).any():
-        raise ValueError(f"{path}: hours and DNI must be nonnegative")
+    if not {"elevation_deg", "azimuth_deg"} <= set(df.columns):  # sun direction from the local time at the site
+        el, az = sun.solar_position(sun.to_times(df["time"].astype(str), case.site.timezone), case.site)
+        df["elevation_deg"], df["azimuth_deg"] = el, az
     order = list(dict.fromkeys(df["map_id"].astype(str)))
     map_list = [maps[m] for m in order]
     idx = np.array([order.index(m) for m in df["map_id"].astype(str)], dtype=int)

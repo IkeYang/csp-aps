@@ -29,7 +29,7 @@ cspaps = "cspaps.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-cspaps = ["data/*.yaml", "data/*.csv"]
+cspaps = ["data/*.yaml", "data/*.csv", "data/wrong_site/*.yaml", "data/wrong_site/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

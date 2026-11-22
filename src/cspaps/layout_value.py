@@ -262,6 +262,9 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     upper = cert.get("upper_bound_mw")
     info = {"bound_status": cert["status"], "evaluated_joint_poses": cert.get("evaluated_joint_poses"),
             "raw_power_w": float(thermal["power_w"]), "raw_spread_w": float(thermal["spread_w"])}
+    if chk is not None:
+        info.update(hotspot_panel=int(chk.hotspot_panel), hotspot_azimuth_deg=float(chk.hotspot_azimuth_deg),
+                    hotspot_z_m=float(chk.hotspot_z), peak_to_limit=float(chk.peak_ratio))
     if dual is not None:
         info["dual_bound_mw"] = dual.get("upper_bound_mw")
         info["dual_gap"] = dual.get("gap")
@@ -288,6 +291,8 @@ class ScenarioRecord:
     azimuth_deg: float
     dni_w_m2: float  # scenario DNI (site mean for normalised factor maps)
     plan: PlanResult
+    actual_hours: float | None = None  # real time the scenario stands for (h); hours is the weight of V
+    map_digest: str | None = None  # content hash of the DNI map (identifies the exact map used)
 
     def row(self, lam_aps: float, lam_l: float) -> dict:
         p = self.plan
@@ -310,6 +315,9 @@ class ScenarioRecord:
             "p_intercepted_mw": p.p_int_w / 1e6, "p_region_mw": p.p_h_w / 1e6, "cv_2d": p.cv_2d,
             "circ_u_mw": p.circ_u_w / 1e6, "peak_flux_kw_m2": p.peak_flux_kw_m2, "peak_to_allowed": p.peak_ratio,
             "flux_status": p.flux_status, "n_active": p.n_active, "n_defocused": p.n_defocused,
+            "peak_to_limit": p.info.get("peak_to_limit"), "hotspot_panel": p.info.get("hotspot_panel"),
+            "hotspot_azimuth_deg": p.info.get("hotspot_azimuth_deg"), "hotspot_z_m": p.info.get("hotspot_z_m"),
+            "dni_map_digest": self.map_digest, "actual_hours": self.actual_hours,
             "solve_time_s": round(p.solve_time_s, 3),
         }
 
@@ -480,7 +488,8 @@ def solve_scenario(case: Case, fld: Field, sset, i: int, settings: InnerSettings
     plan = solve_instant(case, fld, float(s.elevation[i]), float(s.azimuth[i]), sset.dni_at(i, fld.xyz[:, :2]),
                          settings, grid, keep_flux)
     return ScenarioRecord(sset.ids[i], sset.map_id(i), float(s.weight_h[i]), float(s.elevation[i]),
-                          float(s.azimuth[i]), float(s.dni[i]), plan)
+                          float(s.azimuth[i]), float(s.dni[i]), plan, float(s.actual_hours[i]),
+                          sset.samples.map_of(i).digest())
 
 
 def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout", ids=None,
@@ -500,7 +509,11 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
     nw = min(n_workers(case.layout_opt.workers if workers is None else workers), max(n_s, 1))
     results: list = [None] * n_s
     stop = cancel or (lambda: False)
-    if nw > 1 and n_s > 1:
+    if stop():  # cancelled before this layout started: every scenario is reported as not solved
+        n_s_run = 0
+    else:
+        n_s_run = n_s
+    if nw > 1 and n_s_run > 1:
         order = [int(i) for i in np.argsort(-sset.samples.weight_h * sset.samples.dni)]  # big scenarios first
         p = pool(nw)
         try:
@@ -518,7 +531,7 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
         finally:
             p.close()
             p.join()
-    else:
+    elif n_s_run:
         fld = Field(xyz, ids)
         grid = build_grid(case.receiver, settings.grid_shape[1], settings.grid_shape[0])
         for i in range(n_s):
@@ -535,7 +548,8 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
             plan = PlanResult("not_solved", 0.0, 0.0, 0.0, 0.0, None, None, 0.0, 0.0, None, None, None, False, 0.0,
                               0.0, "unverified", 0, n, z, z, z, np.zeros(n, bool), z, None, 0.0)
             results[i] = ScenarioRecord(sset.ids[i], sset.map_id(i), float(s.weight_h[i]), float(s.elevation[i]),
-                                        float(s.azimuth[i]), float(s.dni[i]), plan)
+                                        float(s.azimuth[i]), float(s.dni[i]), plan, float(s.actual_hours[i]),
+                                        sset.samples.map_of(i).digest())
     return LayoutValue(name, xyz, ids, results, settings.lam_aps, lam_l, sset.fingerprint(), settings,
                        _time.perf_counter() - t0, dict(tags or {}))
 

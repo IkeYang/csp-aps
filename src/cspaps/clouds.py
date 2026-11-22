@@ -9,6 +9,7 @@ pyrheliometer network) can be loaded from CSV instead.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -134,12 +135,14 @@ def load_dni_map(path, xy: np.ndarray) -> np.ndarray:
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
     df = pd.read_csv(path)
-    if not {"x", "y", "dni"} <= set(df.columns):
-        raise ValueError(f"{path}: DNI map CSV needs columns x,y,dni")
+    clean, problems = check_dni_table(df)
+    if problems:
+        raise ValueError(f"{Path(path).name}: " + " ".join(p["message"] for p in problems[:5]))
+    if not len(clean):
+        raise ValueError(f"{Path(path).name}: no DNI points")
+    df = clean
     pts = df[["x", "y"]].to_numpy(float)
     val = df["dni"].to_numpy(float)
-    if not len(pts) or not np.isfinite(pts).all() or not np.isfinite(val).all() or (val < 0).any():
-        raise ValueError("DNI samples need finite coordinates and nonnegative irradiance")
     if len(df) == len(xy) and np.allclose(pts, xy[:, :2], atol=1e-3):
         return np.clip(val, 0.0, None)
     nearest = NearestNDInterpolator(pts, val)(xy[:, 0], xy[:, 1])
@@ -178,3 +181,47 @@ def cloud_transmittance(clouds: list[Cloud], xy: np.ndarray) -> np.ndarray:
     """Transmittance of frozen cloud shadows at the points (1 = clear)."""
     t0 = pd.Timestamp("2000-01-01")
     return CloudField(clouds, t0).transmittance(np.asarray(xy, dtype=float).reshape(-1, 2), t0)
+
+
+DNI_DEFINITION = "直射辐照度（DNI，W/m²），表示垂直于太阳光线的单位面积收到多少直射功率"
+
+
+def check_dni_table(df: pd.DataFrame, value_col: str = "dni") -> tuple[pd.DataFrame, list[dict]]:
+    """Row-level check of a DNI point table (x, y, dni). Returns (rows that pass as floats, problems).
+
+    Every problem names the data row (1-based, header not counted), the column, the raw value and what is
+    expected, e.g. row 3: dni is 'missing' -> enter a nonnegative number in W/m2 and import again.
+    """
+    problems = []
+    need = ["x", "y", value_col]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        return df.iloc[0:0], [{"row": None, "column": ", ".join(missing), "value": None,
+                               "message": f"文件缺少列 {', '.join(missing)}。需要表头 x,y,{value_col}（x 东、y 北，单位 m；"
+                                          f"{value_col} 单位 W/m²）。"}]
+    ok = np.ones(len(df), dtype=bool)
+    for col in need:
+        num = pd.to_numeric(df[col], errors="coerce")
+        bad = num.isna() | ~np.isfinite(num.to_numpy(dtype=float, na_value=np.nan))
+        if col == value_col:
+            bad |= num < 0
+        for i in np.flatnonzero(bad.to_numpy()):
+            raw = df[col].iloc[i]
+            unit = "W/m²" if col == value_col else "m"
+            what = "非负数" if col == value_col else "数"
+            problems.append({"row": int(i) + 1, "column": col, "value": raw,
+                             "message": f"第 {i + 1} 行的 {col} 是 {raw}。请输入{what}，单位 {unit}，再重新导入。"})
+        ok &= ~bad.to_numpy()
+    clean = df.loc[ok, need].astype(float)
+    return clean, problems
+
+
+def coverage_of_points(points_xy: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    """True where a heliostat lies inside the convex hull of the measurement points (interpolated, not extrapolated)."""
+    from scipy.spatial import Delaunay
+
+    pts = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+    q = np.asarray(xy, dtype=float).reshape(-1, 2)
+    if len(pts) < 3 or np.linalg.matrix_rank(pts - pts.mean(axis=0)) < 2:
+        return np.zeros(len(q), dtype=bool)
+    return Delaunay(pts).find_simplex(q) >= 0

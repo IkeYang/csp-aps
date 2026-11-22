@@ -4,7 +4,6 @@ from itertools import product
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from cspaps import case_from_dict, load_case, sun
@@ -149,13 +148,13 @@ def _ring(n, r, phase=0.0):
 def test_cancelled_evaluation_reports_coverage_and_pending_rank():
     case = _case()
     sset = build_scenarios(case)
-    calls = {"n": 0}
+    done = {"n": 0}
 
-    def cancel():
-        calls["n"] += 1
-        return calls["n"] > 2  # two scenarios solved, then cancelled
+    def progress(msg):
+        done["n"] = int(msg.rsplit(":", 1)[1].split("/")[0])  # "APS scenarios B: 2/4"
 
-    part = evaluate_layout_value(case, _ring(20, 60.0), sset, "B", workers=1, cancel=cancel)
+    part = evaluate_layout_value(case, _ring(20, 60.0), sset, "B", workers=1, progress=progress,
+                                 cancel=lambda: done["n"] >= 2)  # the user cancels after two scenarios
     full = evaluate_layout_value(case, _ring(20, 70.0), sset, "A", workers=1)
     t = part.totals()
     assert t["ranking_status"] == "pending" and t["n_solved"] == 2 and t["coverage"] == pytest.approx(0.5)
