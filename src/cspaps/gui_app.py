@@ -129,7 +129,7 @@ LABELS = {
     "layout_opt.shading_points": "阴影采样点数", "layout_opt.maxiter": "进化代数", "layout_opt.popsize": "种群规模系数",
     "layout_opt.seed": "随机种子", "layout_opt.workers": "并行进程 (-1 = 全部)",
     "layout_opt.refine_top": "复核前几名", "layout_opt.polish_rounds": "局部微调轮数",
-    "layout_opt.ranking": "正式排名口径", "layout_opt.aps_weight": "内层（瞄准）权重 λ_APS（空 = 沿用问题一的 λ）",
+    "layout_opt.ranking": "正式排名口径", "layout_opt.aps_weight": "运行权重 λ_APS（空 = 与评价权重 λ_L 相同）",
     "layout_opt.baseline": "初始布局对照", "layout_opt.formal_swap_rounds": "正式排名后的换位轮数（按 V 接受）",
     "layout_opt.inner_joint_trials": "每个工况的联合姿态搜索次数", "layout_opt.inner_certify_rounds": "每个工况的松弛取整次数（0 = 关）",
     "layout_opt.inner_certify_iters": "每个工况的对偶上界迭代数", "layout_opt.dense_check_scenarios": "更密工况复核的工况数（0 = 关）",

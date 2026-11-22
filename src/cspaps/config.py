@@ -220,6 +220,9 @@ class AnnualSpec:
     time_step_min: float = 60.0
     min_sun_elevation_deg: float = 5.0
     aiming: str = "center"  # "center" (fast) or an APS method name
+    # representative DNI of a merged state: "time_mean" (weight = the actual hours) or "energy_weighted"
+    # (sum G^2 w / sum G w, weight = irradiance-equivalent hours, the 0.4 / 0.5.0 convention)
+    representative_dni: str = "time_mean"
 
 
 @dataclass
@@ -259,7 +262,7 @@ class LayoutOpt:
     uniformity_sectors: int = 0
     # ---- formal ranking: V(L) = sum_s h_s (P_s - lambda_L U_s) from per-scenario APS plans (layout_value.py)
     ranking: str = "aps_value"  # "aps_value" (per-scenario APS on the scenario set) | "legacy" (0.4 review)
-    aps_weight: float | None = None  # inner lambda_APS of P - lambda_APS U; None = uniformity.weight (weighted mode) else 0
+    aps_weight: float | None = None  # inner (operating) lambda_APS of P - lambda_APS U; None = uniformity_weight (one lambda)
     baseline: str = "initial"  # "initial": the case's own field (N heliostats nearest the tower) is ranked too | "none"
     formal_swap_rounds: int = 1  # swap rounds on the winner, accepted only if V(L) increases
     inner_joint_trials: int = 2  # joint-pose neighbourhood trials per scenario solve
@@ -485,6 +488,8 @@ def _validate(case: Case) -> None:
         raise ValueError("aps.safety_margin must be in [0, 1)")
     if case.aps.method not in ("center", "kfactor", "greedy", "milp"):
         raise ValueError(f"aps.method '{case.aps.method}' not in center|kfactor|greedy|milp")
+    if case.annual.representative_dni not in ("time_mean", "energy_weighted"):
+        raise ValueError("annual.representative_dni must be time_mean|energy_weighted")
     if case.annual.method not in ("sun_bins", "sun_grid", "representative_days", "hourly"):
         raise ValueError(f"annual.method '{case.annual.method}' not in sun_bins|sun_grid|representative_days|hourly")
     if case.weather.source == "file" and not case.weather.file:

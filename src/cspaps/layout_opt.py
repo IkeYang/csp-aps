@@ -101,8 +101,8 @@ def make_samples(case: Case, method: str, n_bins: int, dni_bands: int = 1, hourl
         return hourly
     if method == "sun_grid":
         a = case.annual
-        return sun.sun_grid(hourly, a.grid_elevation_step_deg, a.grid_azimuth_step_deg, dni_bands)
-    return sun.sun_bins(hourly, n_bins, seed=seed, dni_bands=dni_bands)
+        return sun.sun_grid(hourly, a.grid_elevation_step_deg, a.grid_azimuth_step_deg, dni_bands, a.representative_dni)
+    return sun.sun_bins(hourly, n_bins, seed=seed, dni_bands=dni_bands, weighting=case.annual.representative_dni)
 
 
 def _spread_mwh(result, case, operational=False):
@@ -123,7 +123,7 @@ def _hourly_theoretical_score(case, xyz, hourly, lam, shading_points):
 
     full = _surface_score(case)
     res = annual(case, Field(xyz), samples=hourly, aiming="center", with_flux=full,
-                 shading_points=shading_points, keep_state_power=lam > 0 and not full)
+                 shading_points=shading_points, keep_state_power=lam > 0 and not full, check_flux=False)
     energy = float(res.timeseries["p_absorbed_mw"] @ hourly.weight_h) if len(hourly) else 0.0
     if full:
         return energy, _spread_mwh(res, case)
@@ -186,7 +186,7 @@ def evaluate_layout(
     penalty = lam * uni["circ_spread_mwh"] if uni else 0.0
     if aiming == "center" and lam > 0 and _surface_score(case):
         center_res = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=True,
-                            shading_points=shading_points, workers=1)
+                            shading_points=shading_points, workers=1, check_flux=False)
         center_energy = center_res.summary()["absorbed_energy_mwh"]
         penalty = lam * _spread_mwh(center_res, case)
     if aiming == "center":
@@ -276,7 +276,7 @@ def layout_tradeoff(case: Case, kind: str, params: dict, samples: sun.Samples, n
         lay = xyz[sel]
         full = _surface_score(case)
         res = annual(case, Field(lay), samples=samples, aiming="center", with_flux=full,
-                     shading_points=shading_points, workers=1, keep_state_power=True)
+                     shading_points=shading_points, workers=1, keep_state_power=True, check_flux=False)
         met = lu.layout_metrics(case, lay, samples, res.state_power_w, lam)
         row = {"lambda": lam, "energy_mwh": res.summary()["absorbed_energy_mwh"],
                "cv_circ_weighted": met["cv_circ_weighted"], "centroid_offset_m": met["centroid_offset_m"],
@@ -343,7 +343,8 @@ def _refine_positions(case, ev, samples, rng):
             continue
         full = _surface_score(case)
         result = annual(case, Field(xyz), samples=samples, aiming="center", with_flux=full,
-                        shading_points=spec.shading_points, workers=1, keep_state_power=spec.uniformity_weight > 0)
+                        shading_points=spec.shading_points, workers=1, keep_state_power=spec.uniformity_weight > 0,
+                        check_flux=False)
         energy = result.summary()["absorbed_energy_mwh"]
         uni = (lu.layout_metrics(case, xyz, samples, result.state_power_w, spec.uniformity_weight)
                if spec.uniformity_weight > 0 else None)
@@ -639,7 +640,7 @@ def optimize_layout(
         if ev.n and spec.refine_top > 0:
             say(f"review {rank}/{len(top)}: centre aiming on {len(review_center)} states")
             rc = annual(case, Field(ev.xyz), samples=review_center, aiming="center", grid=grid,
-                        shading_points=spec.shading_points, keep_state_power=True)
+                        shading_points=spec.shading_points, keep_state_power=True, check_flux=False)
             info["energy_review_center_mwh"] = rc.summary()["absorbed_energy_mwh"]
             uni = lu.layout_metrics(case, ev.xyz, review_center, rc.state_power_w, lam, grid)
             ev.uniformity = uni

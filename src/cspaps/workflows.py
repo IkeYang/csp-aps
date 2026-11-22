@@ -768,10 +768,12 @@ def task_sunbins(case: Case, base: str | Path, n_bins: int | None = None, check:
     t0 = _time.perf_counter()
     out = out_dir(base, case, "sunbins")
     hourly = sun.hourly_samples(case)
-    bins = sun.sun_bins(hourly, n_bins or case.annual.n_sun_bins, dni_bands=case.annual.dni_bands)
+    bins = sun.sun_bins(hourly, n_bins or case.annual.n_sun_bins, dni_bands=case.annual.dni_bands,
+                        weighting=case.annual.representative_dni)
     files = {"bins_csv": out / "sun_bins.csv", "bins_png": out / "sun_bins.png", "summary_json": out / "sun_bins.json"}
     pd.DataFrame({"elevation_deg": bins.elevation, "azimuth_deg": bins.azimuth, "dni_w_m2": bins.dni,
-                  "weight_h": bins.weight_h, "dni_energy_kwh_m2": bins.dni * bins.weight_h / 1e3,
+                  "weight_h": bins.weight_h, "actual_hours": bins.actual_hours,
+                  "dni_energy_kwh_m2": bins.dni * bins.weight_h / 1e3,
                   "hourly_members": bins.members}).to_csv(files["bins_csv"], index=False)
     plot_sun_bins(hourly, bins, files["bins_png"])
     summary = {"n_hourly_samples": len(hourly), "n_bins": len(bins), "annual_dni_kwh_m2": round(hourly.dni_hours, 1),
@@ -784,8 +786,9 @@ def task_sunbins(case: Case, base: str | Path, n_bins: int | None = None, check:
                  "runtime_s": _time.perf_counter() - t}]
         variants = [("sun_bins", k) for k in (20, 30, 40)] + [("sun_grid", None)]
         for name, k in variants:
-            smp = sun.sun_bins(hourly, k) if name == "sun_bins" else sun.sun_grid(
-                hourly, case.annual.grid_elevation_step_deg, case.annual.grid_azimuth_step_deg)
+            smp = sun.sun_bins(hourly, k, weighting=case.annual.representative_dni) if name == "sun_bins" else sun.sun_grid(
+                hourly, case.annual.grid_elevation_step_deg, case.annual.grid_azimuth_step_deg,
+                weighting=case.annual.representative_dni)
             t = _time.perf_counter()
             e = annual(case, fld, samples=smp, with_flux=False, workers=1).energy_mwh["intercept"]
             rows.append({"method": name if k is None else f"{name}_{k}", "n_states": len(smp), "energy_mwh": e,
