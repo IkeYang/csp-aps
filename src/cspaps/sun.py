@@ -13,10 +13,18 @@ from .config import Case, Site, Sun
 
 
 def to_times(times, timezone: str) -> pd.DatetimeIndex:
-    """Parse times; naive values are interpreted in the site's local timezone."""
+    """Parse times; naive values are interpreted in the site's local timezone.
+
+    Daylight-saving zones: a local time that does not exist (clocks jump forward) is shifted forward; a
+    repeated local time (clocks fall back) is resolved from the order of the series when it contains both
+    occurrences, otherwise read as standard time.
+    """
     idx = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(times)))
     if idx.tz is None:
-        idx = idx.tz_localize(timezone)
+        try:
+            idx = idx.tz_localize(timezone, ambiguous="infer", nonexistent="shift_forward")
+        except ValueError:  # a repeated hour appears once (or the order is not monotonic): standard time
+            idx = idx.tz_localize(timezone, ambiguous=np.zeros(len(idx), dtype=bool), nonexistent="shift_forward")
     return idx
 
 
@@ -118,9 +126,47 @@ class Samples:
     times: pd.DatetimeIndex | None = None
     label: str = ""
     members: np.ndarray | None = None  # hourly samples merged into each state (binned methods)
+    maps: list | None = None  # spatial DNI maps (dni_maps.DNIMap); None = the DNI is uniform over the site
+    map_index: np.ndarray | None = None  # (S,) map of each state (index into ``maps``)
+    ids: list | None = None  # scenario IDs (scenario sets)
 
     def __len__(self) -> int:
         return int(self.elevation.size)
+
+    @property
+    def spatial(self) -> bool:
+        return self.maps is not None and self.map_index is not None
+
+    def dni_at(self, i: int, xy) -> float | np.ndarray:
+        """DNI of state i at the points xy (N, 2): the scalar DNI, or the state's map sampled at the points."""
+        if not self.spatial:
+            return float(self.dni[i])
+        m = self.maps[int(self.map_index[i])]
+        v = m.sample(np.asarray(xy, dtype=float).reshape(-1, 2))
+        return v * float(self.dni[i]) if m.unit == "factor" else v
+
+    def map_of(self, i: int):
+        return self.maps[int(self.map_index[i])] if self.spatial else None
+
+    @property
+    def max_factor(self) -> float:
+        """Largest DNI / scenario DNI ratio over the maps (1 without maps); bounds any heliostat's DNI."""
+        if not self.spatial:
+            return 1.0
+        out = 1.0
+        for i in range(len(self)):
+            m = self.map_of(i)
+            ref = 1.0 if m.unit == "factor" else max(float(self.dni[i]), 1e-12)
+            out = max(out, float(m.values.max()) / ref)
+        return out
+
+    def subset(self, idx) -> "Samples":
+        idx = np.asarray(idx)
+        return Samples(self.elevation[idx], self.azimuth[idx], self.dni[idx], self.weight_h[idx],
+                       self.times[idx] if self.times is not None else None, self.label,
+                       self.members[idx] if self.members is not None else None, self.maps,
+                       self.map_index[idx] if self.map_index is not None else None,
+                       [self.ids[k] for k in np.atleast_1d(np.arange(len(self))[idx])] if self.ids is not None else None)
 
     @property
     def dni_hours(self) -> float:

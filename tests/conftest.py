@@ -25,6 +25,7 @@ def small_case_dict() -> dict:
                      "random_clouds": {"n": 2, "seed": 1, "radius_m": [40, 60], "speed_m_s": 6}},
         "layout_opt": {"n_heliostats": 120, "maxiter": 1, "popsize": 2, "refine_top": 1,
                        "n_sun_bins": 6, "shading_points": 4, "workers": 1, "polish_rounds": 1},
+        "scenarios": {"n_scenarios": 3},  # formal layout ranking: keep the per-scenario APS runs few
         "mcrt": {"rays_per_heliostat": 400},
     }
 

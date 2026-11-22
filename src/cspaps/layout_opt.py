@@ -76,6 +76,7 @@ class LayoutEval:
     search_aiming: str = "center"
     uniformity: dict | None = None  # layout_uniformity.layout_metrics of the selected field (lambda_L > 0)
     selection: dict | None = None  # exchange search info (swaps, time)
+    value: object | None = dc_field(default=None, repr=False)  # layout_value.LayoutValue (formal ranking)
 
     @property
     def n(self) -> int:
@@ -84,7 +85,18 @@ class LayoutEval:
 
 def make_samples(case: Case, method: str, n_bins: int, dni_bands: int = 1, hourly: sun.Samples | None = None,
                  seed: int = 0) -> sun.Samples:
+    """Sun states for the search / review. With spatial DNI maps every state carries its map regime
+    (``scenarios``): the hours of each regime are binned separately, so the maps' DNI energy is preserved."""
+    from .scenarios import attach_regimes, build_scenarios, is_spatial
+
     hourly = hourly if hourly is not None else sun.hourly_samples(case)
+    if is_spatial(case):
+        if case.scenarios.source == "file":
+            return build_scenarios(case).samples
+        hourly = hourly if hourly.spatial else attach_regimes(case, hourly)
+        if method == "hourly":
+            return hourly
+        return build_scenarios(case, n_bins, hourly, dni_bands).samples
     if method == "hourly":
         return hourly
     if method == "sun_grid":
@@ -119,7 +131,7 @@ def _hourly_theoretical_score(case, xyz, hourly, lam, shading_points):
     if lam > 0:
         for start in range(0, len(hourly), 24):
             sl = slice(start, start + 24)
-            subset = sun.Samples(hourly.elevation[sl], hourly.azimuth[sl], hourly.dni[sl], hourly.weight_h[sl])
+            subset = hourly.subset(np.arange(len(hourly))[sl])
             model = build_model(case, xyz, subset, res.state_power_w[sl], lam)
             spread += model.terms(np.ones(len(xyz)))["spread_mwh"]
     return energy, spread
@@ -300,7 +312,7 @@ class _Objective:
         if lo.n_heliostats and ev.n < lo.n_heliostats:
             # Spread of C nonnegative equal-area columns is at most sqrt(C) times
             # the mean. Rank every shortfall below any feasible weighted objective.
-            max_e = self.samples.dni_hours * lo.n_heliostats * self.case.heliostat.area / 1000
+            max_e = self.samples.dni_hours * self.samples.max_factor * lo.n_heliostats * self.case.heliostat.area / 1000
             floor = max_e * (1 + lo.uniformity_weight * np.sqrt(self.case.receiver.n_azimuth)) + 1
             return floor * (1 + lo.n_heliostats - ev.n)
         return -ev.energy_mwh
@@ -399,6 +411,7 @@ class LayoutOptResult:
     candidates: list[LayoutEval] = dc_field(default_factory=list, repr=False)  # reviewed layouts, search order
     bound: dict = dc_field(default_factory=dict)  # certificate: upper bound on any layout's annual energy
     potential: object | None = dc_field(default=None, repr=False)  # certify.PotentialMap of the site
+    formal: dict = dc_field(default_factory=dict, repr=False)  # formal ranking by V(L) (see formal_ranking)
 
     @property
     def field(self) -> Field:
@@ -411,6 +424,20 @@ class LayoutOptResult:
     def summary(self) -> dict:
         b = self.best
         aps_summary = b.aps_result.summary() if b.aps_result is not None else None
+        out = self._summary(b, aps_summary)
+        if self.formal:
+            out["formal"] = formal_summary(self.formal)
+            out["ranking_basis"] = "aps_value: V(L) = sum_s h_s (P_s - lambda_L U_s) from per-scenario APS plans"
+            win = out["formal"]["winner_totals"]
+            out["annual_energy_mwh_with_aps"] = round(win["energy_mwh"], 1)
+            out["annual_value_mwh"] = round(win["value_mwh"], 1) if np.isfinite(win["value_mwh"]) else None
+            out["operational_status"] = ("no_feasible_annual_states" if not win["status_counts"].get("feasible")
+                                         else "formal_aps_value")
+        else:
+            out["ranking_basis"] = "legacy review objective"
+        return out
+
+    def _summary(self, b, aps_summary) -> dict:
         return {
             "status": self.status,
             "operational_status": ("no_feasible_annual_states" if aps_summary and aps_summary["feasible_sun_states"] == 0
@@ -483,10 +510,14 @@ def optimize_layout(
     from . import layout_uniformity as lu
 
     lam = float(spec.uniformity_weight)
-    hourly = sun.hourly_samples(case)
+    from .scenarios import attach_regimes
+
+    formal = spec.ranking == "aps_value" and spec.refine_top > 0  # refine_top = 0: fast search only, no review
+    hourly = attach_regimes(case, sun.hourly_samples(case))  # map regime of every hour (spatial DNI)
     search_aiming = spec.search_aiming
     if search_aiming == "auto":
-        search_aiming = "greedy" if case.uniformity.enabled else "center"
+        # formal ranking: the search is a fast centre-aim pre-screen; APS runs on the formal scenario set
+        search_aiming = "greedy" if case.uniformity.enabled and not formal else "center"
     search_bands = spec.review_dni_bands if search_aiming != "center" else 1
     samples = make_samples(case, spec.search_sampling, spec.n_sun_bins, search_bands, hourly, spec.seed)
     say(f"search sampling: {samples.label}, {len(samples)} states, aiming={search_aiming}; optimising {names}")
@@ -577,7 +608,8 @@ def optimize_layout(
     review_center = make_samples(case, spec.review_sampling, spec.review_n_sun_bins, 1, hourly, spec.seed)
     review_aps = make_samples(case, spec.review_sampling, spec.review_n_sun_bins, spec.review_dni_bands, hourly, spec.seed)
     review_aiming = case.aps.method if case.aps.method != "center" else search_aiming
-    use_aps = spec.refine_top > 0 and review_aiming != "center"
+    # formal ranking replaces the 0.4 constrained-APS review (APS runs on the formal scenario set instead)
+    use_aps = spec.refine_top > 0 and review_aiming != "center" and not formal
     evals: list[LayoutEval] = []
     rows = []
     for rank, (_, row) in enumerate(top.iterrows(), start=1):
@@ -714,6 +746,22 @@ def optimize_layout(
             ranking["final_rank"] = np.arange(1, len(ranking) + 1)
             ranking["rank_change"] = ranking["search_rank"] - ranking["final_rank"]
 
+    # ---- formal ranking: every shortlisted layout (and the initial field) gets its own APS plan per scenario
+    formal_info = {}
+    if formal and not stop():
+        formal_info = formal_ranking(case, evals, hourly, samples, say, stop)
+        win = formal_info.get("winner")
+        if win is not None:
+            value = formal_info["values"][win]
+            owner = formal_info["owners"].get(win)
+            if owner is None:  # the initial field won
+                best = LayoutEval({"source": "initial field"}, value.n, value.xyz, value.totals()["value_mwh"],
+                                  search_aiming="formal_aps_value")
+            else:  # centre-aim results of the search belong to the unswapped positions
+                best = replace(owner, xyz=value.xyz, result=None, aps_result=None)
+            best.value = value
+            best.aps_energy_mwh = value.totals()["energy_mwh"]
+
     # ---- final checks and capacity
     dm = case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
     validation = validate_layout(case, best.xyz, spec.n_heliostats, dm)
@@ -730,7 +778,23 @@ def optimize_layout(
     if cancelled:
         validation["cancelled"] = True
     bound, pmap = {}, None
-    if spec.upper_bound and spec.n_heliostats:
+    if formal_info and spec.upper_bound and spec.n_heliostats:
+        from .certify import layout_upper_bound, potential_map
+
+        say("certificate: lone-heliostat potential map and packing bound on the formal scenario set")
+        sset = formal_info["scenario_set"]
+        pmap = potential_map(case, sset.samples)
+        tot = best.value.totals() if best.value is not None else None
+        bound = layout_upper_bound(case, spec.n_heliostats, dm, samples=sset.samples, pmap=pmap, layout_xyz=best.xyz,
+                                   found_energy_mwh=tot["energy_mwh"] if tot else None)
+        bound["sampling"] = {"method": "formal scenario set", "n_states": len(sset), "fingerprint": sset.fingerprint()}
+        bound["found_energy_basis"] = "per-scenario APS plans of the winner (joint poses, verified), absorbed energy E"
+        if tot and bound.get("upper_bound_mwh"):
+            bound["value_found_mwh"] = tot["value_mwh"]
+            bound["gap_value_conservative"] = max(0.0, 1.0 - tot["value_mwh"] / bound["upper_bound_mwh"])
+            bound["applies_to"] = (f"the formal scenario set ({len(sset)} scenarios, maps {sorted(sset.subset_maps())}); "
+                                   "any layout of N heliostats in the site, any aim points; V <= E <= bound")
+    elif spec.upper_bound and spec.n_heliostats and not formal:
         from .certify import hourly_site_upper_bound, layout_upper_bound, potential_map
 
         say("certificate: lone-heliostat potential map and packing bound")
@@ -771,18 +835,176 @@ def optimize_layout(
         rc = annual(case, Field(best.xyz), samples=review_center, aiming="center", with_flux=False,
                     shading_points=spec.shading_points, keep_state_power=True)
         uniformity.update(lu.layout_metrics(case, best.xyz, review_center, rc.state_power_w, lam, grid))
-        if lam > 0 and best.candidates_xyz is not None and spec.n_heliostats:
-            key = {tuple(np.round(p, 6)) for p in best.xyz}
-            sel = np.array([tuple(np.round(p, 6)) in key for p in best.candidates_xyz])
-            cand = annual(case, Field(best.candidates_xyz), samples=samples, aiming="center", with_flux=False,
+        # the selection step of the search is certified on the best layout that came out of it
+        sel_ev = best if best.candidates_xyz is not None else next(
+            (e for e in evals if e.candidates_xyz is not None and e.n == spec.n_heliostats), None)
+        if lam > 0 and sel_ev is not None and spec.n_heliostats:
+            key = {tuple(np.round(p, 6)) for p in sel_ev.xyz}
+            sel = np.array([tuple(np.round(p, 6)) in key for p in sel_ev.candidates_xyz])
+            cand = annual(case, Field(sel_ev.candidates_xyz), samples=samples, aiming="center", with_flux=False,
                           shading_points=spec.shading_points, workers=1, keep_state_power=True, blockers=sel)
-            model = lu.build_model(case, best.candidates_xyz, samples, cand.state_power_w, lam, grid)
+            model = lu.build_model(case, sel_ev.candidates_xyz, samples, cand.state_power_w, lam, grid)
             if sel.sum() == min(spec.n_heliostats, len(sel)):
                 cert = lu.selection_bound(model, int(sel.sum()), sel)
                 cert["model"] = ("candidate positions of this generator parameter vector, centre aim, "
                                  "shading / blocking priced against the final layout")
+                cert["layout"] = "winner" if sel_ev is best else "best search layout (the initial field won)"
                 uniformity["selection_certificate"] = cert
         uniformity["selection"] = best.selection
         best.uniformity = uniformity
     return LayoutOptResult(best, history, ranking, samples, _time.perf_counter() - t0, validation, swaps,
-                           review_aps if use_aps else review_center, capacity, evals, bound, pmap)
+                           review_aps if use_aps else review_center, capacity, evals, bound, pmap, formal_info)
+
+
+def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, samples: sun.Samples,
+                   say: Callable[[str], None] = lambda m: None, stop: Callable[[], bool] = lambda: False) -> dict:
+    """Rank layouts by V(L) = sum_s h_s (P_s - lambda_L U_s) with their own APS plan in every scenario.
+
+    Layouts: the shortlisted search layouts (``evals``, N heliostats) and, with ``layout_opt.baseline =
+    initial``, the case's initial field. Every layout is solved on the same scenario set with the same
+    inner settings. The leading search layout is then polished by swaps (lowest APS-energy heliostats
+    out, best-priced unused candidates in) that are kept only if V increases; optionally the winner and
+    the initial field are re-evaluated on a denser scenario set (sampling error of the representative set).
+    """
+    from .field import Field
+    from .layout_value import baseline_layout, compare_values, displacement, evaluate_layout_value, inner_settings
+    from .scenarios import build_scenarios
+
+    spec = case.layout_opt
+    n_req = spec.n_heliostats or (evals[0].n if evals else 0)
+    sset = build_scenarios(case, hourly=hourly)
+    settings = inner_settings(case)
+    say(f"formal ranking: {len(sset)} scenarios (maps {sorted(sset.subset_maps())}), lambda_APS = "
+        f"{settings.lam_aps:g}, lambda_L = {spec.uniformity_weight:g}")
+    values: dict = {}
+    owners: dict = {}
+    seen = set()
+    for k, ev in enumerate(evals, start=1):
+        if stop() or not ev.n or ev.n != n_req:
+            continue
+        key = np.round(np.sort(ev.xyz[:, :2], axis=0), 4).tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        name = f"search_{k}"
+        say(f"formal ranking: APS on {len(sset)} scenarios for {name}")
+        values[name] = evaluate_layout_value(case, ev.xyz, sset, name, settings=settings, progress=say, cancel=stop,
+                                             tags={"kind": "search", "search_rank": k})
+        owners[name] = ev
+    base_note = None
+    if spec.baseline == "initial" and not stop():
+        b = baseline_layout(case, n_req)
+        if b is not None:
+            base_note = b[2]
+            say(f"formal ranking: APS on {len(sset)} scenarios for the initial field")
+            values["initial"] = evaluate_layout_value(case, b[0], sset, "initial", ids=b[1], settings=settings,
+                                                      progress=say, cancel=stop,
+                                                      tags={"kind": "initial", "note": base_note})
+            owners["initial"] = None
+        else:
+            base_note = "initial field not comparable (fewer heliostats than N or not buildable)"
+    swaps = []
+    search_names = [k for k in values if k != "initial"]
+    if search_names and spec.formal_swap_rounds > 0:
+        lead = max(search_names, key=lambda k: values[k].totals()["value_mwh"])
+        ev, cur = owners[lead], values[lead]
+        m = max(1, int(round(spec.swap_fraction * n_req)))
+        for r in range(spec.formal_swap_rounds):
+            if stop() or ev.candidates_xyz is None:
+                break
+            key = {tuple(np.round(p, 6)) for p in cur.xyz}
+            in_layout = np.array([tuple(np.round(p, 6)) in key for p in ev.candidates_xyz])
+            unused = np.flatnonzero(~in_layout)
+            if unused.size == 0:
+                break
+            price = annual(case, Field(ev.candidates_xyz), samples=samples, aiming="center", with_flux=False,
+                           shading_points=spec.shading_points, workers=1, blockers=in_layout).heliostat_energy_mwh
+            add = unused[np.argsort(-price[unused])[:m]]
+            drop = np.argsort(cur.mirror_energy_mwh(), kind="stable")[:len(add)]
+            new_xyz = np.vstack([np.delete(cur.xyz, drop, axis=0), ev.candidates_xyz[add]])
+            name = f"{lead}+swap{r + 1}"
+            say(f"formal swap round {r + 1}: {len(add)} heliostats, APS on {len(sset)} scenarios")
+            new = evaluate_layout_value(case, new_xyz, sset, name, settings=settings, progress=say, cancel=stop,
+                                        tags={"kind": "search_swap", "search_rank": cur.tags.get("search_rank")})
+            gain = new.totals()["value_mwh"] - cur.totals()["value_mwh"]
+            swaps.append({"round": r + 1, "layout": name, "swapped": int(len(add)), "gain_value_mwh": float(gain),
+                          "gain_energy_mwh": new.totals()["energy_mwh"] - cur.totals()["energy_mwh"],
+                          "accepted": bool(gain > 0)})
+            if gain > 0:
+                values[name], owners[name], cur = new, ev, new
+            else:
+                break
+    if not values:
+        return {"scenario_set": sset, "settings": settings, "values": {}, "owners": {}, "winner": None,
+                "ranking": pd.DataFrame(), "swaps": swaps, "baseline_note": base_note}
+    ranking = compare_values(list(values.values()), reference="initial" if "initial" in values else None)
+    winner = str(ranking.loc[0, "name"]) if bool(ranking.loc[0, "rankable"]) else None
+    out = {"scenario_set": sset, "settings": settings, "values": values, "owners": owners, "winner": winner,
+           "ranking": ranking, "swaps": swaps, "baseline_note": base_note}
+    if winner is not None and "initial" in values and winner != "initial":
+        out["displacement"] = displacement(values["initial"].xyz, values[winner].xyz)
+    if (spec.cross_check_maps and case.scenarios.map_model == "clouds" and winner is not None
+            and "initial" in values and winner != "initial" and not stop()):
+        other = case.copy()
+        other.scenarios.seed += 1000
+        cross_set = build_scenarios(other, hourly=hourly)
+        rows = []
+        for name in (winner, "initial"):
+            say(f"independent cloud maps: {name} on {len(cross_set)} scenarios")
+            cv = evaluate_layout_value(other, values[name].xyz, cross_set, name, ids=values[name].ids,
+                                       settings=settings, progress=say, cancel=stop, keep_flux=False)
+            rows.append({"name": name, "value_mwh": cv.totals()["value_mwh"], "energy_mwh": cv.totals()["energy_mwh"],
+                         "penalty_mwh": cv.totals()["penalty_mwh"],
+                         "value_formal_mwh": values[name].totals()["value_mwh"]})
+        lead = rows[0]["value_mwh"] - rows[1]["value_mwh"]
+        out["cross_maps"] = {"seed": other.scenarios.seed, "fingerprint": cross_set.fingerprint(), "rows": rows,
+                             "lead_formal_mwh": rows[0]["value_formal_mwh"] - rows[1]["value_formal_mwh"],
+                             "lead_independent_mwh": lead, "winner_still_ahead": bool(lead > 0)}
+    if spec.dense_check_scenarios > 0 and winner is not None and not stop():
+        dense_set = build_scenarios(case, spec.dense_check_scenarios, hourly)
+        rows = []
+        for name in dict.fromkeys([winner, "initial", *[n for n in ranking["name"] if n not in (winner, "initial")][:1]]):
+            if name not in values or stop():
+                continue
+            say(f"sampling check: {name} on {len(dense_set)} scenarios")
+            dv = evaluate_layout_value(case, values[name].xyz, dense_set, name, ids=values[name].ids,
+                                       settings=settings, progress=say, cancel=stop, keep_flux=False)
+            a, b = values[name].totals(), dv.totals()
+            rows.append({"name": name, "value_rep_mwh": a["value_mwh"], "value_dense_mwh": b["value_mwh"],
+                         "energy_rep_mwh": a["energy_mwh"], "energy_dense_mwh": b["energy_mwh"],
+                         "penalty_rep_mwh": a["penalty_mwh"], "penalty_dense_mwh": b["penalty_mwh"],
+                         "value_error_pct": 100 * (a["value_mwh"] / b["value_mwh"] - 1) if b["value_mwh"] else None,
+                         "energy_error_pct": 100 * (a["energy_mwh"] / b["energy_mwh"] - 1) if b["energy_mwh"] else None})
+        order_rep = [r["name"] for r in sorted(rows, key=lambda r: -r["value_rep_mwh"])]
+        order_dense = [r["name"] for r in sorted(rows, key=lambda r: -r["value_dense_mwh"])]
+        out["dense"] = {"n_scenarios": len(dense_set), "fingerprint": dense_set.fingerprint(), "rows": rows,
+                        "same_order": order_rep == order_dense, "order_representative": order_rep,
+                        "order_dense": order_dense}
+    return out
+
+
+def formal_summary(formal: dict) -> dict:
+    """JSON-ready digest of a formal ranking."""
+    sset, settings = formal["scenario_set"], formal["settings"]
+    ranking = formal["ranking"]
+    rows = []
+    for _, r in ranking.iterrows():
+        rows.append({k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in r.items()
+                     if k in ("rank", "name", "value_mwh", "energy_mwh", "penalty_mwh", "weighted_penalty_mwh",
+                              "delta_value_mwh", "delta_energy_mwh", "delta_uniformity_mwh", "complete",
+                              "inner_gap_annual", "max_inner_gap", "status_counts", "status_hours", "circ_penalty_mwh",
+                              "cv_2d_power_weighted", "kind", "note", "reference")})
+    win = formal.get("winner")
+    out = {"scenario_set": {k: v for k, v in sset.record().items() if k != "map_records"},
+           "inner_settings": settings.record(), "lambda_aps": settings.lam_aps,
+           "lambda_layout": float(ranking["lambda_layout"].iloc[0]) if len(ranking) else None,
+           "ranking": rows, "winner": win, "swaps": formal.get("swaps", []),
+           "baseline_note": formal.get("baseline_note"), "dense_check": formal.get("dense"),
+           "cross_maps": formal.get("cross_maps"),
+           "winner_totals": formal["values"][win].totals() if win else {"value_mwh": float("nan"), "energy_mwh": 0.0,
+                                                                         "status_counts": {}}}
+    d = formal.get("displacement")
+    if d and d.get("comparable"):
+        out["displacement_vs_initial"] = {k: d[k] for k in ("mean_move_m", "median_move_m", "max_move_m",
+                                                             "n_unchanged", "n_moved")}
+    return out

@@ -545,7 +545,16 @@ def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None
     summary["search_settings"] = {k: getattr(case.layout_opt, k) for k in (
         "generator", "n_heliostats", "bounds", "fixed", "search_sampling", "n_sun_bins", "review_sampling",
         "search_aiming", "review_n_sun_bins", "review_dni_bands", "maxiter", "popsize", "seed", "polish_rounds", "refine_top",
-        "swap_rounds", "swap_fraction", "uniformity_weight")}
+        "swap_rounds", "swap_fraction", "uniformity_weight", "ranking", "aps_weight", "baseline", "formal_swap_rounds",
+        "inner_joint_trials", "inner_certify_rounds", "dense_check_scenarios")}
+    if res.formal and res.formal.get("values"):
+        fdir = out / "formal"
+        files.update(save_scenario_set(res.formal["scenario_set"], fdir / "scenario_set", case))
+        files.update(export_values(res.formal["values"], fdir / "values", res.formal["ranking"]))
+        summary["formal"]["exports"] = {
+            "scenario_set": "formal/scenario_set (scenarios.csv, dni_maps.csv/json)",
+            "per_layout": "formal/values/<layout>/scenario_values.csv + aims/<scenario>.csv + layout.csv",
+            "recompute": "V = sum(hours * (p_abs_mw - lambda_layout * u_mw)) over rows with counts_in_value"}
     _json(files["summary_json"], summary)
     finish(out, "layout_opt", summary, t0=t0)
     return {"summary": _clean(summary), "files": files, "result": res, "run_dir": out,
@@ -813,3 +822,289 @@ def engine_service(case: Case, lines, write: Callable[[str], None]) -> int:
             write(json.dumps({"state": "error", "error": f"{type(exc).__name__}: {exc}"}))
         n += 1
     return n
+
+
+# --------------------------------------------------------------------------- annual value with spatial DNI maps
+
+LAYOUT_NAMES_ZH = {"initial": "初始布局"}
+
+
+def layout_label(name: str) -> str:
+    """Display name of a formal-ranking layout (search_2+swap1 -> 搜索候选 2 + 换位 1)."""
+    if name in LAYOUT_NAMES_ZH:
+        return LAYOUT_NAMES_ZH[name]
+    if name.startswith("search_"):
+        base, _, swap = name.partition("+swap")
+        txt = f"搜索候选 {base.removeprefix('search_')}"
+        return f"{txt} + 换位 {swap}" if swap else txt
+    return name
+
+
+def _scenario_set_for(case: Case, scenarios_dir=None):
+    from .scenarios import build_scenarios, load_folder
+
+    return load_folder(scenarios_dir) if scenarios_dir else build_scenarios(case)
+
+
+def _layout_source(case: Case, source) -> tuple[np.ndarray, np.ndarray, str]:
+    """(xyz, ids, note) of a layout given as 'initial', a CSV path or an (N, 3) array."""
+    from .field import read_layout
+    from .layout_value import baseline_layout
+
+    if isinstance(source, str) and source == "initial":
+        n = case.layout_opt.n_heliostats or build_field(case).n
+        b = baseline_layout(case, n)
+        if b is None:
+            raise ValueError("the case's initial field has fewer heliostats than layout_opt.n_heliostats")
+        return b
+    if isinstance(source, (str, Path)):
+        xyz, ids = read_layout(case.resolve(source), case.heliostat.pivot_height)
+        return xyz, (np.arange(1, len(xyz) + 1) if ids is None else ids), f"layout CSV {Path(source).name}"
+    xyz = np.asarray(source, dtype=float).reshape(-1, 3)
+    return xyz, np.arange(1, len(xyz) + 1), "layout array"
+
+
+def save_scenario_set(sset, folder: Path, case: Case) -> dict:
+    from .plotting import plot_dni_maps
+
+    files = sset.save(folder)
+    files["maps_png"] = folder / "dni_maps.png"
+    plot_dni_maps(sset.subset_maps(), files["maps_png"], boundary=case.field.boundary, tower=case.receiver.center[:2])
+    return files
+
+
+def task_scenarios(case: Case, base: str | Path, n: int | None = None) -> dict:
+    """Build the case's scenario set (sun, hours, DNI map per scenario) and save it for reuse and audit."""
+    from .scenarios import build_scenarios
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "scenarios")
+    sset = build_scenarios(case, n)
+    files = save_scenario_set(sset, out / "scenario_set", case)
+    summary = {"status": "done", **{k: v for k, v in sset.record().items() if k != "map_records"},
+               "scenarios": sset.table().to_dict(orient="records"),
+               "maps": {k: m.record() for k, m in sset.subset_maps().items()}}
+    _json(out / "scenarios.json", summary)
+    finish(out, "scenarios", summary, {"n": n}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out, "scenario_set": sset}
+
+
+def task_scenario_aps(case: Case, base: str | Path, scenario_id: str, scenarios_dir=None, layout=None,
+                      lam_aps: float | None = None) -> dict:
+    """Task 1 for one scenario of a scenario set on one layout -- the independent check of a layout score.
+
+    Uses exactly the inner settings of the layout evaluation (``layout_value.inner_settings``), so the
+    plan, P_s and U_s equal the row of that layout's ``scenario_values.csv``.
+    """
+    from .layout_value import inner_settings, solve_scenario
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "scenario_aps")
+    sset = _scenario_set_for(case, scenarios_dir)
+    xyz, ids, note = _layout_source(case, layout) if layout is not None else (build_field(case).xyz, build_field(case).ids,
+                                                                             "case field")
+    fld = Field(xyz, ids)
+    settings = inner_settings(case, lam_aps)
+    i = sset.index(scenario_id)
+    rec = solve_scenario(case, fld, sset, i, settings)
+    row = rec.row(settings.lam_aps, case.layout_opt.uniformity_weight)
+    p = rec.plan
+    files = {"summary_json": out / f"scenario_{scenario_id}.json", "aims_csv": out / f"scenario_{scenario_id}_aims.csv",
+             "flux_png": out / f"scenario_{scenario_id}_flux.png"}
+    write_aims_csv(files["aims_csv"], fld, case, (p.aim_azimuth, p.aim_z), p.active,
+                   {"dni_w_m2": np.round(p.dni, 4), "absorbed_kw": np.round(p.mirror_power_w / 1e3, 5)})
+    grid = build_grid(case.receiver, settings.grid_shape[1], settings.grid_shape[0])
+    if p.flux is not None:
+        plot_flux_map(p.flux, grid, case.receiver, files["flux_png"], aims=(p.aim_azimuth[p.active], p.aim_z[p.active]),
+                      title=f"{scenario_id} [{p.status}] P_abs {p.p_abs_w / 1e6:.3f} MW, U {p.u_w / 1e6:.3f} MW")
+    summary = {"status": p.status, "scenario": row, "layout": note, "n_heliostats": fld.n,
+               "scenario_set_fingerprint": sset.fingerprint(), "inner_settings": settings.record(),
+               "map": sset.samples.map_of(i).record()}
+    _json(files["summary_json"], summary)
+    finish(out, "scenario_aps", summary, {"scenario_id": scenario_id, "scenarios_dir": scenarios_dir,
+                                          "layout": str(layout) if layout is not None else None}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out, "record": rec, "field": fld}
+
+
+def export_values(values: dict, folder: Path, ranking: pd.DataFrame | None = None) -> dict:
+    """Per-layout exports (scenario table, aim plans, layout CSV) and the comparison table."""
+    folder.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for name, v in values.items():
+        safe = name.replace("+", "_plus_")
+        sub = v.export(folder / safe)
+        files[f"values_{safe}_csv"] = sub["scenario_csv"]
+    if ranking is not None and len(ranking):
+        files["ranking_csv"] = folder / "formal_ranking.csv"
+        cols = [c for c in ranking.columns if c not in ("status_counts", "status_hours")]
+        r = ranking[cols].copy()
+        r["status_counts"] = ranking["status_counts"].map(lambda d: json.dumps(d, ensure_ascii=False))
+        r["label"] = r["name"].map(layout_label)
+        r.to_csv(files["ranking_csv"], index=False)
+    return files
+
+
+def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None, scenarios_dir=None,
+                      lam_layout: float | None = None, progress: Progress | None = None,
+                      cancel: Callable[[], bool] | None = None) -> dict:
+    """Evaluate given layouts on one scenario set with their own APS plans and rank them by V(L).
+
+    ``layouts`` maps a name to 'initial', a layout CSV or an (N, 3) array (default: the initial field).
+    """
+    from .layout_value import STATUS_RULES, compare_values, displacement, evaluate_layout_value, inner_settings
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "layout_value")
+    sset = _scenario_set_for(case, scenarios_dir)
+    files = save_scenario_set(sset, out / "scenario_set", case)
+    settings = inner_settings(case)
+    lam = case.layout_opt.uniformity_weight if lam_layout is None else float(lam_layout)
+    layouts = layouts or {"initial": "initial"}
+    values, notes = {}, {}
+    for name, src in layouts.items():
+        if cancel and cancel():
+            break
+        xyz, ids, note = _layout_source(case, src)
+        notes[name] = note
+        values[name] = evaluate_layout_value(case, xyz, sset, name, ids=ids, settings=settings, lam_layout=lam,
+                                             progress=progress, cancel=cancel, tags={"note": note})
+    counts = {v.n for v in values.values()}
+    ranking = compare_values(list(values.values()), lam, reference="initial" if "initial" in values else None)
+    files.update(export_values(values, out / "values", ranking))
+    summary = {"status": "done" if all(v.totals()["complete"] for v in values.values()) else "incomplete",
+               "equal_heliostat_count": len(counts) == 1, "lambda_aps": settings.lam_aps, "lambda_layout": lam,
+               "scenario_set": {k: v for k, v in sset.record().items() if k != "map_records"},
+               "inner_settings": settings.record(), "ranking": ranking.to_dict("records"),
+               "notes": notes, "status_rules": STATUS_RULES}
+    names = list(values)
+    if len(names) >= 2 and values[names[0]].n == values[names[1]].n:
+        d = displacement(values[names[0]].xyz, values[names[1]].xyz)
+        summary["displacement"] = {k: d[k] for k in ("mean_move_m", "median_move_m", "max_move_m", "n_unchanged",
+                                                     "n_moved")} if d.get("comparable") else None
+    files["summary_json"] = out / "layout_value.json"
+    _json(files["summary_json"], summary)
+    finish(out, "layout_value", summary, {"layouts": {k: str(v) if not isinstance(v, np.ndarray) else "array"
+                                                      for k, v in layouts.items()}, "lambda_layout": lam}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out, "values": values, "ranking": ranking,
+            "scenario_set": sset}
+
+
+def task_rescore(folder: str | Path, lam_layout: float) -> dict:
+    """Recompute every layout's V for another outer weight from exported scenario tables only (no solver)."""
+    from .layout_value import recompute_from_csv
+
+    folder = Path(folder)
+    rows = []
+    for csv in sorted(folder.rglob("scenario_values.csv")):
+        r = recompute_from_csv(csv, lam_layout)
+        rows.append({"layout": csv.parent.name, **r, "file": str(csv)})
+    df = pd.DataFrame(rows).sort_values("value_mwh", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+    if len(df):
+        df["rank"] = np.arange(1, len(df) + 1)
+    return {"summary": {"lambda_layout": lam_layout, "layouts": df.to_dict("records")}, "files": {}, "run_dir": folder}
+
+
+def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, radius_m=(60.0, 140.0),
+                       transmittance=(0.1, 0.35), seed: int = 0, clouds: list[dict] | None = None,
+                       lam_aps: float | None = None, progress: Progress | None = None) -> dict:
+    """One instant before and after a cloud arrives (task 1 with the formal inner settings).
+
+    States:
+      clear       clear-sky DNI, plan A = APS for the clear field
+      cloud_keep  cloud shadow on the field, plan A kept (no re-optimisation)
+      cloud_aps   cloud shadow, plan C = APS re-solved for the shaded DNI
+      clear_keep  the cloud has gone, plan C still executed (risk of exceeding the flux limit)
+      cloud_safe  cloud shadow, APS with the flux limit checked at clear-sky DNI (safe if the cloud clears)
+    """
+    from .clouds import Cloud, cloud_transmittance, static_clouds
+    from .layout_value import inner_case, inner_settings, solve_instant
+    from .plotting import plot_cloud_compare
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "cloud_compare")
+    say = progress or (lambda m: None)
+    fld = build_field(case)
+    ts, el, az, dni_clear = sun_state(case, time)
+    u = case.uniformity
+    lam = (u.weight if (u.enabled and u.mode == "weighted") else 0.0) if lam_aps is None else float(lam_aps)
+    settings = inner_settings(case, lam)
+    grid = build_grid(case.receiver, settings.grid_shape[1], settings.grid_shape[0])
+    cl = ([Cloud(**c) for c in clouds] if clouds else
+          static_clouds(fld, n_clouds, tuple(radius_m), tuple(transmittance), seed))
+    tau = cloud_transmittance(cl, fld.xyz[:, :2])
+    d_clear = np.full(fld.n, float(dni_clear))
+    d_cloud = d_clear * tau
+    c_eval = inner_case(case, settings)
+
+    def executed(label, key, dni, aim, active, plan=None):
+        snap = evaluate(c_eval, fld, el, az, dni, aim=aim, active=active, grid=grid, time=ts)
+        th = snap.thermal_objective(c_eval.uniformity)
+        chk = snap.verify(case.receiver)
+        m = uniformity_metrics(snap.absorbed_flux, grid.to_map(snap.region))
+        return {"key": key, "label": label, "dni": dni, "aim_azimuth": np.asarray(aim[0], float),
+                "aim_z": np.asarray(aim[1], float), "active": np.asarray(active, bool), "flux": snap.flux,
+                "absorbed_flux": snap.absorbed_flux, "p_abs_mw": th["power_w"] / 1e6, "p_int_mw": snap.p_receiver / 1e6,
+                "u_mw": th["spread_w"] / 1e6, "objective_mw": (th["power_w"] - lam * th["spread_w"]) / 1e6,
+                "cv_2d": th["cv_2d"], "cv_circ": m["cv_circ"], "cv_height": m["cv_height"],
+                "peak_flux_kw_m2": chk.peak_flux_kw_m2, "peak_to_allowed": chk.peak_ratio / max(chk.allowed_ratio, 1e-12),
+                "peak_to_limit": chk.peak_ratio, "flux_status": chk.status,
+                "hotspot": {"azimuth_deg": chk.hotspot_azimuth_deg, "z_m": chk.hotspot_z, "panel": int(chk.hotspot_panel)},
+                "n_active": int(np.sum(active)), "n_defocused": int(np.sum(~np.asarray(active, bool))),
+                "mirror_power_kw": snap.power["intercept"] * (snap.alpha_eff if snap.alpha_eff is not None else 1.0) / 1e3,
+                "plan_status": plan.status if plan is not None else "kept",
+                "inner_gap": plan.gap if plan is not None else None}
+
+    say("plan A: APS for the clear field")
+    plan_a = solve_instant(case, fld, el, az, d_clear, settings, grid)
+    aim_a, act_a = (plan_a.aim_azimuth, plan_a.aim_z), plan_a.active
+    say("plan C: APS re-solved under the cloud shadow")
+    plan_c = solve_instant(case, fld, el, az, d_cloud, settings, grid, warm=plan_a.choice)  # A competes too
+    aim_c, act_c = (plan_c.aim_azimuth, plan_c.aim_z), plan_c.active
+    say("plan S: APS under the cloud, flux checked at clear-sky DNI")
+    plan_s = solve_instant(case, fld, el, az, d_cloud, settings, grid, dni_constraint=d_clear, warm=plan_a.choice)
+    states = [executed("云来之前 · APS 方案 A", "clear", d_clear, aim_a, act_a, plan_a),
+              executed("云来 · 沿用方案 A", "cloud_keep", d_cloud, aim_a, act_a),
+              executed("云来 · 重新 APS 方案 C", "cloud_aps", d_cloud, aim_c, act_c, plan_c),
+              executed("云散 · 仍执行方案 C", "clear_keep", d_clear, aim_c, act_c),
+              executed("云来 · 防云散 APS 方案 S", "cloud_safe", d_cloud, (plan_s.aim_azimuth, plan_s.aim_z),
+                       plan_s.active, plan_s),
+              executed("云散 · 执行方案 S", "clear_safe", d_clear, (plan_s.aim_azimuth, plan_s.aim_z), plan_s.active)]
+    for s, en in zip(states, ("Clear sky, plan A", "Cloud, plan A kept", "Cloud, APS re-solved (C)",
+                              "Cloud gone, plan C kept", "Cloud, APS safe for clearing (S)",
+                              "Cloud gone, plan S kept")):
+        s["label_en"] = en
+    pts_a = surface_point(case.receiver, *aim_a)
+    for s in states:
+        p = surface_point(case.receiver, s["aim_azimuth"], s["aim_z"])
+        moved = np.linalg.norm(p - pts_a, axis=1)
+        changed = (moved > 1e-6) | (s["active"] != act_a)
+        s["n_changed_vs_a"] = int(changed.sum())
+        s["mean_aim_shift_m"] = float(moved[changed & s["active"] & act_a].mean()) if np.any(changed & s["active"] & act_a) else 0.0
+    rows = [{k: v for k, v in s.items() if not isinstance(v, np.ndarray) and k not in ("hotspot",)} for s in states]
+    table = pd.DataFrame(rows)
+    files = {"summary_json": out / "cloud_compare.json", "states_csv": out / "cloud_compare_states.csv",
+             "compare_png": out / "cloud_compare.png", "aims_csv": out / "cloud_compare_aims.csv"}
+    table.to_csv(files["states_csv"], index=False)
+    aims = pd.DataFrame({"id": fld.ids, "x": fld.xyz[:, 0], "y": fld.xyz[:, 1], "transmittance": np.round(tau, 5)})
+    for s in states:
+        aims[f"{s['key']}_dni"] = np.round(s["dni"], 3)
+        aims[f"{s['key']}_active"] = s["active"].astype(int)
+        aims[f"{s['key']}_aim_azimuth"] = np.round(s["aim_azimuth"], 5)
+        aims[f"{s['key']}_aim_z"] = np.round(s["aim_z"], 5)
+        aims[f"{s['key']}_power_kw"] = np.round(s["mirror_power_kw"], 4)
+    aims.to_csv(files["aims_csv"], index=False)
+    plot_cloud_compare(fld.xyz, case.receiver, grid, states[:3] + states[3:4], files["compare_png"],
+                       boundary=case.field.boundary)
+    base_row = states[0]
+    summary = {"status": "done", "time": ts.isoformat(), "sun_elevation_deg": el, "sun_azimuth_deg": az,
+               "dni_clear_w_m2": float(dni_clear), "lambda_aps": lam, "n_heliostats": fld.n,
+               "clouds": [c.__dict__ for c in cl], "shaded_heliostats": int((tau < 0.95).sum()),
+               "mean_transmittance": float(tau.mean()), "states": rows,
+               "loss_keep_vs_clear_mw": base_row["p_abs_mw"] - states[1]["p_abs_mw"],
+               "gain_reaps_vs_keep_mw": states[2]["p_abs_mw"] - states[1]["p_abs_mw"],
+               "inner_settings": settings.record()}
+    _json(files["summary_json"], summary)
+    finish(out, "cloud_compare", summary, {"time": str(time), "n_clouds": n_clouds, "seed": seed,
+                                           "radius_m": list(radius_m), "transmittance": list(transmittance)}, t0)
+    return {"summary": _clean(summary), "files": files, "run_dir": out, "states": states, "field": fld,
+            "grid": grid, "transmittance": tau, "clouds": cl, "case": case}
