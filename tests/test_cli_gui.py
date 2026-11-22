@@ -96,7 +96,9 @@ def test_gui_walkthrough(monkeypatch):
     for label in ("指令状态", "最高通量（复核）", "距上限余量", "散焦镜数", "数据新鲜度"):
         assert label in cards
     at.radio(key="page").set_value("布局优化").run()
-    at.slider(key="1:layout_opt.uniformity_weight").set_value(0.5).run()
+    assert at.radio(key="layout_mode").value == "compare"  # the engineer's main path opens first
+    at.radio(key="layout_mode").set_value("search").run()
+    at.slider(key="1:pref_opt").set_value(0.5).run()
     assert at.session_state["case_dict"]["layout_opt"]["uniformity_weight"] == 0.5
     at.button(key="btn_opt").click().run()
     assert not at.exception
@@ -179,6 +181,7 @@ def test_gui_cloud_compare_and_formal_value(monkeypatch, tmp_path):
     for text in ("① 云前吸收功率", "③ 云来 · 不改策略", "④ 云来 · 重新 APS", "被云遮挡"):
         assert text in labels
     at.radio(key="page").set_value("布局优化").run()
+    at.radio(key="layout_mode").set_value("search").run()
     at.button(key="btn_opt").click().run()
     assert not at.exception
     f = at.session_state["res_opt"]["summary"]["formal"]
@@ -187,6 +190,8 @@ def test_gui_cloud_compare_and_formal_value(monkeypatch, tmp_path):
     assert not at.exception
     at.button(key="fv_opt_recompute").click().run()
     assert all(r["一致"] == "✓" for r in at.session_state["fv_opt_recheck"])
+    at.radio(key="layout_mode").set_value("compare").run()  # the optimised layout against the initial field
+    assert at.selectbox(key="vc_A").value == "opt" and at.selectbox(key="vc_B").value == "initial"
     at.button(key="btn_lv").click().run()
     assert not at.exception
     assert at.session_state["res_lv"]["summary"]["equal_heliostat_count"]

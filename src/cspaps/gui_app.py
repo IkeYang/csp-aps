@@ -89,10 +89,11 @@ LABELS = {
     "aps.method": "求解方法", "aps.safety_margin": "安全裕度", "aps.n_height_levels": "候选高度数",
     "aps.height_span": "候选高度覆盖比例", "aps.azimuth_offsets_deg": "候选周向偏移 (°)",
     "aps.passes": "改进轮数", "aps.tie_tolerance": "等效功率容差", "aps.move_penalty_per_m": "移动惩罚 (每米)",
-    "aps.allow_defocus": "允许散焦", "aps.milp_time_limit_s": "MILP 时限 (s)", "aps.verify": "细网格复核",
+    "aps.allow_defocus": "允许散焦", "aps.milp_time_limit_s": "MILP 时限 (s)", "aps.milp_max_nnz": "MILP 系数上限", "aps.verify": "细网格复核",
     "aps.verify_max_rounds": "热点约束最多轮数", "aps.verify_max_cells": "复核网格上限",
     "aps.auto_grid": "自动细化求解网格", "aps.max_solver_cells": "求解网格上限",
     "aps.certify": "计算最优性证书（上界与差距）", "aps.certify_time_s": "证书迭代时限 (s)",
+    "aps.subfield_sectors": "子场分解扇区数",
     "aps.certify_rounds": "松弛随机取整次数", "layout_opt.upper_bound": "计算可证上界",
     "layout_opt.uniformity_weight": "布局均匀度权重 λ_L",
     "layout_opt.selection_iterations": "镜位定价迭代次数（搜索阶段）", "layout_opt.uniformity_sectors": "均匀度扇区数（0 = 按管屏）",
@@ -151,7 +152,7 @@ LABELS = {
 CHOICES = {
     "sun.shape": ["gaussian", "pillbox"], "sun.dni_model": ["meinel", "constant"],
     "atmosphere.model": ["vittitoe_biggs_clear", "vittitoe_biggs_hazy", "beer_lambert"],
-    "weather.source": ["clear_sky", "file"], "aps.method": ["greedy", "kfactor", "center", "milp"],
+    "weather.source": ["clear_sky", "file"], "aps.method": ["greedy", "kfactor", "center", "milp", "subfield"],
     "uniformity.mode": ["cv_limit", "weighted"],
     "annual.method": ["sun_bins", "sun_grid", "representative_days", "hourly"],
     "annual.aiming": ["center", "greedy", "kfactor"], "layout_opt.generator": ["radial_staggered", "biomimetic"],
@@ -178,7 +179,7 @@ CHOICE_LABELS = {
                          "beer_lambert": "Beer–Lambert 消光"},
     "weather.source": {"clear_sky": "晴空模型", "file": "EPW / DNI 文件"},
     "aps.method": {"greedy": "贪心 APS（推荐）", "kfactor": "瞄准因子法", "center": "中心瞄准基准",
-                   "milp": "混合整数精确法（小镜场）"},
+                   "milp": "混合整数精确法（小镜场）", "subfield": "子场分解（可并行）"},
     "uniformity.mode": {"cv_limit": "CV 上限约束", "weighted": "固定权重折中"},
     "annual.method": {"sun_bins": "DNI 加权代表太阳位置", "sun_grid": "太阳角度分箱",
                       "representative_days": "每月代表日", "hourly": "逐时复算"},
@@ -691,12 +692,8 @@ def _contributors(case, fld, t, dni, aim, active, az, z, top=6):
 
 # --------------------------------------------------------------------------- site, weather and field inputs
 
-def _weather_panel(case, key: str) -> None:
-    """Weather source of the case; warns when the site moved away from the weather file's site."""
-    from cspaps.weather import fetch_power_dni
-
-    case = _case()[0] or case  # include edits made by the widgets above in this run
-    data = st.session_state["case_dict"]
+def _weather_site_check(case) -> None:
+    """Weather source line; a warning when the site moved away from the weather file's site."""
     lat, lon = case.site.latitude, case.site.longitude
     ws = st.session_state.get("weather_site")
     if case.weather.source == "file":
@@ -712,6 +709,16 @@ def _weather_panel(case, key: str) -> None:
                      "请下载新站址的逐时 DNI、上传实测气象文件，或改用晴空模型。")
     else:
         st.caption("气象数据：晴空模型（Meinel，按海拔修正）")
+
+
+def _weather_panel(case, key: str) -> None:
+    """Weather source of the case; warns when the site moved away from the weather file's site."""
+    from cspaps.weather import fetch_power_dni
+
+    case = _case()[0] or case  # include edits made by the widgets above in this run
+    data = st.session_state["case_dict"]
+    lat, lon = case.site.latitude, case.site.longitude
+    _weather_site_check(case)
     c1, c2 = st.columns(2)
     year = case.annual.year
     if c1.button(f"下载 NASA POWER {year} 年逐时 DNI", key=f"power_{key}",
@@ -1194,6 +1201,7 @@ def _compare_workspace(case) -> None:
         c1, c2 = st.columns(2)
         with c1:
             _fields("site", ["latitude", "longitude", "timezone"], n_cols=3)
+            _weather_site_check(_case()[0] or case)
         with c2:
             _receiver_center_inputs(case)
         choices, layouts, blockers = {}, {}, []
@@ -1894,9 +1902,9 @@ def page_layout(case) -> None:
                           "uniformity_metric", "ranking", "baseline", "aps_weight", "formal_swap_rounds",
                           "dense_check_scenarios", "inner_joint_trials", "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"}
                 _fields("layout_opt", [f.name for f in dataclasses.fields(_SECTIONS["layout_opt"]) if f.name not in common])
-            with st.expander("APS 复核使用的瞄准与均匀度设置"):
-                _fields("aps", ["method", "safety_margin", "n_height_levels", "azimuth_offsets_deg"])
-                _fields("uniformity", ["enabled", "mode", "weight", "max_cv"])
+            with st.expander("APS 复核使用的瞄准设置"):
+                _fields("aps", ["method", "n_height_levels", "azimuth_offsets_deg"])
+                st.caption("均匀性权重由第 2 步的偏好滑块决定（运行与评价同一个 λ）；安全裕度也在第 2 步设置。")
         case, err = _case()
         if err:
             st.error(err)
@@ -2435,6 +2443,53 @@ def _ab_block(values: dict, ranking: pd.DataFrame, key: str) -> None:
         st.dataframe(pd.DataFrame(status_rows), hide_index=True)
 
 
+STATUS_MEANING = {
+    "feasible": "找到通过细网格复核（不占用安全裕度）的运行方案。",
+    "feasible_shutdown": "找到了方案，但最优或唯一可行的做法是全部散焦（吸热为零）——这是可执行的决定，不是计算失败。",
+    "no_feasible_found": "本次计算预算内没找到可行运行方案，但没有证明不存在；吸热器按停机计 0，是保守的下界。",
+    "proven_infeasible": "已经证明在当前约束下不存在任何可运行方案（例如不允许散焦而热流上限过低）。",
+    "not_solved": "计算被取消或尚未完成，该工况没有结果；布局的年度价值不完整。",
+}
+
+
+def _status_legend() -> None:
+    """How to read the scenario statuses and what to do next (shown whether or not they occur)."""
+    with st.expander("工况状态怎么读：本次未找到 / 已证无可行 / 可行停机"):
+        st.dataframe(pd.DataFrame([{"状态": VALUE_STATUS_ZH[k], "含义": STATUS_MEANING[k], "计分": VALUE_STATUS_RULE[k],
+                                    "下一步": NEXT_STEP.get(k, "—")} for k in STATUS_MEANING]),
+                     hide_index=True, width="stretch")
+
+
+def _calc_basis(case, values: dict, ranking: pd.DataFrame, sset) -> None:
+    """Parameters, data sources and the solve scope of this result, in one place."""
+    v0 = next(iter(values.values()))
+    stg = v0.settings
+    rec = sset.record()
+    lam_l = float(ranking["lambda_layout"].iloc[0])
+    offs = ", ".join(f"{a:g}°" for a in stg.azimuth_offsets_deg) or "0°"
+    region = ("整个吸热面" if not stg.region_panels and not stg.region_z else
+              f"管屏 {list(stg.region_panels) if stg.region_panels else '全部'}，高度 {list(stg.region_z) if stg.region_z else '全高'}")
+    method = CHOICE_LABELS["aps.method"].get(stg.method, stg.method)
+    with st.expander("本次计算的口径：参数、数据来源和求解范围"):
+        st.dataframe(pd.DataFrame([
+            {"项目": "偏好 λ", "本次取值": f"评价 λ_L = {lam_l:g}；运行 λ_APS = {stg.lam_aps:g}"},
+            {"项目": "安全裕度", "本次取值": f"{stg.safety_margin:.0%}（细网格复核的峰值不超过上限的 {1 - stg.safety_margin:.0%} 才算可行）"},
+            {"项目": "考核区域", "本次取值": region},
+            {"项目": "工况集", "本次取值": f"{rec['n_scenarios']} 个工况，合计 {rec['actual_hours']:,.0f} 实际小时，"
+                                       f"DNI 年能量 {rec['annual_dni_kwh_m2']:,.0f} kWh/m²"},
+            {"项目": "数据来源", "本次取值": str(rec.get("source", "—"))},
+            {"项目": "DNI 地图", "本次取值": "、".join(rec["maps"])},
+            {"项目": "代表小时口径", "本次取值": str(rec.get("hours_basis", "工况清单中的小时数"))},
+            {"项目": "求解方法", "本次取值": f"{method} + 联合姿态复核 {stg.joint_trials} 次"
+                                        + (f" + 松弛取整 {stg.certify_rounds} 轮" if stg.certify_rounds else "")},
+            {"项目": "候选瞄准点（求解范围）", "本次取值": f"周向偏移 {offs} × {stg.n_height_levels} 个高度层（覆盖吸热器高度的 "
+                                                  f"{stg.height_span:.0%}）" + ("，允许散焦" if stg.allow_defocus else "，不允许散焦")},
+            {"项目": "评分网格", "本次取值": f"{stg.grid_shape[1]} 方位 × {stg.grid_shape[0]} 高度"},
+            {"项目": "工况集指纹 / 设置指纹", "本次取值": f"{rec['fingerprint']} / {stg.digest()}（相同才可比较）"},
+        ]), hide_index=True, width="stretch")
+        st.caption("“候选瞄准点”就是求解范围：最优性差距与上界只对这组候选点成立。比较布局时必须用同一工况集指纹和设置指纹。")
+
+
 def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bound: dict | None = None,
                    dense: dict | None = None, disp: dict | None = None, run_dir=None, swaps=None,
                    cross: dict | None = None) -> None:
@@ -2446,6 +2501,8 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
     _ab_block(values, ranking, key)
     _value_kpis(values, ranking, bound, sset)
     _decision_callout(values, ranking)
+    _calc_basis(case, values, ranking, sset)
+    _status_legend()
     tabs = st.tabs(["排名与优势分解", "逐工况明细", "工况与 DNI 地图", "与初始布局对照", "最优性与误差", "导出与复算"])
     with tabs[0]:
         a, b = st.columns([1.2, 1])
@@ -3075,7 +3132,11 @@ def page_replay(case) -> None:
 def page_optics(case) -> None:
     _hero("模型校验", "光学校验", "蒙特卡洛光线追迹（MCRT）以随机光线独立检查解析光斑模型；功率差、热流图差和峰值统计误差"
           "用于评估模型偏差。也可导出 SolTrace 对标算例，或用暴力求交复核阴影遮挡筛选。")
-    t1, t2, t3 = st.tabs(["解析模型与光线追迹", "SolTrace 对标", "遮挡筛选复核"])
+    t1, t4, t5, t2, t3 = st.tabs(["解析模型与光线追迹", "压力工况复核", "求解器对比", "SolTrace 对标", "遮挡筛选复核"])
+    with t4:
+        _stress_suite(case)
+    with t5:
+        _solver_benchmark(case)
     with t1:
         c1, c2, c3, c4 = st.columns(4)
         v_default = pd.Timestamp(case.realtime.start if case is not None else "2025-06-21 13:40")
@@ -3122,6 +3183,142 @@ def page_optics(case) -> None:
         _job_error("shc")
         if "res_shc" in st.session_state:
             st.dataframe(pd.DataFrame(st.session_state["res_shc"]["summary"]["cases"]), hide_index=True)
+
+
+def _pct_num(v, digits: int = 2):
+    return None if v is None or (isinstance(v, float) and not np.isfinite(v)) else round(100 * float(v), digits)
+
+
+def _stress_suite(case) -> None:
+    from cspaps.validation import SUITE, SUITE_WHY, SUITE_ZH
+
+    st.write("用同一方案分别跑解析模型与光线追迹，检验四种最容易出错的工况。**物理误差**（解析 − 追迹，同一方案、同一网格）"
+             "与**求解差距**（候选瞄准集上的上界与方案目标之差，在解析模型内部计算）分开列出：前者说明模型本身离光线追迹多远，"
+             "后者说明算法离该模型下的最好方案多远。")
+    with st.expander("四种工况分别检验什么", expanded=False):
+        for k in SUITE:
+            st.markdown(f"- **{SUITE_ZH[k]}**：{SUITE_WHY[k]}")
+    c1, c2, c3 = st.columns(3)
+    keys = c1.multiselect("工况", list(SUITE), default=list(SUITE), format_func=lambda k: SUITE_ZH[k], key="vs_keys")
+    rays = c2.number_input("每面镜子光线数", value=1000, step=500, min_value=100, key="vs_rays")
+    seeds = c3.number_input("随机种子数", value=3, step=1, min_value=2, key="vs_seeds")
+    soltrace = st.checkbox("同时导出 SolTrace 对标算例（逐镜 DNI 写成反射率系数）", value=True, key="vs_soltrace")
+    _job_button("vsuite", "运行压力工况复核", wf.task_validation_suite, keys=tuple(keys) or None, rays=int(rays),
+                seeds=int(seeds), soltrace=soltrace, blockers=[] if keys else ["请至少选择一个工况"])
+    _job_error("vsuite")
+    if "res_vsuite" not in st.session_state:
+        return
+    r = st.session_state["res_vsuite"]
+    states = r["summary"]["states"]
+    worst = max(states, key=lambda x: abs(x["physical"]["power_on_receiver_mw"]["rel_diff"] or 0))
+    ok = all(x["physical"]["mcrt_within_limit"] for x in states)
+    st.success(f"{len(states)} 个工况中，解析与追迹的功率差最大 {_pct_num(worst['physical']['power_on_receiver_mw']['rel_diff'])}%"
+               f"（{worst['label']}）。" + ("光线追迹在所有工况下都确认热流低于限值（均值 + 2 倍标准误）。" if ok else
+                                         "注意：有工况的追迹峰值（均值 + 2 倍标准误）超过限值，见下表。"))
+    rows = []
+    for x in states:
+        ph = x["physical"]
+        rows.append({
+            "工况": x["label"], "时刻": x["time"][:16].replace("T", " "), "太阳高度 (°)": round(x["elevation_deg"], 1),
+            "DNI 范围 (W/m²)": f"{x['dni_w_m2']['min']:.0f}–{x['dni_w_m2']['max']:.0f}",
+            "功率 解析 (MW)": round(ph["power_on_receiver_mw"]["analytic"], 3),
+            "功率 追迹 (MW)": round(ph["power_on_receiver_mw"]["mcrt"], 3),
+            "功率差 (%)": _pct_num(ph["power_on_receiver_mw"]["rel_diff"]),
+            "追迹功率标准误 (%)": _pct_num(ph["power_on_receiver_mw"]["mcrt_std_error"] / max(ph["power_on_receiver_mw"]["mcrt"], 1e-12)),
+            "峰值 解析 (kW/m²)": round(ph["peak_flux_kw_m2"]["analytic"], 1),
+            "峰值 追迹 (kW/m²)": round(ph["peak_flux_kw_m2"]["mcrt_mean_map"], 1),
+            "峰值差 (%)": _pct_num(ph["peak_flux_kw_m2"]["rel_diff"], 1),
+            "峰值/限值 细网格复核": round(ph["peak_to_limit"]["analytic_verified_fine"], 3),
+            "峰值/限值 追迹": f"{ph['peak_to_limit']['mcrt_grid']:.3f} ± {ph['peak_to_limit']['mcrt_std_error']:.3f}",
+            "热点距离 (m)": round(ph["hotspot"]["distance_m"], 2),
+            "网格": "×".join(str(v) for v in ph["grid"]), "种子": ", ".join(str(v) for v in ph["mcrt"]["seeds"]),
+            "每镜光线": ph["mcrt"]["rays_per_heliostat"],
+        })
+    _section(None, "物理误差：解析模型 vs 光线追迹", "差值方向：解析 − 追迹；追迹为多个种子的平均图，峰值取平均图的最大格；"
+             "解析图取格心值、追迹图为格内平均，峰值差含这部分离散差异。")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    srows = []
+    for x in states:
+        so = x["solver"]
+        srows.append({"工况": x["label"], "λ_APS": so["lambda_aps"], "方案状态": so["status"],
+                      "目标 P − λU (MW)": round(so["objective_mw"], 3),
+                      "上界 (MW)": None if so["upper_bound_mw"] is None else round(so["upper_bound_mw"], 3),
+                      "求解差距 (%)": _pct_num(so["gap"]), "上界方法": so["bound_method"],
+                      "候选范围": "本算例 APS 设置的周向偏移 × 高度层（含散焦）",
+                      "散焦镜数": so["n_defocused"], "求解时间 (s)": round(so["solve_time_s"], 2)})
+    _section(None, "求解差距：方案目标 vs 候选集上界", "上界对候选集内任何方案都成立；“无遮挡能量上界”在低太阳高度时较松，"
+             "差距大并不表示方案差，而是该上界未计入阴影遮挡。")
+    st.dataframe(pd.DataFrame(srows), hide_index=True, width="stretch")
+    pick = st.selectbox("查看工况的热流图", [x["key"] for x in states],
+                        format_func=lambda k: next(x["label"] for x in states if x["key"] == k), key="vs_pick")
+    maps = r["maps"][pick]
+    grid = build_grid(case.receiver)
+    zmax = max(maps["analytic_w_m2"].max(), maps["mcrt_w_m2"].max()) / 1e3
+    a, b = st.columns(2)
+    with a:
+        _chart(receiver_map(case, grid, maps["analytic_w_m2"], "解析模型热流", zmax=zmax), f"vs_a_{pick}")
+    with b:
+        _chart(receiver_map(case, grid, maps["mcrt_w_m2"], "光线追迹热流（多种子平均）", zmax=zmax), f"vs_m_{pick}")
+    _chart(flux_diff_map(case, grid, maps["mcrt_w_m2"], maps["analytic_w_m2"], "解析 − 追迹"), f"vs_d_{pick}")
+    x = next(x for x in states if x["key"] == pick)
+    if x.get("soltrace_export"):
+        st.caption(f"SolTrace 算例：{x['soltrace_export']['folder']}；运行：`{x['soltrace_export']['next_step']}`")
+    _show_files(r, images=[])
+
+
+def _solver_benchmark(case) -> None:
+    from cspaps.benchmark import INNER_METHODS, INNER_ZH, OUTER_METHODS, OUTER_ZH
+
+    st.write("在相同条件下比较求解器：同一场地、镜数、DNI 空间图、权重和计算时间。只有通过细网格复核（不占用安全裕度）的方案"
+             "才计入；所有内层方法都对同一个上界（各方法得到的最小有效上界）计算差距，外层布局都用正式年度价值 V(L) 评分，"
+             "并在另一组留出工况（不同代表太阳位置与云图）上重新排名。")
+    part = st.radio("比较", ["inner", "outer"], horizontal=True, key="sb_part",
+                    format_func=lambda v: {"inner": "内层：单时刻瞄准", "outer": "外层：布局搜索"}[v])
+    c1, c2, c3 = st.columns(3)
+    budget = c1.number_input("每个方法的时间预算 (s)", value=60 if part == "inner" else 300, step=10, min_value=5,
+                             key=f"sb_budget_{part}")
+    if part == "inner":
+        n_states = c2.number_input("工况数（按 h×DNI 最大取）", value=4, min_value=1, step=1, key="sb_states")
+        tighten = c3.checkbox("收紧热流限制使其起作用", value=False, key="sb_tight",
+                              help="把所有管屏限值乘以系数，使中心瞄准在夏至正午超限约 30%。")
+        factor = None
+        if tighten:
+            factor = st.slider("限值系数", 0.2, 1.0, 0.6, 0.05, key="sb_factor")
+        methods = st.multiselect("方法", list(INNER_METHODS), default=list(INNER_METHODS), key="sb_inner_m",
+                                 format_func=lambda m: INNER_ZH[m])
+        _job_button("sbench", "运行内层比较", wf.task_solver_benchmark, "inner", int(n_states), float(budget),
+                    limit_factor=factor, methods=tuple(methods) or None)
+    else:
+        seeds = c2.multiselect("随机种子", [1, 2, 3, 4], default=[1, 2], key="sb_seeds")
+        methods = st.multiselect("方法", list(OUTER_METHODS), default=list(OUTER_METHODS), key="sb_outer_m",
+                                 format_func=lambda m: OUTER_ZH[m])
+        st.caption("外层比较每个方法、每个种子都要跑一次布局搜索和两次正式年度价值评估，耗时约为预算的数倍。")
+        _job_button("sbench", "运行外层比较", wf.task_solver_benchmark, "outer", budget_s=float(budget),
+                    seeds=tuple(seeds) or (1,), methods=tuple(methods) or None)
+    _job_error("sbench")
+    r = st.session_state.get("res_sbench")
+    if not r:
+        return
+    if "inner_summary" in r:
+        agg = r["inner_summary"]
+        lim = r["summary"].get("limit_factor")
+        _section(None, "内层：每种方法的汇总", f"热流限值 {r['summary']['max_flux_kw_m2']:.0f} kW/m²"
+                 + (f"（原值 × {lim:g}）" if lim else "") + "；差距相对于该工况所有方法中最小的有效上界。")
+        show = agg.rename(columns={"方法": "方法名", "states": "工况数", "feasible": "可行工况",
+                                   "hours_weighted_objective_mwh": "按小时加权目标 (MWh)",
+                                   "mean_gap_to_best_bound": "平均差距", "max_gap_to_best_bound": "最大差距",
+                                   "mean_loss_to_best_found": "离最好方案平均损失", "time_s": "总时间 (s)",
+                                   "all_within_budget": "都在预算内"})
+        st.dataframe(show.drop(columns=["method", "objective_sum_mw"], errors="ignore"), hide_index=True, width="stretch")
+        with st.expander("逐工况明细"):
+            st.dataframe(r["inner"], hide_index=True, width="stretch")
+    if "outer_summary" in r:
+        _section(None, "外层：布局搜索", "V(L) 为训练工况上的正式年度价值；留出工况换了代表太阳位置与云图；"
+                 "标准差来自不同随机种子。")
+        st.dataframe(r["outer_summary"].drop(columns=["method"], errors="ignore"), hide_index=True, width="stretch")
+        with st.expander("每次运行"):
+            st.dataframe(r["outer"], hide_index=True, width="stretch")
+    _show_files(r, images=[])
 
 
 def page_parameters(case) -> None:

@@ -578,6 +578,58 @@ def solve_greedy(
     return choice, {"passes": passes_done, "repairs": repairs, "timed_out": timed_out["v"]}
 
 
+class _SubProblem:
+    """View of an AimProblem restricted to some heliostats with its own limit per constraint point."""
+
+    def __init__(self, prob: AimProblem, available: np.ndarray, limit: np.ndarray):
+        self._prob, self.available, self.limit = prob, available, limit
+
+    def __getattr__(self, name):
+        return getattr(self._prob, name)
+
+
+def subfield_of(prob: AimProblem, n_sub: int) -> np.ndarray:
+    """Sector (0..n_sub-1) of every heliostat by the compass azimuth it faces on the receiver (centre aim)."""
+    az = prob.cand_az[:, prob.center_k] % 360.0
+    return np.minimum((az / (360.0 / max(1, n_sub))).astype(int), max(1, n_sub) - 1)
+
+
+def solve_subfield(prob: AimProblem, spec: APSSpec, n_sub: int | None = None) -> tuple[np.ndarray, dict]:
+    """Subfield decomposition (HALOS-style): sectors solved independently, so they can run in parallel.
+
+    Sector k may use, at every constraint point p, the share
+        s_k(p) = sum_{i in k} max_c F_i,c(p) / sum_i max_c F_i,c(p)
+    of the allowed flux (what its mirrors could deliver there at most). The shares sum to 1, so the union
+    of the sector plans keeps sum_k flux_k(p) <= sum_k s_k(p) L(p) = L(p) at every response point; the
+    caller then verifies on the fine grid and repairs as for the other methods. ``info`` reports the
+    serial time (sum over sectors) and the ideal parallel time (slowest sector)."""
+    n_sub = int(n_sub or spec.subfield_sectors)
+    sector = subfield_of(prob, n_sub)
+    npts = prob.limit.size
+    reach = np.zeros((n_sub, npts))
+    for i in np.flatnonzero(prob.available):
+        idx = prob.cells[i]
+        if idx.size:
+            reach[sector[i], idx] += prob.F(i).max(axis=0)
+    total = reach.sum(axis=0)
+    share = np.where(total > 0, reach / np.where(total > 0, total, 1.0), 1.0 / n_sub)
+    choice = np.full(prob.n, -1)
+    times, sizes = [], []
+    for k in range(n_sub):
+        members = prob.available & (sector == k)
+        sizes.append(int(members.sum()))
+        if not members.any():
+            times.append(0.0)
+            continue
+        t0 = _time.perf_counter()
+        sub = _SubProblem(prob, members, prob.limit * share[k])
+        ch, _ = solve_greedy(sub, spec)
+        choice[members] = ch[members]
+        times.append(_time.perf_counter() - t0)
+    return choice, {"subfield_sectors": n_sub, "subfield_sizes": sizes, "subfield_serial_s": float(sum(times)),
+                    "subfield_parallel_s": float(max(times) if times else 0.0)}
+
+
 def _milp_matrices(prob: AimProblem):
     from scipy.sparse import coo_matrix
 
@@ -603,10 +655,11 @@ def _milp_matrices(prob: AimProblem):
     return a_flux, a_one
 
 
-def solve_milp(prob: AimProblem, spec: APSSpec, relax: bool = False, max_nnz: int = 4_000_000):
+def solve_milp(prob: AimProblem, spec: APSSpec, relax: bool = False, max_nnz: int | None = None):
     """Exact 0/1 programme (or its LP relaxation) with HiGHS. Returns (choice, info)."""
     from scipy.optimize import Bounds, LinearConstraint, milp
 
+    max_nnz = int(getattr(spec, "milp_max_nnz", 4_000_000) if max_nnz is None else max_nnz)
     nnz = sum(r.size for r in prob.rs.resp)
     if nnz > max_nnz:
         raise ValueError(
@@ -678,6 +731,8 @@ def solve(
             return solve_greedy(prob, spec, prev_xyz, prev_active, init=warm, priority=priority)
         if method == "milp":
             return solve_milp(prob, spec)
+        if method == "subfield":
+            return solve_subfield(prob, spec)
         raise ValueError(f"Unknown APS method '{method}'")
 
     choice, extra = run(init)
@@ -699,7 +754,7 @@ def solve(
         # in a fixed number of rounds). Finish with repair from the current plan: only heliostats feeding a
         # violated point move or defocus, so the plan reaches the limit.
         # (rule-based methods such as kfactor keep their own failure state: they are not silently replaced)
-        while (method in ("milp", "greedy") and check.status == "over_limit" and check.hotspots
+        while (method in ("milp", "greedy", "subfield") and check.status == "over_limit" and check.hotspots
                and repairs < max(4, 2 * spec.verify_max_rounds)):
             added += prob.rs.add_points([h[0] for h in check.hotspots], [h[1] for h in check.hotspots])
             choice, _ = solve_greedy(prob, spec, prev_xyz, prev_active, init=choice, full_passes=0)
@@ -709,7 +764,7 @@ def solve(
         info["repair_rounds"] = repairs
         info["hotspot_points_added"] = added
     uni = prob.case.uniformity
-    if uni.enabled and method in ("greedy", "kfactor", "milp"):
+    if uni.enabled and method in ("greedy", "kfactor", "milp", "subfield"):
         from .uniformity import solve_uniform
 
         ures = solve_uniform(prob, choice, uni, prev_aim_xyz=prev_xyz, prev_active=prev_active)
@@ -726,7 +781,22 @@ def solve(
                 choice = ures.choice
                 check = prob.verify(choice)
                 r2 += 1
+            info["uniformity_repair_rounds"] = r2
         info.update(uniformity_info(prob, choice, uni, ures))
+    # Last word: repair from the current plan. A uniformity move (or a re-solve) can leave a fine-grid peak
+    # between the allowed ratio and the limit; only heliostats feeding a violated point move or defocus,
+    # so the plan keeps its power and ends verified "ok" (the strict margin counts nothing less).
+    if spec.verify and check is not None and method in ("milp", "greedy", "subfield"):
+        final = 0
+        while not check.ok and check.hotspots and final < max(4, 2 * spec.verify_max_rounds):
+            added += prob.rs.add_points([h[0] for h in check.hotspots], [h[1] for h in check.hotspots])
+            choice, _ = solve_greedy(prob, spec, prev_xyz, prev_active, init=choice, full_passes=0)
+            check = prob.verify(choice)
+            final += 1
+        info["final_repair_rounds"] = final
+        info["hotspot_points_added"] = added
+        if final and uni.enabled:
+            info.update(uniformity_info(prob, choice, uni))
     return finalize(prob, method, choice, info, check, spec, t0)
 
 

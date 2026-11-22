@@ -214,7 +214,7 @@ def task_aim(
         prob = build_problem(case, fld, el, az, dni_v, dni_con, grid=grid)
         res = solve(prob, method, case.aps, prev, prev_active)
         proposal_check = res.check
-        if do_certify and method in ("greedy", "kfactor", "milp") and fld.n:
+        if do_certify and method in ("greedy", "kfactor", "milp", "subfield") and fld.n:
             if progress:
                 progress("certifying: upper bound and relaxation rounding")
             initial = res.choice.copy()
@@ -730,6 +730,118 @@ def task_soltrace_export(case: Case, base: str | Path, time, method: str = "cent
     _json(out / "export_summary.json", res["summary"])
     finish(out, "soltrace_export", res["summary"], {"time": str(time), "method": method}, t0)
     return {"summary": _clean(res["summary"]), "files": res["files"], "run_dir": out}
+
+
+def task_validation_suite(case: Case, base: str | Path, keys=None, rays: int | None = None, seeds: int | None = None,
+                          year: int = 2025, soltrace: bool = True, progress: Progress | None = None) -> dict:
+    """Ray-trace checks of the stress states (low sun, cloud edge, high-load mixed aiming, near the limit).
+
+    Physical error (analytic vs MCRT on the same plan and grid) and the solver gap are reported separately;
+    every plan is also exported for SolTrace (per-mirror DNI as a reflectivity factor)."""
+    from .soltrace import export_plan
+    from .validation import SUITE, compare_state, row, suite_states
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "validation_suite")
+    say = progress or (lambda m: None)
+    fld = build_field(case)
+    keys = tuple(keys or SUITE)
+    states = suite_states(case, fld, keys, year=year, progress=say)
+    grid = build_grid(case.receiver)
+    results, rows, files = [], [], {}
+    for st_ in states:
+        say(f"ray trace {st_.key}")
+        r = compare_state(st_, fld, rays=rays, seeds=seeds, grid=build_grid(st_.case.receiver))
+        maps = r.pop("maps")
+        header = (f"kW/m2; {st_.key}; grid {grid.azimuth_deg.size} azimuth x {grid.z.size} height; rows = height "
+                  f"bottom->top, columns = azimuth from N clockwise; MCRT seeds {r['physical']['mcrt']['seeds']}, "
+                  f"{r['physical']['mcrt']['rays_per_heliostat']} rays/heliostat")
+        for k in ("analytic", "mcrt"):
+            fp = out / f"{st_.key}_{k}_kw_m2.csv"
+            np.savetxt(fp, maps[f"{k}_w_m2"] / 1e3, delimiter=",", fmt="%.4f", header=header)
+            files[f"{st_.key}_{k}_csv"] = fp
+        fp = out / f"{st_.key}_limit_kw_m2.csv"
+        np.savetxt(fp, maps["limit_w_m2"] / 1e3, delimiter=",", fmt="%.4f", header=header.replace(st_.key, f"{st_.key} limit"))
+        files[f"{st_.key}_limit_csv"] = fp
+        png = out / f"{st_.key}_flux_compare.png"
+        plot_flux_compare(maps["analytic_w_m2"], maps["mcrt_w_m2"], build_grid(st_.case.receiver), st_.case.receiver, png,
+                          labels=(f"Analytic, {st_.key}", f"MCRT ({len(r['physical']['mcrt']['seeds'])} seeds)"))
+        files[f"{st_.key}_png"] = png
+        if soltrace:
+            p = st_.plan
+            ex = export_plan(st_.case, fld, st_.time, st_.elevation, st_.azimuth, st_.dni, (p.aim_azimuth, p.aim_z),
+                             p.active, out / "soltrace" / st_.key, method=f"suite:{st_.key}", with_mcrt=False)
+            r["soltrace_export"] = {"folder": str(out / "soltrace" / st_.key), "next_step": ex["summary"]["next_step"],
+                                    "dni_per_mirror": ex["summary"]["dni_w_m2"]["per_mirror"]}
+        r["maps_files"] = {k: str(v) for k, v in files.items() if k.startswith(st_.key)}
+        r["_maps"] = maps
+        results.append(r)
+        rows.append(row(r))
+    table = pd.DataFrame(rows)
+    files["summary_csv"] = out / "validation_suite.csv"
+    table.to_csv(files["summary_csv"], index=False, encoding="utf-8-sig")
+    files["summary_json"] = out / "validation_suite.json"
+    summary = {"states": [{k: v for k, v in r.items() if k != "_maps"} for r in results], "table": rows,
+               "conventions": {"physical_error": "analytic minus MCRT on the same plan, grid and DNI per mirror",
+                               "solver_gap": "(upper bound - objective) / upper bound on the candidate set, analytic model",
+                               "mcrt_within_limit": "MCRT mean map + 2 standard errors <= the limit (same grid)",
+                               "dni": "clear-sky model of the case (not the weather record); cloud edge scales it per mirror"}}
+    _json(files["summary_json"], summary)
+    finish(out, "validation_suite", {"table": rows}, {"keys": list(keys), "rays": rays, "seeds": seeds, "year": year}, t0)
+    return {"summary": _clean(summary), "table": table, "maps": {r["key"]: r["_maps"] for r in results},
+            "files": files, "run_dir": out}
+
+
+def task_solver_benchmark(case: Case, base: str | Path, part: str = "inner", n_states: int = 6, budget_s: float = 60.0,
+                          seeds=(1, 2), limit_factor: float | None = None, methods=None,
+                          max_evals: int | None = None, lam_aps: float | None = None,
+                          progress: Progress | None = None) -> dict:
+    """Solvers under the same conditions: inner (task 1 on the largest scenarios) and / or outer (layout search).
+
+    ``limit_factor`` scales every flux limit (e.g. 0.45) so that the limits bind; the record says so."""
+    from . import benchmark as bm
+    from .validation import tighten_limits
+
+    t0 = _time.perf_counter()
+    out = out_dir(base, case, "solver_benchmark")
+    say = progress or (lambda m: None)
+    c = tighten_limits(case, float(limit_factor)) if limit_factor else case
+    summary: dict = {"case": case.name, "budget_s": budget_s, "limit_factor": limit_factor,
+                     "max_flux_kw_m2": c.receiver.max_flux_kw_m2, "lambda_aps": lam_aps}
+    files = {}
+    result: dict = {}
+    if part in ("inner", "both"):
+        fld = build_field(c)
+        states = bm.inner_states(c, fld, n_states)
+        df = bm.inner_benchmark(c, fld, states, methods or bm.INNER_METHODS, budget_s, lam_aps=lam_aps, progress=say)
+        agg = bm.inner_summary(df)
+        files["inner_csv"] = out / "inner_benchmark.csv"
+        files["inner_summary_csv"] = out / "inner_benchmark_summary.csv"
+        df.to_csv(files["inner_csv"], index=False, encoding="utf-8-sig")
+        agg.to_csv(files["inner_summary_csv"], index=False, encoding="utf-8-sig")
+        summary["inner"] = {"n_heliostats": fld.n, "states": [s["label"] for s in states],
+                            "summary": agg.to_dict("records"), "runs": df.to_dict("records")}
+        result["inner"], result["inner_summary"] = df, agg
+    if part in ("outer", "both"):
+        r = bm.outer_benchmark(c, methods or bm.OUTER_METHODS, tuple(seeds), budget_s, max_evals=max_evals, progress=say)
+        files["outer_csv"] = out / "layout_benchmark.csv"
+        files["outer_summary_csv"] = out / "layout_benchmark_summary.csv"
+        r["runs"].to_csv(files["outer_csv"], index=False, encoding="utf-8-sig")
+        r["summary"].to_csv(files["outer_summary_csv"], index=False, encoding="utf-8-sig")
+        for name, xyz in r["layouts"].items():
+            fp = out / f"layout_{name}.csv"
+            save_layout_csv(Field(xyz), fp)
+            files[f"layout_{name}"] = fp
+        summary["outer"] = {"runs": r["runs"].to_dict("records"), "summary": r["summary"].to_dict("records"),
+                            "train": r["train"], "held_out": r["held_out"], "seeds": r["seeds"],
+                            "settings_digest": r["settings_digest"], "n_heliostats": c.layout_opt.n_heliostats}
+        result["outer"], result["outer_summary"] = r["runs"], r["summary"]
+    files["summary_json"] = out / "solver_benchmark.json"
+    _json(files["summary_json"], summary)
+    finish(out, "solver_benchmark", {"part": part}, {"part": part, "n_states": n_states, "budget_s": budget_s,
+                                                       "seeds": list(seeds), "limit_factor": limit_factor,
+                                                       "lambda_aps": lam_aps}, t0)
+    return {"summary": _clean(summary), **result, "files": files, "run_dir": out}
 
 
 def task_shading_check(case: Case, base: str | Path) -> dict:

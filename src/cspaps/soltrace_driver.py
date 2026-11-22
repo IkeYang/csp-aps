@@ -48,12 +48,30 @@ def build(PySolTrace, Point, case, rays, dni):
     sv = case["sun"]["vector"]
     sun.position = Point(100.0 * sv[0], 100.0 * sv[1], 100.0 * sv[2])
 
+    # per-mirror DNI (cloud shadows): SolTrace has one DNI, so each mirror's reflectivity is scaled by its DNI
+    # fraction (optics shared by mirrors with the same fraction, 0.01 steps)
+    scaled = {}
+
+    def optic_for(factor):
+        f = round(float(factor), 2)
+        if f >= 0.995:
+            return ref
+        if f not in scaled:
+            op = PT.add_optic(f"Reflector_{int(round(100 * f)):03d}")
+            op.front.reflectivity = o["reflectivity"] * f
+            op.front.slope_error = o["normal_error_mrad"]
+            op.front.spec_error = o["specular_error_mrad"]
+            op.front.dist_type = "g"
+            op.back.reflectivity = 0.0
+            scaled[f] = op
+        return scaled[f]
+
     st = PT.add_stage()
     for h in case["heliostats"]:
         if not h["active"]:
             continue
         el = st.add_element()
-        el.optic = ref
+        el.optic = optic_for(h.get("dni_factor", 1.0))
         p, n = h["position"], h["normal"]
         el.position = Point(*p)
         el.aim = Point(p[0] + 100.0 * n[0], p[1] + 100.0 * n[1], p[2] + 100.0 * n[2])

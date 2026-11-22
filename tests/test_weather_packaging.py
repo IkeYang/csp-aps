@@ -64,6 +64,7 @@ def test_invalid_rectangle_blocks_the_layout_run(monkeypatch, tmp_path):
     at.session_state["ver"] = 1
     at.run()
     at.radio(key="page").set_value("布局优化").run()
+    at.radio(key="layout_mode").set_value("search").run()
     at.number_input(key="1:rect.x0").set_value(400.0).run()  # x_min > x_max
     btn = at.button(key="btn_opt")
     assert btn.disabled
@@ -107,6 +108,8 @@ def test_site_change_warns_about_the_weather_file(monkeypatch, tmp_path):
     at.radio(key="page").set_value("布局优化").run()
     assert not any("站址已修改" in m.value for m in at.markdown)
     at.number_input(key="1:site.latitude").set_value(30.0).run()
+    assert any("站址已修改" in m.value for m in at.markdown)  # the A/B comparison warns too
+    at.radio(key="layout_mode").set_value("search").run()
     assert any("站址已修改" in m.value for m in at.markdown)
     at.button(key="clear_layout").click().run()
     assert at.session_state["case_dict"]["weather"]["source"] == "clear_sky"

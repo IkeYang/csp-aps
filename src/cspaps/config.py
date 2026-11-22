@@ -135,7 +135,7 @@ class FieldSpec:
 
 @dataclass
 class APSSpec:
-    method: str = "greedy"  # "center" | "kfactor" | "greedy" | "milp"
+    method: str = "greedy"  # "center" | "kfactor" | "greedy" | "milp" | "subfield"
     safety_margin: float = 0.05  # aim for at most (1 - margin) * max flux
     n_height_levels: int = 7  # candidate aim heights per heliostat
     height_span: float = 0.8  # candidate heights span this fraction of the receiver height
@@ -145,6 +145,7 @@ class APSSpec:
     move_penalty_per_m: float = 0.0  # real-time smoothing: power fraction lost per m of aim shift
     allow_defocus: bool = True  # put heliostats on standby when no feasible aim exists
     milp_time_limit_s: float = 60.0
+    milp_max_nnz: int = 4_000_000  # refuse MILPs with more flux coefficients (memory / time guard)
     verify: bool = True  # re-check every solution on an adaptive fine grid with full beams
     auto_grid: bool = True  # refine the solver grid so that cells are <= sigma_min / 1.5 (capped)
     max_solver_cells: int = 40_000
@@ -157,6 +158,7 @@ class APSSpec:
     certify_rounds: int = 4  # randomised roundings of the relaxed solution
     coupled_exact_limit: int = 256  # enumerate all joint mirror poses up to this many assignments
     coupled_trials: int = 18  # additional joint-pose trials for larger offline problems
+    subfield_sectors: int = 4  # method "subfield": azimuth sectors solved independently (parallelisable)
 
 
 @dataclass
@@ -486,8 +488,10 @@ def _validate(case: Case) -> None:
         raise ValueError("realtime.scenario must be clouds|moving_edge|sudden_clear")
     if not 0 <= case.aps.safety_margin < 1:
         raise ValueError("aps.safety_margin must be in [0, 1)")
-    if case.aps.method not in ("center", "kfactor", "greedy", "milp"):
-        raise ValueError(f"aps.method '{case.aps.method}' not in center|kfactor|greedy|milp")
+    if case.aps.method not in ("center", "kfactor", "greedy", "milp", "subfield"):
+        raise ValueError(f"aps.method '{case.aps.method}' not in center|kfactor|greedy|milp|subfield")
+    if case.aps.subfield_sectors < 1:
+        raise ValueError("aps.subfield_sectors must be >= 1")
     if case.annual.representative_dni not in ("time_mean", "energy_weighted"):
         raise ValueError("annual.representative_dni must be time_mean|energy_weighted")
     if case.annual.method not in ("sun_bins", "sun_grid", "representative_days", "hourly"):

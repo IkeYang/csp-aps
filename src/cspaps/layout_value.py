@@ -126,7 +126,7 @@ def eval_grid_shape(case: Case) -> tuple[int, int]:
 
 def inner_settings(case: Case, lam_aps: float | None = None) -> InnerSettings:
     lo, aps, u = case.layout_opt, case.aps, case.uniformity
-    method = aps.method if aps.method in ("greedy", "milp") else "greedy"
+    method = aps.method if aps.method in ("greedy", "milp", "subfield") else "greedy"
     return InnerSettings(
         lam_aps=float(inner_weight(case) if lam_aps is None else lam_aps), method=method,
         joint_trials=int(lo.inner_joint_trials), certify_rounds=int(lo.inner_certify_rounds),
@@ -238,6 +238,8 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
                           np.zeros(grid.shape) if keep_flux else None, _time.perf_counter() - t0)
     prob = build_problem(c, fld, elevation, azimuth, dni_v, dni_constraint, grid=grid)
     res = solve(prob, settings.method, c.aps)
+    solver_info = {k: res.info[k] for k in ("subfield_serial_s", "subfield_parallel_s", "milp_status",
+                                             "final_repair_rounds") if k in res.info}
     initial = res.choice.copy()
     dual = None
     if settings.certify_rounds > 0 and (prob.k + 1) ** min(prob.n, 20) > c.aps.coupled_exact_limit:
@@ -261,7 +263,7 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     chk = res.check
     upper = cert.get("upper_bound_mw")
     info = {"bound_status": cert["status"], "evaluated_joint_poses": cert.get("evaluated_joint_poses"),
-            "raw_power_w": float(thermal["power_w"]), "raw_spread_w": float(thermal["spread_w"])}
+            "raw_power_w": float(thermal["power_w"]), "raw_spread_w": float(thermal["spread_w"]), **solver_info}
     if chk is not None:
         info.update(hotspot_panel=int(chk.hotspot_panel), hotspot_azimuth_deg=float(chk.hotspot_azimuth_deg),
                     hotspot_z_m=float(chk.hotspot_z), peak_to_limit=float(chk.peak_ratio))
