@@ -38,6 +38,7 @@ from cspaps.gui_plots import (
     value_decomposition_chart,
 )
 from cspaps.layout_opt import validate_layout
+from cspaps.tables import export_name, read_user_csv
 from cspaps.optics import footprints_at
 from cspaps.resources import demo_case_path
 from cspaps.receiver import build_grid, incident_limit_w_m2, panel_of, surface_normal, surface_point
@@ -68,7 +69,8 @@ LABELS = {
     "site.timezone": "时区",
     "receiver.center": "中心点 [x, y, z] (m)", "receiver.diameter": "直径 (m)", "receiver.height": "高度 (m)",
     "receiver.max_flux_kw_m2": "默认允许通量 (kW/m²)", "receiver.n_azimuth": "周向网格数",
-    "receiver.n_height": "高度网格数", "receiver.tower_diameter": "塔身直径 (m，空 = 同集热器)",
+    "receiver.n_height": "高度网格数", "receiver.tower_diameter": "塔身直径 (m，空 = 同集热器，0 = 不算塔影)",
+    "receiver.tower_height": "塔高：塔顶离地 (m，空 = 吸热器底部)",
     "receiver.absorptivity": "吸收率", "receiver.flux_limit_basis": "限值口径 (incident 入射 / absorbed 吸收)",
     "receiver.n_panels": "管屏数", "receiver.panel_start_azimuth_deg": "1 号管屏起始方位 (°)",
     "receiver.panel_max_flux_kw_m2": "各管屏允许通量 (YAML 列表，kW/m²)",
@@ -248,6 +250,9 @@ HELP = {
     "heliostat.width": "定日镜反射面宽度（水平方向），单位米。", "heliostat.height": "定日镜反射面高度，单位米。",
     "heliostat.pivot_height": "定日镜旋转中心离地高度，单位米。",
     "receiver.diameter": "圆柱外置式吸热器直径，单位米。", "receiver.height": "吸热器受光段高度，单位米。",
+    "receiver.tower_height": "塔影按塔身（塔身直径，地面到塔顶）加吸热器（吸热器直径，吸热器底到顶）两段圆柱计算。"
+                             "塔顶默认就是吸热器底部；塔身高出吸热器或吸热器下有平台时在这里填写。",
+    "receiver.tower_diameter": "塔身直径用于计算塔影；不填与吸热器相同，填 0 不计塔影。",
     "field.exclusion_radius": "塔周不允许布置定日镜的半径（检修通道、塔基础等），单位米。",
     "aps.n_height_levels": "每面镜在吸热器高度方向的候选瞄准层数。层数越多越接近连续瞄准，计算越慢。",
     "aps.azimuth_offsets_deg": "候选瞄准点相对正对方位的周向偏移（度），YAML 列表，例如 [-6, 0, 6]。",
@@ -785,7 +790,7 @@ def _weather_panel(case, key: str) -> None:
     if wup is not None and st.session_state.get(f"weather_loaded_{key}") != (wup.name, wup.size):
         path = _save_upload(wup)
         if path.suffix.lower() == ".csv":
-            head = pd.read_csv(path, nrows=5)
+            head = read_user_csv(path, nrows=5)
             if not {"time", "dni"} <= set(head.columns):
                 INPUT_ERRORS.append("气象 CSV 需要 time,dni 两列")
                 return
@@ -812,7 +817,7 @@ def _field_inputs(case) -> None:
     st.caption(f"镜场来源：{src} · {n_txt}")
     up = st.file_uploader("导入镜场坐标 CSV（列 id,x,y[,z]，单位 m，x 东、y 北、原点为塔底）", type=["csv"], key="field_csv")
     if up is not None and st.session_state.get("field_csv_loaded") != (up.name, up.size):
-        df = pd.read_csv(up)
+        df = read_user_csv(up)
         up.seek(0)
         if not {"x", "y"} <= set(df.columns):
             st.error("镜场 CSV 需要 x、y 两列（可选 id、z）。")
@@ -836,6 +841,7 @@ def _field_inputs(case) -> None:
     st.caption("吸热器（圆柱）中心三维坐标与尺寸")
     _receiver_center_inputs(case)
     _fields("receiver", ["diameter", "height"])
+    _fields("receiver", ["tower_diameter", "tower_height"])
     st.caption("定日镜尺寸")
     _fields("heliostat", ["width", "height", "pivot_height"], n_cols=3)
 
@@ -980,7 +986,7 @@ def _dni_upload_check(case, upload, fld) -> list[str]:
     from cspaps.clouds import check_dni_table, coverage_of_points, load_dni_map
 
     try:
-        raw = pd.read_csv(upload, dtype=str, keep_default_na=False)
+        raw = read_user_csv(upload, dtype=str, keep_default_na=False)
     except Exception as exc:  # noqa: BLE001
         upload.seek(0)
         return [f"无法读取文件：{exc}"]
@@ -1157,7 +1163,7 @@ def _scenario_source_inputs(case, key: str) -> list[str]:
             st.error(f"地图库无法读取：{exc}")
             return blockers + ["地图库无法读取"]
         try:
-            table = pd.read_csv(c2_.resolve(c2_.scenarios.file), dtype=str, keep_default_na=False)
+            table = read_user_csv(c2_.resolve(c2_.scenarios.file), dtype=str, keep_default_na=False)
         except (OSError, ValueError) as exc:
             st.error(f"工况清单无法读取：{exc}")
             return blockers + ["工况清单无法读取"]
@@ -1562,7 +1568,9 @@ def _scenario_check_section(case) -> None:
                              inactive=~p.active, height=420, sun_angles=(rec.elevation_deg, rec.azimuth_deg)), "scen_dni")
     with r:
         _chart(receiver_aims_map(c, grid, p.flux, p.aim_azimuth, p.aim_z, p.active, fld.ids, p.dni,
-                                 title="吸热器热流与每面镜中心的瞄准点", height=420, cmin=0), "scen_rec")
+                                 title="吸热器热流与每面镜中心的瞄准点", height=420, cmin=0,
+                                 spots=_spots(c, fld.xyz, p.aim_azimuth, p.aim_z, rec.elevation_deg, rec.azimuth_deg)),
+               "scen_rec")
     _chart(aim_scene_3d(c, fld.xyz, p.dni, p.aim_azimuth, p.aim_z, p.active, title="三维示意（抽样光束）", cmin=0,
                        sun_angles=(rec.elevation_deg, rec.azimuth_deg), beam_power=p.mirror_power_w),
            "scen_3d")
@@ -1660,8 +1668,12 @@ def _aps_results(res: dict) -> None:
                       "送达功率": (snap.power["intercept"] / 1e3, "送达 (kW)")}[color_by]
         _chart(receiver_aims_map(case, snap.grid, snap.flux, snap.aim_azimuth, snap.aim_z, snap.active, fld.ids, vals, vlab,
                                  title="吸热器展开图 · 入射热流与每面镜中心的瞄准点（× 为细网格复核热点）",
-                                 hotspot=chk, height=460), "s_rec")
-        st.caption("每个点是一面定日镜的镜面中心光线在吸热器上的落点（瞄准点），悬停查看镜子编号与坐标。"
+                                 hotspot=chk, height=460,
+                                 spots=_spots(case, fld.xyz, snap.aim_azimuth, snap.aim_z, snap.sun_elevation,
+                                              snap.sun_azimuth)), "s_rec")
+        st.caption("每个点是一面定日镜的镜面中心光线在吸热器上的落点（瞄准点）。点越大，该镜的光斑越大；"
+                   "悬停可查看镜子编号、光斑 σ（光束截面上的标准差）、光斑在吸热面上的 2σ 宽和高（约含 86% 光能）、"
+                   "入射角与截获比例。点图例“光斑轮廓”可按真实尺寸画出每个光斑的 2σ 椭圆。"
                    "横轴按罗盘方位展开圆柱面：北 0°、东 90°。")
     with tabs[1]:
         l, r = st.columns(2)
@@ -1930,6 +1942,7 @@ def page_layout(case) -> None:
             st.caption("吸热器（圆柱）中心三维坐标，原点为塔底")
             _receiver_center_inputs(case)
             _fields("receiver", ["diameter", "height"])
+            _fields("receiver", ["tower_diameter", "tower_height"])
             _site_inputs(case)
             _weather_panel(case, "layout")
         with _card("layout_goal"):
@@ -2664,7 +2677,9 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
                           if p.info.get("hotspot_azimuth_deg") is not None else None)
                     _chart(receiver_aims_map(case, grid, p.flux, p.aim_azimuth, p.aim_z, p.active, v.ids, p.dni,
                                              title="吸热器热流与瞄准点（该布局自己的 APS 方案）", zmax=zmax, height=380,
-                                             hotspot=hs, cmin=0, cmax=dmax), f"{key}_rec_{name}_{sid}")
+                                             hotspot=hs, cmin=0, cmax=dmax,
+                                             spots=_spots(case, v.xyz, p.aim_azimuth, p.aim_z, sset.samples.elevation[i],
+                                                          sset.samples.azimuth[i])), f"{key}_rec_{name}_{sid}")
                     _hotspot_text(case, p)
     with tabs[2]:
         tbl = sset.table()
@@ -2764,7 +2779,7 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
                 if st.button("仅凭导出文件复算全部得分", key=f"{key}_recompute"):
                     lam = float(ranking["lambda_layout"].iloc[0])
                     rec = wf.task_rescore(vdir, lam)["summary"]["layouts"]
-                    mem = {n.replace("+", "_plus_"): v.totals(lam)["value_mwh"] for n, v in values.items()}
+                    mem = {export_name(n): v.totals(lam)["value_mwh"] for n, v in values.items()}
                     st.session_state[f"{key}_recheck"] = [
                         {"布局": wf.layout_label(r["layout"].replace("_plus_", "+")), "复算 V": round(r["value_mwh"], 4),
                          "界面 V": round(mem.get(r["layout"], float("nan")), 4),
@@ -3088,6 +3103,11 @@ def _cloud_results(res: dict) -> None:
     lam = summ["lambda_aps"]
     cmin, cmax = 0.0, float(np.max(a["dni"])) * 1.02
     zmax = max(float(np.max(s["flux"])) for s in res["states"]) / 1e3
+
+    def sp(state):  # spot size of every mirror for this state's aims (same sun for all states)
+        return _spots(case, fld.xyz, state["aim_azimuth"], state["aim_z"], summ["sun_elevation_deg"],
+                      summ["sun_azimuth_deg"])
+
     _section(None, "云影对比结果",
              f"{summ['time'][:16].replace('T', ' ')} · 太阳高度角 {summ['sun_elevation_deg']:.1f}° · 晴空 DNI {summ['dni_clear_w_m2']:.0f} W/m² · "
              f"λ = {lam:g} · {summ['n_heliostats']} 面定日镜")
@@ -3117,7 +3137,7 @@ def _cloud_results(res: dict) -> None:
                                  cmax=cmax, height=430), "cc_dni_a")
         with r:
             _chart(receiver_aims_map(case, grid, a["flux"], a["aim_azimuth"], a["aim_z"], a["active"], fld.ids, a["dni"],
-                                     title="吸热器展开 · 热流与每面镜中心的瞄准点（点色 = 该镜 DNI）", zmax=zmax, cmin=cmin, cmax=cmax, height=430),
+                                     title="吸热器展开 · 热流与每面镜中心的瞄准点（点色 = 该镜 DNI）", zmax=zmax, cmin=cmin, cmax=cmax, height=430, spots=sp(a)),
                    "cc_rec_a")
         l, r = st.columns(2)
         with l:
@@ -3152,7 +3172,7 @@ def _cloud_results(res: dict) -> None:
         l, r = st.columns([1.25, 1])
         with l:
             _chart(receiver_aims_map(case, grid, b["flux"], b["aim_azimuth"], b["aim_z"], b["active"], fld.ids, b["dni"],
-                                     title="沿用方案 A：瞄准点不变（点色 = 云下 DNI）", zmax=zmax, cmin=cmin, cmax=cmax, height=420), "cc_rec_b")
+                                     title="沿用方案 A：瞄准点不变（点色 = 云下 DNI）", zmax=zmax, cmin=cmin, cmax=cmax, height=420, spots=sp(b)), "cc_rec_b")
         with r:
             _chart(flux_diff_map(case, grid, a["flux"], b["flux"], "热流变化（云来 · 沿用 A − 云前）"), "cc_diff_ab")
         st.caption("被遮挡镜子的光斑变暗，原本相互补齐的热流出现缺口：总吸热减少，受热不均匀度上升。")
@@ -3162,7 +3182,7 @@ def _cloud_results(res: dict) -> None:
         with l:
             _chart(receiver_aims_map(case, grid, c["flux"], c["aim_azimuth"], c["aim_z"], c["active"], fld.ids, c["dni"],
                                      prev=(a["aim_azimuth"], a["aim_z"], a["active"]),
-                                     title="重新 APS：新瞄准点（白线 = 从方案 A 的移动）", zmax=zmax, cmin=cmin, cmax=cmax, height=420), "cc_rec_c")
+                                     title="重新 APS：新瞄准点（白线 = 从方案 A 的移动）", zmax=zmax, cmin=cmin, cmax=cmax, height=420, spots=sp(c)), "cc_rec_c")
         with r:
             _chart(flux_diff_map(case, grid, b["flux"], c["flux"], "热流变化（重新 APS − 沿用 A）"), "cc_diff_bc")
         l, r = st.columns(2)
@@ -3182,13 +3202,13 @@ def _cloud_results(res: dict) -> None:
             st.markdown("**云突然散去，仍执行方案 C**")
             _state_numbers(d, a)
             _chart(receiver_aims_map(case, grid, d["flux"], d["aim_azimuth"], d["aim_z"], d["active"], fld.ids, d["dni"],
-                                     title="晴空 DNI 下执行云下方案 C", zmax=zmax, cmin=cmin, cmax=cmax, height=380, hotspot=d["hotspot"]), "cc_rec_d")
+                                     title="晴空 DNI 下执行云下方案 C", zmax=zmax, cmin=cmin, cmax=cmax, height=380, hotspot=d["hotspot"], spots=sp(d)), "cc_rec_d")
         with r:
             st.markdown("**防云散方案 S：通量按晴空 DNI 校核，目标按云下 DNI**")
             _state_numbers(safe_clear, a)
             _chart(receiver_aims_map(case, grid, safe_clear["flux"], safe_clear["aim_azimuth"], safe_clear["aim_z"],
                                      safe_clear["active"], fld.ids, safe_clear["dni"], title="云散后执行方案 S",
-                                     zmax=zmax, cmin=cmin, cmax=cmax, height=380, hotspot=safe_clear["hotspot"]), "cc_rec_s")
+                                     zmax=zmax, cmin=cmin, cmax=cmax, height=380, hotspot=safe_clear["hotspot"], spots=sp(safe_clear)), "cc_rec_s")
         st.caption(f"云下方案 S 的吸收功率 {safe['p_abs_mw']:.3f} MW（方案 C {c['p_abs_mw']:.3f} MW）：为云突然散去预留的代价。"
                    "在线引擎的“含 DNI 预测”策略按同样的原则约束通量。")
     with tabs[5]:
@@ -3282,6 +3302,18 @@ def page_optics(case) -> None:
         _job_error("shc")
         if "res_shc" in st.session_state:
             st.dataframe(pd.DataFrame(st.session_state["res_shc"]["summary"]["cases"]), hide_index=True)
+
+
+def _spots(case, xyz, aim_az, aim_z, sun_elevation, sun_azimuth):
+    """Spot size of every mirror for the aim-point maps (None if it cannot be computed)."""
+    from cspaps.simulate import beam_spots
+
+    try:
+        if float(sun_elevation) <= 0:
+            return None
+        return beam_spots(case, xyz, aim_az, aim_z, float(sun_elevation), float(sun_azimuth))
+    except Exception:  # noqa: BLE001 - a display aid must never break the result page
+        return None
 
 
 def _pct_num(v, digits: int = 2):

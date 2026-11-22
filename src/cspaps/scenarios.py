@@ -85,7 +85,8 @@ class ScenarioSet:
     def fingerprint(self) -> str:
         h = hashlib.sha256()
         t = self.table()[["scenario_id", "elevation_deg", "azimuth_deg", "hours", "dni_w_m2", "map_id"]]
-        h.update(t.to_csv(index=False, float_format="%.6f").encode())
+        # fixed line ending: the same scenario set has the same fingerprint on Windows and Linux
+        h.update(t.to_csv(index=False, float_format="%.6f", lineterminator="\n").encode())
         for k in sorted({self.map_id(i) for i in range(len(self))}):
             h.update(self.maps[k].digest().encode())
         return h.hexdigest()[:16]
@@ -276,8 +277,10 @@ def check_scenario_table(case, df: pd.DataFrame, maps: dict[str, DNIMap], map_fi
 def load_table(case, path, maps: dict[str, DNIMap] | None = None) -> ScenarioSet:
     """Scenario table CSV: scenario_id, elevation_deg + azimuth_deg (or a local ``time``), hours, dni_w_m2,
     map_id [, actual_hours, hourly_members]."""
+    from .tables import read_user_csv
+
     maps = dict(maps if maps is not None else model_maps(case))
-    df = pd.read_csv(path)
+    df = read_user_csv(path)
     problems = check_scenario_table(case, df, maps, case.scenarios.map_file or "地图库")
     if problems:
         raise ValueError(f"{Path(path).name}: " + " ".join(p["message"] for p in problems[:5]))

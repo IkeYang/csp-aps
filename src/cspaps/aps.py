@@ -187,16 +187,16 @@ def build_response(
     if case.shading.enabled and n:
         # each candidate has its own mirror normal and reflected beam, so shading and blocking are evaluated
         # per candidate (they differ by up to tens of percent at low sun near the field edge)
+        n_pts = int(shading_points or case.shading.n_points)
         sb_k = np.empty((n, k))
         tower_dark = np.zeros((n, k), dtype=bool)
-        non_tower_occluded = (np.empty((n, k, case.shading.n_points ** 2), dtype=bool)
-                              if store_occlusion_samples else None)
+        # the cached sample masks must match the sampling used here (n_pts x n_pts points per mirror)
+        non_tower_occluded = np.empty((n, k, n_pts ** 2), dtype=bool) if store_occlusion_samples else None
         for j in range(k):
             shadow = shading.shading_blocking(fld.xyz, normals[:, j], s, t[:, j], hel, rec, fld.pairs,
-                                              n_points=shading_points or case.shading.n_points,
-                                              tower_shadow=case.shading.tower_shadow)
+                                              n_points=n_pts, tower_shadow=case.shading.tower_shadow)
             sb_k[:, j] = shadow["combined"]
-            tower_dark[:, j] = shadow["tower_fraction"] == 1.
+            tower_dark[:, j] = shadow["tower_fraction"] >= 1.0
             if non_tower_occluded is not None:
                 non_tower_occluded[:, j] = shadow["non_tower_occluded"]
     else:

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from . import __version__, sun
+from .tables import export_name, safe_filename
 from .aps import build_problem, optimize_aims, solve, solve_greedy
 from .certify import improve_and_certify
 from .clouds import load_dni_map
@@ -70,7 +71,7 @@ def _clean(d):
 def out_dir(base: str | Path, case: Case, task: str = "run") -> Path:
     """A new run folder; the case inputs are saved in it."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    root = Path(base) / case.name
+    root = Path(base) / safe_filename(case.name)
     root.mkdir(parents=True, exist_ok=True)
     for k in itertools.count(1):
         out = root / (f"{task}_{stamp}" if k == 1 else f"{task}_{stamp}-{k}")
@@ -1085,7 +1086,7 @@ def export_values(values: dict, folder: Path, ranking: pd.DataFrame | None = Non
     folder.mkdir(parents=True, exist_ok=True)
     files = {}
     for name, v in values.items():
-        safe = name.replace("+", "_plus_")
+        safe = export_name(name)
         sub = v.export(folder / safe)
         files[f"values_{safe}_csv"] = sub["scenario_csv"]
     if ranking is not None and len(ranking):
@@ -1188,7 +1189,7 @@ def replay_layout_value(folder, base, progress=None, cancel=None):
     if layouts:
         layouts = {name: ("initial" if path == "initial" else folder / path) for name, path in layouts.items()}
     else:  # Historical comparisons store their positions with the per-scenario results.
-        layouts = {r["name"]: folder / "values" / r["name"].replace("+", "_plus_") / "layout.csv"
+        layouts = {r["name"]: folder / "values" / export_name(r["name"]) / "layout.csv"
                    for r in summary["ranking"]}
     return task_layout_value(case, base, layouts, folder / "scenario_set", summary["lambda_layout"], progress, cancel)
 

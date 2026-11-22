@@ -171,7 +171,7 @@ class APSEngine:
                 normals, *_ = optics.heliostat_geometry(fld.xyz, aim_xyz, s)
                 pts = shading.mirror_points(fld.xyz, *shading.mirror_frames(normals), hel,
                                             shading.grid_offsets(case.shading.n_points))
-                tower = shading.ray_hits_tower(pts, s[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+                tower = shading.ray_hits_structure(pts, s[None, None, :], rec)
                 other = self._rs.non_tower_occluded[np.arange(fld.n), k]
                 sb = 1.0 - (other | tower).mean(axis=1)
             else:
@@ -351,8 +351,7 @@ class APSEngine:
                 normal, *_ = optics.heliostat_geometry(self.fld.xyz[changed], surface_point(case.receiver, aa[changed], zz[changed]), s)
                 pts = shading.mirror_points(self.fld.xyz[changed], *shading.mirror_frames(normal), case.heliostat,
                                             shading.grid_offsets(case.shading.n_points))
-                return shading.ray_hits_tower(pts, s, case.receiver.center[:2], case.receiver.tower_radius,
-                                              case.receiver.top).all(axis=1)
+                return shading.ray_hits_structure(pts, s, case.receiver).all(axis=1)
             keep = np.flatnonzero(changed)[dark_at(azimuth, height) & dark_at(ref_az, ref_z)]
             azimuth[keep], height[keep], on[keep] = ref_az[keep], ref_z[keep], ref_on[keep]
             return azimuth, height, on

@@ -105,7 +105,9 @@ def _read_weather(case: Case, path) -> pd.Series:
         dni_s.index = dni_s.index - pd.Timedelta(minutes=30)
         dni_s = dni_s.tz_convert(case.site.timezone)
     else:
-        df = pd.read_csv(path)
+        from .tables import read_user_csv
+
+        df = read_user_csv(path)
         if not {"time", "dni"} <= set(df.columns):
             raise ValueError(f"{path}: weather CSV needs columns time,dni")
         idx = to_times(df["time"], case.site.timezone)

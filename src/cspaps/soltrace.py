@@ -102,7 +102,7 @@ def export_plan(case: Case, fld: Field, ts, el: float, az: float, dni, aim, acti
                    "specular_error_mrad": hel.specular_error_mrad},
         "receiver": {"center": list(rec.center), "radius": rec.radius, "height": rec.height,
                      "tower_radius": rec.tower_radius if case.shading.tower_shadow else 0.0,
-                     "tower_height": rec.center[2] - 0.5 * rec.height},
+                     "tower_height": rec.tower_top},
         "grid": {"n_azimuth": int(grid.azimuth_deg.size), "n_height": int(grid.z.size)},
         "heliostats": [
             {"id": int(h_id), "position": p.tolist(), "normal": n.tolist(), "aim_point": a.tolist(),

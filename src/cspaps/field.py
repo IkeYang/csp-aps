@@ -275,9 +275,9 @@ def clip_to_site(case: Case, xyz: np.ndarray) -> np.ndarray:
 
 def read_layout(path: str | Path, pivot_height: float) -> tuple[np.ndarray, np.ndarray | None]:
     """(xyz, ids or None) from a layout CSV with columns [id,]x,y[,z]."""
-    import pandas as pd
+    from .tables import read_user_csv
 
-    df = pd.read_csv(path)
+    df = read_user_csv(path)
     if not {"x", "y"} <= set(df.columns):
         raise ValueError(f"{path}: CSV needs a header with columns x,y[,z] (optionally id)")
     z = df["z"].to_numpy(float) if "z" in df else np.full(len(df), pivot_height)

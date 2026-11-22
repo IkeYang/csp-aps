@@ -146,7 +146,18 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _safe_console() -> None:
+    """Never fail on printing: a Windows console or a redirected stdout may use a code page (cp936, cp1252)
+    that cannot encode every character of a result (e.g. Chinese labels, superscripts, Greek letters)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):  # replaced streams (pytest capture, IDE consoles)
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _safe_console()
     args = build_parser().parse_args(argv)
     if args.command == "gui":
         app = Path(__file__).with_name("gui_app.py")

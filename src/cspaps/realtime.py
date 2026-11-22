@@ -201,6 +201,8 @@ def run_realtime(
                 "feasible_absorbed_mw": snap.p_absorbed / 1e6 if operational else 0.0,
                 "n_defocused": int((~np.asarray(active)).sum()), "n_moved": n_moved,
                 "n_defocus_commands": n_defocus_commands,
+                "n_tracking_in_tower_shadow": int(np.sum(np.asarray(active, bool) & (snap.tower_fraction >= 1.0)))
+                if snap.tower_fraction is not None else 0,
                 "plan_state": state, "plan_reasons": reasons,
                 "engine_total_s": eng_time, "response_reused": reused,
             })

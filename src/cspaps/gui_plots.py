@@ -28,40 +28,77 @@ def _base_layout(fig, title: str, height: int = 520):
     return fig
 
 
+def shadow_plane_height(case: Case, xyz=None) -> float:
+    """Height of the plane the tower shadow is drawn on: the mirrors' own pivot height (median of the
+    layout's z), or the case's ``heliostat.pivot_height`` when no layout is given."""
+    z = np.asarray(xyz, dtype=float).reshape(-1, 3)[:, 2] if xyz is not None and len(xyz) else None
+    return float(np.median(z)) if z is not None and np.all(np.isfinite(z)) else float(case.heliostat.pivot_height)
+
+
+def tower_shadow_outline(case: Case, sun_elevation: float, sun_azimuth: float, z_plane: float,
+                         clip: float | None = None) -> list[np.ndarray]:
+    """Shadow of the tower and the receiver (``shading.shadow_cylinders``) on the plane z = z_plane.
+
+    A cylinder of radius r between heights z0 and z1 shades the plane where its cross-sections fall,
+    i.e. circles of radius r centred at distance (z - z_plane) / tan(elevation) down-sun of the axis,
+    for z in [max(z0, z_plane), z1]: a stadium. One closed (M, 2) polygon per cylinder above the plane."""
+    from .shading import shadow_cylinders
+
+    el = np.radians(sun_elevation)
+    if not 0 < el <= np.pi / 2:
+        return []
+    center = np.asarray(case.receiver.center[:2], dtype=float)
+    a = np.radians(sun_azimuth)
+    away = -np.array([np.sin(a), np.cos(a)])  # the shadow points away from the sun
+    cross = np.array([-away[1], away[0]])
+    theta = np.linspace(-np.pi / 2, np.pi / 2, 49)
+    out = []
+    for radius, z0, z1 in shadow_cylinders(case.receiver):
+        if z1 <= z_plane:
+            continue
+        d0 = (max(z0, z_plane) - z_plane) / np.tan(el)
+        d1 = (z1 - z_plane) / np.tan(el)
+        if clip is not None and d1 > 2 * clip:  # sunrise / sunset: cut the shadow just beyond the field
+            if d0 > clip:
+                continue
+            d1 = clip
+        arc = radius * (np.cos(theta)[:, None] * away + np.sin(theta)[:, None] * cross)
+        far = center + d1 * away + arc
+        near = center + d0 * away - arc  # the near half circle, walked back
+        out.append(np.vstack((far, near)))
+    return out
+
+
 def _tower_shadow(fig, case, xyz, sun_angles, *, scene=False):
-    """Silhouette of the finite tower cylinder at the nominal mirror pivot height (ENU)."""
+    """Shadow of the tower and receiver on the plane of the mirror pivots (variable heights from the case)."""
     if sun_angles is None or not (case.shading.enabled and case.shading.tower_shadow):
         return
-    elevation, azimuth = np.radians(sun_angles)
     rec = case.receiver
-    z = case.heliostat.pivot_height
-    radius = rec.tower_radius
-    if not 0 < elevation <= np.pi / 2 or radius <= 0 or z >= rec.top:
-        return
-    center = np.asarray(rec.center[:2])
-    away = -np.array([np.sin(azimuth), np.cos(azimuth)])
-    cross = np.array([-away[1], away[0]])
-    length = (rec.top - z) / np.tan(elevation)
-    # Clip an exceptionally long sunrise/sunset shadow beyond the visible field.
-    extent = np.vstack((center, np.asarray(xyz)[:, :2]))
+    z = shadow_plane_height(case, xyz)
+    center = np.asarray(rec.center[:2], dtype=float)
+    el, az = float(sun_angles[0]), float(sun_angles[1])
+    a = np.radians(az)
+    away = -np.array([np.sin(a), np.cos(a)])
+    # clip an exceptionally long sunrise / sunset shadow just beyond the field shown
+    extent = np.vstack((center, np.asarray(xyz, dtype=float).reshape(-1, 3)[:, :2])) if xyz is not None else center[None]
     if case.field.boundary is not None and not scene:
         extent = np.vstack((extent, case.field.boundary))
-    clip = float(((extent - center) @ away).max()) + 2 * radius
-    theta = np.linspace(-np.pi / 2, np.pi / 2, 49)
-    arc = radius * (np.cos(theta)[:, None] * away + np.sin(theta)[:, None] * cross)
-    far = center + length * away + arc if length <= 2 * clip else center + clip * away + arc[[0, -1]]
-    points = np.vstack((far, center - arc))
-    x, y = points.T
-    name = f"塔影（镜轴高度 {z:g} m）"
-    if scene:
-        idx = np.arange(1, len(x) - 1)
-        fig.add_trace(go.Mesh3d(x=x, y=y, z=np.full(len(x), z), i=np.zeros(len(idx), int), j=idx, k=idx + 1,
-                                name=name, color="#594577", opacity=0.42, flatshading=True, showlegend=True,
-                                hoverinfo="skip"))
-    else:
-        fig.add_trace(go.Scatter(x=np.r_[x, x[0]], y=np.r_[y, y[0]], mode="lines", fill="toself",
-                                 line=dict(color="#66547e", width=1.5), fillcolor="rgba(99,76,130,.27)",
-                                 name=name, hoverinfo="skip"))
+    clip = float(((extent - center) @ away).max()) + 2 * max(rec.tower_radius, rec.radius)
+    parts = tower_shadow_outline(case, el, az, z, clip=clip)
+    if not parts:
+        return
+    name = f"塔影（塔高 {rec.tower_top:g} m、吸热器顶 {rec.top:g} m，投在镜轴高度 {z:g} m）"
+    for k, poly in enumerate(parts):
+        x, y = poly.T
+        if scene:
+            idx = np.arange(1, len(x) - 1)
+            fig.add_trace(go.Mesh3d(x=x, y=y, z=np.full(len(x), z), i=np.zeros(len(idx), int), j=idx, k=idx + 1,
+                                    name=name, color="#594577", opacity=0.42, flatshading=True, showlegend=k == 0,
+                                    legendgroup="tower_shadow", hoverinfo="skip"))
+        else:
+            fig.add_trace(go.Scatter(x=np.r_[x, x[0]], y=np.r_[y, y[0]], mode="lines", fill="toself",
+                                     line=dict(color="#66547e", width=1.5), fillcolor="rgba(99,76,130,.27)",
+                                     name=name, showlegend=k == 0, legendgroup="tower_shadow", hoverinfo="skip"))
 
 
 def tower_shadow_fraction(case: Case, xyz, sun_elevation: float, sun_azimuth: float) -> np.ndarray:
@@ -80,8 +117,7 @@ def tower_shadow_fraction(case: Case, xyz, sun_elevation: float, sun_azimuth: fl
     normals, *_ = optics.heliostat_geometry(xyz, surface_point(case.receiver, aim_az, aim_z), direction)
     points = shading.mirror_points(xyz, *shading.mirror_frames(normals), case.heliostat,
                                    shading.grid_offsets(case.shading.n_points))
-    hit = shading.ray_hits_tower(points, direction, case.receiver.center[:2], case.receiver.tower_radius,
-                                 case.receiver.top)
+    hit = shading.ray_hits_structure(points, direction, case.receiver)
     return hit.mean(axis=1)
 
 
@@ -249,7 +285,7 @@ def plant_scene(case: Case, xyz: np.ndarray, values=None, label: str = "", heigh
     fig.add_trace(go.Scatter3d(x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers", marker=marker,
                                name="定日镜", hovertemplate="x %{x:.0f} m, y %{y:.0f} m<extra></extra>"))
     th = np.linspace(0, 2 * np.pi, 40)
-    zt = np.array([0.0, cz - 0.5 * rec.height])
+    zt = np.array([0.0, rec.tower_top])  # tower height variable (default: receiver bottom)
     tr = rec.tower_radius
     fig.add_trace(go.Surface(x=cx + tr * np.outer(np.sin(th), np.ones(2)), y=cy + tr * np.outer(np.cos(th), np.ones(2)),
                              z=np.outer(np.ones_like(th), zt), showscale=False, colorscale=[[0, "#9aa7ad"], [1, "#9aa7ad"]],
@@ -504,7 +540,7 @@ def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_li
         fig.add_trace(go.Scatter3d(x=lx, y=ly, z=lz, mode="lines", name=f"反射光束（抽样 {pick.size} 条）",
                                    line=dict(color="rgba(224,155,45,0.45)", width=2), hoverinfo="skip"))
     th, s, c = _cylinder(rec)
-    zt = np.array([0.0, cz - 0.5 * rec.height])
+    zt = np.array([0.0, rec.tower_top])  # tower height variable (default: receiver bottom)
     fig.add_trace(go.Surface(x=cx + rec.tower_radius * np.outer(s, np.ones(2)), y=cy + rec.tower_radius * np.outer(c, np.ones(2)),
                              z=np.outer(np.ones_like(th), zt), showscale=False, colorscale=[[0, "#9aa7ad"], [1, "#9aa7ad"]],
                              hoverinfo="skip", name="塔"))
@@ -565,11 +601,54 @@ def receiver_aims_3d(case: Case, grid: ReceiverGrid, flux_w_m2, xyz: np.ndarray,
     return _base_layout(fig, title, height)
 
 
+def _spot_text(spots: dict, i: int) -> str:
+    k = spots.get("k", 2.0)
+    return (f"<br>光斑 σ {spots['sigma_m'][i]:.2f} m（光束截面）"
+            f"<br>吸热面上 {k:g}σ 范围：宽 {spots['width_m'][i]:.2f} m × 高 {spots['height_m'][i]:.2f} m"
+            f"<br>入射角 {spots['incidence_deg'][i]:.0f}°，截获 {100 * spots['intercept'][i]:.1f}%，"
+            f"斜距 {spots['slant_m'][i]:.0f} m")
+
+
+def _spot_outlines(fig, case: Case, az, zz, cov, k: float = 2.0, sample: int = 40) -> None:
+    """k-sigma spot ellipses to scale (one NaN-separated trace each, copies across 0 / 360 deg).
+
+    A sample of at most ``sample`` mirrors, spread evenly around the receiver, is drawn by default; the
+    outlines of all mirrors are one legend click away (drawing hundreds at once hides the flux map)."""
+    from .optics import spot_outline
+
+    n = len(az)
+    ex, ey = spot_outline(case.receiver, az, zz, cov, k)
+    frac = 1.0 - np.exp(-0.5 * k * k)
+
+    def trace(idx, name, visible):
+        xs, ys = [], []
+        for i in idx:
+            for shift in (0.0, 360.0, -360.0):
+                xx = ex[i] + shift
+                if shift == 0.0 or (xx.max() > 0.0 and xx.min() < 360.0):
+                    xs.append(np.r_[xx, np.nan])
+                    ys.append(np.r_[ey[i], np.nan])
+        fig.add_trace(go.Scatter(x=np.concatenate(xs), y=np.concatenate(ys), mode="lines", hoverinfo="skip",
+                                 line=dict(color="rgba(255,255,255,0.7)", width=0.9), name=name, visible=visible))
+
+    if n <= sample:
+        trace(range(n), f"光斑轮廓（{k:g}σ，约含 {frac:.0%} 光能）", True)
+        return
+    order = np.argsort(np.asarray(az) % 360.0, kind="stable")
+    pick = order[np.linspace(0, n - 1, sample).round().astype(int)]
+    trace(pick, f"光斑轮廓 · 抽样 {sample} 面（{k:g}σ，约含 {frac:.0%} 光能）", True)
+    trace(range(n), f"全部 {n} 面的光斑轮廓（点图例显示）", "legendonly")
+
+
 def receiver_aims_map(case: Case, grid: ReceiverGrid, flux_w_m2, aim_az, aim_z, active, ids=None, values=None,
                       value_label: str = "DNI (W/m²)", prev=None, title: str = "", height: int = 420, zmax=None,
-                      hotspot: dict | None = None, show_flux: bool = True, cmin=None, cmax=None):
+                      hotspot: dict | None = None, show_flux: bool = True, cmin=None, cmax=None, spots: dict | None = None):
     """Unrolled receiver: flux heat map and every active mirror's aim point (coloured by a mirror attribute);
-    with ``prev`` = (az, z, active) the moved aims get arrows from their previous position."""
+    with ``prev`` = (az, z, active) the moved aims get arrows from their previous position.
+
+    ``spots`` (``simulate.beam_spots``): the point size grows with the beam size, the hover gives the spot
+    (beam sigma, the 2-sigma extent on the surface, incidence, intercept) and a legend entry toggles the
+    2-sigma outline of every spot drawn to scale on the unrolled surface."""
     fig = receiver_map(case, grid, flux_w_m2, title, zmax=zmax, hotspot=hotspot, height=height) if show_flux else go.Figure()
     if show_flux:  # flux colour bar in the upper half, mirror colour bar in the lower half
         fig.update_traces(colorbar=dict(len=0.48, y=0.76, thickness=10), selector=dict(type="heatmap"))
@@ -592,8 +671,14 @@ def receiver_aims_map(case: Case, grid: ReceiverGrid, flux_w_m2, aim_az, aim_z, 
         if gone.size:
             fig.add_trace(go.Scatter(x=paz[gone], y=pz[gone], mode="markers", name=f"改为散焦（{gone.size} 面）",
                                      marker=dict(symbol="x", size=7, color=RED), hoverinfo="skip"))
+    if on.size and spots is not None:
+        _spot_outlines(fig, case, az[on], zz[on], np.asarray(spots["cov"])[on], spots.get("k", 2.0))
     if on.size:
         marker = dict(size=6, line=dict(width=0.6, color="white"))
+        if spots is not None:  # bigger spot -> bigger point (5-15 px over the range of this plan)
+            sg = np.asarray(spots["sigma_m"], float)[on]
+            span = float(sg.max() - sg.min())
+            marker["size"] = 5 + 10 * ((sg - sg.min()) / span if span > 1e-9 else np.full(sg.size, 0.5))
         if values is not None:
             v = np.asarray(values, float)[on]
             marker.update(color=v, colorscale=DNI_SCALE, showscale=True, cmin=cmin, cmax=cmax,
@@ -601,8 +686,10 @@ def receiver_aims_map(case: Case, grid: ReceiverGrid, flux_w_m2, aim_az, aim_z, 
         else:
             marker.update(color="#4fc3f7")
         txt = [f"镜 {ids[i]}<br>方位 {az[i]:.1f}°，高 {zz[i]:.2f} m" +
-               (f"<br>{value_label} {np.asarray(values)[i]:.1f}" if values is not None else "") for i in on]
-        fig.add_trace(go.Scatter(x=az[on], y=zz[on], mode="markers", marker=marker, name="镜面中心的瞄准点",
+               (f"<br>{value_label} {np.asarray(values)[i]:.1f}" if values is not None else "") +
+               (_spot_text(spots, i) if spots is not None else "") for i in on]
+        name = "镜面中心的瞄准点" + ("（点越大光斑越大）" if spots is not None else "")
+        fig.add_trace(go.Scatter(x=az[on], y=zz[on], mode="markers", marker=marker, name=name,
                                    text=txt, hovertemplate="%{text}<extra></extra>", customdata=ids[on]))
     fig.update_xaxes(title="吸热器周向方位（°，北 0° / 东 90°）", range=[0, 360],
                      tickvals=list(range(0, 361, 45)), ticktext=["北", "东北", "东", "东南", "南", "西南", "西", "西北", "北"])

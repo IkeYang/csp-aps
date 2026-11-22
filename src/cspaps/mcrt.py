@@ -24,7 +24,7 @@ from . import optics, sun
 from .config import Case
 from .field import Field
 from .receiver import ReceiverGrid, build_grid, default_aim, surface_point
-from .shading import _corridor, mirror_frames, ray_hits_rect, ray_hits_tower
+from .shading import _corridor, mirror_frames, ray_hits_rect, ray_hits_structure
 from .simulate import STAGES, Snapshot
 
 
@@ -172,7 +172,7 @@ def trace(
         keep = in_chunk & _corridor(rel, np.broadcast_to(s, rel.shape), diag, np.full(rel.shape[0], np.inf))
         shaded = _rect_mask(o, s_ray, pair_i[keep] - sl[0], pair_j[keep], fld.xyz, normals, e_w, e_h, hw, hh)
         if case.shading.enabled and case.shading.tower_shadow and rec.tower_radius > 0:
-            shaded |= ray_hits_tower(o, s_ray, rec.center[:2], rec.tower_radius, rec.top)
+            shaded |= ray_hits_structure(o, s_ray, rec)
         if not case.shading.enabled:
             shaded[:] = False
         w = np.where(shaded, 0.0, w)
