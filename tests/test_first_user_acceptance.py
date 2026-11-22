@@ -87,6 +87,21 @@ def _run_layout_example(at):
     assert not at.exception and not at.error
 
 
+def test_layout_search_shows_full_width_site_preview_before_configuration(monkeypatch, tmp_path):
+    at = _app(monkeypatch, tmp_path, small_case_dict())
+    at.run()
+    at.radio(key="page").set_value("布局优化").run()
+    at.radio(key="layout_mode").set_value("search").run()
+
+    sections = [item.value for item in at.markdown]
+    preview_index = next(i for i, text in enumerate(sections) if "场地预览" in text)
+    inputs_index = next(i for i, text in enumerate(sections) if "场地、设备与位置" in text)
+
+    assert preview_index < inputs_index
+    assert at.get("plotly_chart")[0].key == "site_map"
+    assert not at.exception
+
+
 def test_task3_two_layouts_same_maps_winner_energy_score_and_top_scenario(monkeypatch, tmp_path):
     """Two layouts + one set of annual maps: the winner, its actual annual heat, the score and the scenario
     that contributes most to the difference."""

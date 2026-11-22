@@ -1913,6 +1913,126 @@ def _receiver_center_inputs(case) -> None:
     data.setdefault("receiver", {})["center"] = new
 
 
+def _layout_search_preview(case) -> None:
+    with _card("layout_preview"):
+        _section(None, "场地预览", "虚线为场地边界，红色点线为塔周禁排区。点击「开始布局优化」后，"
+                 "这里会显示单镜年潜力图、优化后的镜位和最优性上界。")
+        try:
+            fld = build_field(case)
+            _chart(field_map(case, fld.xyz, fld.ids, title=f"当前镜场：{fld.n} 面（布局优化将按目标镜数 "
+                             f"{case.layout_opt.n_heliostats} 面重新布置）"), "site_map")
+            if fld.dropped:
+                st.warning(f"{len(fld.dropped)} 面镜子因场地检查被过滤。")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"无法生成镜场：{exc}")
+
+
+def _layout_search_inputs(case) -> str | None:
+    if st.session_state.get("own_data") == "layout":
+        _templates(["layouts", "scenarios", "maps"], "layout_search")
+    with _card("layout_inputs"):
+        _section(1, "场地、设备与位置", "这些就是问题二的全部给定条件。")
+        _fields("site", ["latitude", "longitude", "elevation_m", "timezone"])
+        _fields("layout_opt", ["n_heliostats"], n_cols=1)
+        _fields("heliostat", ["width", "height", "pivot_height"], n_cols=3)
+        st.caption("吸热器（圆柱）中心三维坐标，原点为塔底")
+        _receiver_center_inputs(case)
+        _fields("receiver", ["diameter", "height"])
+        _fields("receiver", ["tower_diameter", "tower_height"])
+        _site_inputs(case)
+        _weather_panel(case, "layout")
+    with _card("layout_goal"):
+        _section(2, "用工程语言设定目标", "一个偏好同时控制运行（怎样瞄准）和评价（怎样排名）。")
+        _preference_controls(case, "opt")
+        _fields("layout_opt", ["uniformity_metric"], n_cols=1)
+        st.caption("上面的初筛指标只用于中心瞄准的快速初筛（周向 = 布局决定、瞄准策略无法消除的部分）；"
+                   "正式排名的不均匀量与问题一相同，是考核区二维吸收热流的 A_H·σ_H。")
+    scen_blockers = []
+    with _card("layout_scen"):
+        _section(3, "看看日照落在哪些镜子上",
+                 "工况 = 太阳方向 + 代表小时数 + 场地 DNI 地图。" + DNI_DEFINITION + "。镜子在哪里就读哪里的 DNI。")
+        scen_blockers = _scenario_source_inputs(case, "opt")
+        c0, _ = _case()
+        if c0 is not None and not scen_blockers:
+            try:
+                from cspaps.layout_value import baseline_layout
+
+                b0 = baseline_layout(c0, c0.layout_opt.n_heliostats or build_field(c0).n)
+                _scenario_browser(c0, {"初始镜场": (b0[0], b0[1])} if b0 else {}, "opt")
+            except Exception as exc:  # noqa: BLE001
+                st.caption(f"工况预览不可用：{exc}")
+        with st.expander("工况与地图的高级设置"):
+            _fields("scenarios", ["map_include_uniform", "map_assignment", "map_sequence", "map_cell_m",
+                                  "dni_bands"], n_cols=2)
+            _fields("annual", ["representative_dni"], n_cols=1)
+            _fields("layout_opt", ["formal_swap_rounds", "formal_position_trials", "ranking_refine_states",
+                                   "dense_check_scenarios", "inner_joint_trials", "inner_certify_rounds",
+                                   "inner_certify_iters", "cross_check_maps"], n_cols=2)
+    with _card("layout_search"):
+        _section(4, "搜索设置", "初筛按中心瞄准的全年理论热量减周向不均匀惩罚评价参数化布局；入围布局与初始布局"
+                 "再在同一组工况上逐个求解 APS，按 V(L) 正式排名。")
+        st.radio("计算强度", list(PRESETS), format_func=lambda k: PRESETS[k][0], key="layout_preset",
+                 index=1, horizontal=False, on_change=_apply_preset)
+        _fields("layout_opt", ["generator", "search_aiming", "refine_top", "upper_bound"])
+        with st.expander("搜索范围、采样精度与计算资源"):
+            common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight",
+                      "uniformity_metric", "ranking", "baseline", "aps_weight", "formal_swap_rounds",
+                      "dense_check_scenarios", "formal_position_trials", "ranking_refine_states", "inner_joint_trials",
+                      "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"}
+            _fields("layout_opt", [f.name for f in dataclasses.fields(_SECTIONS["layout_opt"]) if f.name not in common])
+        with st.expander("APS 复核使用的瞄准设置"):
+            _fields("aps", ["method", "n_height_levels", "azimuth_offsets_deg"])
+            st.caption("均匀性权重由第 2 步的偏好滑块决定（运行与评价同一个 λ）；安全裕度也在第 2 步设置。")
+    case, err = _case()
+    if err:
+        st.error(err)
+        return None
+    with _card("layout_run"):
+        _section(5, "确认要算什么", "开始前核对规模与口径；计算中可以取消，已完成的工况会保留，未完成的布局标为排名待定。")
+        try:
+            tbl = _scenario_table(case.to_yaml(), st.session_state["base_dir"])
+            n_s, hrs = len(tbl), float(tbl["actual_hours"].sum())
+        except Exception:  # noqa: BLE001
+            n_s, hrs = 0, 0.0
+        lo = case.layout_opt
+        _run_summary([("镜数", f"{lo.n_heliostats} 面"), ("正式排名工况", f"{n_s} 个"),
+                      ("合计代表小时（实际）", f"{hrs:,.0f} h"),
+                      ("数据来源", f"工况清单 {Path(case.scenarios.file).name}" if case.scenarios.source == "file"
+                       else f"站址气象 + 地图模型 {case.scenarios.map_model}"),
+                      ("考核区域", "整个吸热面" if not case.uniformity.panels and not case.uniformity.z_range else "部分区域"),
+                      ("安全裕度", f"{case.aps.safety_margin:.0%}"),
+                      ("参加排名", f"搜索前 {lo.refine_top} 名" + (" + 初始镜场" if lo.baseline == "initial" else "")),
+                      ("偏好 λ", f"{lo.uniformity_weight:.2f}")])
+        digest = _job_button("opt", "▶  开始布局优化", wf.task_optimize_layout, progress=True,
+                             cancellable=True, blockers=scen_blockers)
+        _job_error("opt")
+    return digest
+
+
+def _layout_search_results(completed, res: dict, digest: str | None) -> None:
+    if res.get("input_digest") != digest:
+        _callout("warn", "参数已修改，需要重新计算",
+                 f"下面的图表、指标和导出文件对应上一次的参数：镜数 {completed.layout_opt.n_heliostats}，"
+                 f"λ = {completed.layout_opt.uniformity_weight:g}，正式工况 {completed.scenarios.n_scenarios} 个，"
+                 f"地图模型 {completed.scenarios.map_model}。")
+    f = res["result"].formal
+    if f and f.get("values"):
+        s_ = res["summary"]
+        _section(None, "正式排名 · 逐工况 APS 年度价值",
+                 f"{s_['n_heliostats']} 面镜 · {len(f['scenario_set'])} 个工况 · λ_APS = {f['settings'].lam_aps:g} · "
+                 f"λ_L = {completed.layout_opt.uniformity_weight:g} · 用时 {s_['runtime_s']:.0f} s · "
+                 f"场地校验 {'通过' if s_['status'] == 'ok' else s_['status']}")
+        if f.get("validation_set") and not f["validation_set"]["new_states"]:
+            st.info("复核表与设计表使用相同工况。请导入另一张复核工况表以检查排序稳定性。")
+        _render_values(completed, f["values"], f["ranking"], f["scenario_set"], "opt", bound=res["result"].bound,
+                       dense=f.get("dense"), run_dir=res["run_dir"], swaps=f.get("swaps"),
+                       cross=f.get("cross_maps"))
+        with st.expander("初筛（中心瞄准）、搜索过程、场地潜力与周向受热"):
+            _layout_results(completed, res)
+    else:
+        _layout_results(completed, res)
+
+
 def page_layout(case) -> None:
     _hero("问题二 · 电站设计", "镜场布局优化",
           "给定场地范围、镜数与镜面尺寸、吸热器三维坐标、经纬度和全年空间 DNI 工况，寻找年度价值 "
@@ -1927,125 +2047,21 @@ def page_layout(case) -> None:
     if mode == "compare":
         _compare_workspace(case)
         return
-    if st.session_state.get("own_data") == "layout":
-        _templates(["layouts", "scenarios", "maps"], "layout_search")
-    if st.session_state.get("res_opt") is not None:
-        right, left = st.tabs(["计算结果", "调整参数"])
-    else:
-        left, right = st.columns([1, 2.05], gap="large")
-    with left:
-        with _card("layout_inputs"):
-            _section(1, "场地、设备与位置", "这些就是问题二的全部给定条件。")
-            _fields("site", ["latitude", "longitude", "elevation_m", "timezone"])
-            _fields("layout_opt", ["n_heliostats"], n_cols=1)
-            _fields("heliostat", ["width", "height", "pivot_height"], n_cols=3)
-            st.caption("吸热器（圆柱）中心三维坐标，原点为塔底")
-            _receiver_center_inputs(case)
-            _fields("receiver", ["diameter", "height"])
-            _fields("receiver", ["tower_diameter", "tower_height"])
-            _site_inputs(case)
-            _weather_panel(case, "layout")
-        with _card("layout_goal"):
-            _section(2, "用工程语言设定目标", "一个偏好同时控制运行（怎样瞄准）和评价（怎样排名）。")
-            _preference_controls(case, "opt")
-            _fields("layout_opt", ["uniformity_metric"], n_cols=1)
-            st.caption("上面的初筛指标只用于中心瞄准的快速初筛（周向 = 布局决定、瞄准策略无法消除的部分）；"
-                       "正式排名的不均匀量与问题一相同，是考核区二维吸收热流的 A_H·σ_H。")
-        scen_blockers = []
-        with _card("layout_scen"):
-            _section(3, "看看日照落在哪些镜子上",
-                     "工况 = 太阳方向 + 代表小时数 + 场地 DNI 地图。" + DNI_DEFINITION + "。镜子在哪里就读哪里的 DNI。")
-            scen_blockers = _scenario_source_inputs(case, "opt")
-            c0, _ = _case()
-            if c0 is not None and not scen_blockers:
-                try:
-                    from cspaps.layout_value import baseline_layout
-
-                    b0 = baseline_layout(c0, c0.layout_opt.n_heliostats or build_field(c0).n)
-                    _scenario_browser(c0, {"初始镜场": (b0[0], b0[1])} if b0 else {}, "opt")
-                except Exception as exc:  # noqa: BLE001
-                    st.caption(f"工况预览不可用：{exc}")
-            with st.expander("工况与地图的高级设置"):
-                _fields("scenarios", ["map_include_uniform", "map_assignment", "map_sequence", "map_cell_m",
-                                      "dni_bands"], n_cols=2)
-                _fields("annual", ["representative_dni"], n_cols=1)
-                _fields("layout_opt", ["formal_swap_rounds", "formal_position_trials", "ranking_refine_states", "dense_check_scenarios", "inner_joint_trials",
-                                       "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"], n_cols=2)
-        with _card("layout_search"):
-            _section(4, "搜索设置", "初筛按中心瞄准的全年理论热量减周向不均匀惩罚评价参数化布局；入围布局与初始布局"
-                     "再在同一组工况上逐个求解 APS，按 V(L) 正式排名。")
-            st.radio("计算强度", list(PRESETS), format_func=lambda k: PRESETS[k][0], key="layout_preset",
-                     index=1, horizontal=False, on_change=_apply_preset)
-            _fields("layout_opt", ["generator", "search_aiming", "refine_top", "upper_bound"])
-            with st.expander("搜索范围、采样精度与计算资源"):
-                common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight",
-                          "uniformity_metric", "ranking", "baseline", "aps_weight", "formal_swap_rounds",
-                          "dense_check_scenarios", "formal_position_trials", "ranking_refine_states", "inner_joint_trials", "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"}
-                _fields("layout_opt", [f.name for f in dataclasses.fields(_SECTIONS["layout_opt"]) if f.name not in common])
-            with st.expander("APS 复核使用的瞄准设置"):
-                _fields("aps", ["method", "n_height_levels", "azimuth_offsets_deg"])
-                st.caption("均匀性权重由第 2 步的偏好滑块决定（运行与评价同一个 λ）；安全裕度也在第 2 步设置。")
-        case, err = _case()
-        if err:
-            st.error(err)
-            return
-        with _card("layout_run"):
-            _section(5, "确认要算什么", "开始前核对规模与口径；计算中可以取消，已完成的工况会保留，未完成的布局标为排名待定。")
-            try:
-                tbl = _scenario_table(case.to_yaml(), st.session_state["base_dir"])
-                n_s, hrs = len(tbl), float(tbl["actual_hours"].sum())
-            except Exception:  # noqa: BLE001
-                n_s, hrs = 0, 0.0
-            lo = case.layout_opt
-            _run_summary([("镜数", f"{lo.n_heliostats} 面"), ("正式排名工况", f"{n_s} 个"),
-                          ("合计代表小时（实际）", f"{hrs:,.0f} h"),
-                          ("数据来源", f"工况清单 {Path(case.scenarios.file).name}" if case.scenarios.source == "file"
-                           else f"站址气象 + 地图模型 {case.scenarios.map_model}"),
-                          ("考核区域", "整个吸热面" if not case.uniformity.panels and not case.uniformity.z_range else "部分区域"),
-                          ("安全裕度", f"{case.aps.safety_margin:.0%}"),
-                          ("参加排名", f"搜索前 {lo.refine_top} 名" + (" + 初始镜场" if lo.baseline == "initial" else "")),
-                          ("偏好 λ", f"{lo.uniformity_weight:.2f}")])
-            digest = _job_button("opt", "▶  开始布局优化", wf.task_optimize_layout, progress=True, cancellable=True,
-                        blockers=scen_blockers)
-            _job_error("opt")
-    with right:
+    res = st.session_state.get("res_opt")
+    if res is None:
+        _layout_search_preview(case)
+        _layout_search_inputs(case)
         res = st.session_state.get("res_opt")
-        if res is None:
-            with _card("layout_preview"):
-                _section(None, "场地预览", "虚线为场地边界，红色点线为塔周禁排区。点击「开始布局优化」后，"
-                         "这里会显示单镜年潜力图、优化后的镜位和最优性上界。")
-                try:
-                    fld = build_field(case)
-                    _chart(field_map(case, fld.xyz, fld.ids, title=f"当前镜场：{fld.n} 面（布局优化将按目标镜数 "
-                                     f"{case.layout_opt.n_heliostats} 面重新布置）"), "site_map")
-                    if fld.dropped:
-                        st.warning(f"{len(fld.dropped)} 面镜子因场地检查被过滤。")
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"无法生成镜场：{exc}")
-        else:
-            completed = load_case(Path(res["run_dir"]) / "inputs_case.yaml")
-            if res.get("input_digest") != digest:
-                _callout("warn", "参数已修改，需要重新计算",
-                         f"下面的图表、指标和导出文件对应上一次的参数：镜数 {completed.layout_opt.n_heliostats}，"
-                         f"λ = {completed.layout_opt.uniformity_weight:g}，正式工况 {completed.scenarios.n_scenarios} 个，"
-                         f"地图模型 {completed.scenarios.map_model}。")
-            f = res["result"].formal
-            if f and f.get("values"):
-                s_ = res["summary"]
-                _section(None, "正式排名 · 逐工况 APS 年度价值",
-                         f"{s_['n_heliostats']} 面镜 · {len(f['scenario_set'])} 个工况 · λ_APS = {f['settings'].lam_aps:g} · "
-                         f"λ_L = {completed.layout_opt.uniformity_weight:g} · 用时 {s_['runtime_s']:.0f} s · "
-                         f"场地校验 {'通过' if s_['status'] == 'ok' else s_['status']}")
-                if f.get("validation_set") and not f["validation_set"]["new_states"]:
-                    st.info("复核表与设计表使用相同工况。请导入另一张复核工况表以检查排序稳定性。")
-                _render_values(completed, f["values"], f["ranking"], f["scenario_set"], "opt", bound=res["result"].bound,
-                               dense=f.get("dense"), run_dir=res["run_dir"], swaps=f.get("swaps"),
-                               cross=f.get("cross_maps"))
-                with st.expander("初筛（中心瞄准）、搜索过程、场地潜力与周向受热"):
-                    _layout_results(completed, res)
-            else:
-                _layout_results(completed, res)
+    else:
+        completed = load_case(Path(res["run_dir"]) / "inputs_case.yaml")
+        result_tab, settings_tab = st.tabs(["计算结果", "调整参数"])
+        with settings_tab:
+            _layout_search_preview(case)
+            digest = _layout_search_inputs(case)
+        with result_tab:
+            _layout_search_results(completed, res, digest)
     if res is not None:
+        completed = load_case(Path(res["run_dir"]) / "inputs_case.yaml")
         _planning_compare(completed)
 
 
