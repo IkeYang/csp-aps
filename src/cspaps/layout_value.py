@@ -47,7 +47,7 @@ import pandas as pd
 
 from .config import Case
 from .field import Field
-from .receiver import ReceiverGrid, build_grid
+from .receiver import ReceiverGrid, build_grid, default_aim
 
 STATUS_RULES = {
     "feasible": "verified plan with active heliostats; adds h_s (P_s - lambda_L U_s)",
@@ -235,8 +235,9 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     if not np.isfinite(dni_v).all() or np.any(dni_v < 0):
         raise ValueError("DNI must be finite and nonnegative")
     if elevation <= 0 or n == 0 or not np.any(dni_v > 0):
+        aim_az, aim_z = default_aim(c.receiver, fld.xyz)
         return PlanResult("no_sun", 0.0, 0.0, 0.0, 0.0, None, None, 0.0, 0.0, 0.0, 0.0, "no_sun", True, 0.0, 0.0,
-                          "ok", 0, n, dni_v, zeros.copy(), zeros.copy(), np.zeros(n, bool), zeros.copy(),
+                          "ok", n, 0, dni_v, aim_az, aim_z, np.ones(n, bool), zeros.copy(),
                           np.zeros(grid.shape) if keep_flux else None, _time.perf_counter() - t0)
     prob = build_problem(c, fld, elevation, azimuth, dni_v, dni_constraint, grid=grid)
     res = solve(prob, settings.method, c.aps, init=warm)
@@ -252,7 +253,7 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     snap = evaluate(c, fld, elevation, azimuth, dni_v, aim=res.aim, active=res.active, grid=grid)
     thermal = snap.thermal_objective(c.uniformity)
     if cert["status"] == "certified":
-        status = "feasible" if res.active.any() and thermal["power_w"] > 0 else "feasible_shutdown"
+        status = "feasible" if res.active.any() else "feasible_shutdown"
     elif cert["status"] == "certified_infeasible":
         status = "proven_infeasible"
     else:

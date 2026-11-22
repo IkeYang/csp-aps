@@ -96,6 +96,7 @@ class ControlResponse:
     response_reused: bool
     timings: dict
     uniformity: dict = dc_field(default_factory=dict)
+    n_defocus_commands: int | None = None  # transitions from an available, previously aimed mirror
 
     def summary(self) -> dict:
         return {
@@ -105,6 +106,7 @@ class ControlResponse:
             "power_intercepted_mw": round(self.power_intercepted_w / 1e6, 4),
             "power_absorbed_mw": round(self.power_absorbed_w / 1e6, 4),
             "n_defocused": int((~self.active).sum()), "n_moved": self.n_moved,
+            "n_defocus_commands": self.n_defocus_commands,
             "response_reused": self.response_reused,
             "uniformity": self.uniformity,
             "timings_s": {k: round(v, 4) for k, v in self.timings.items()},
@@ -141,7 +143,7 @@ class APSEngine:
         if rs is not None and rs.sun_shift_deg(el, az) <= self.case.engine.response_refresh_deg:
             self.stats["reuses"] += 1
             return rs, True
-        self._rs = build_response(self.case, self.fld, el, az, self.grid)
+        self._rs = build_response(self.case, self.fld, el, az, self.grid, store_occlusion_samples=True)
         self.stats["cold_builds"] += 1
         return self._rs, False
 
@@ -164,7 +166,16 @@ class APSEngine:
                                           tower_shadow=case.shading.tower_shadow)["combined"]
         elif self._rs is not None:
             k = self._choice_from_plan(self._rs, aim_az, aim_z, np.ones(fld.n, bool))
-            sb = self._rs.sb_k[np.arange(fld.n), k] if self._rs.sb_k is not None else self._rs.sb
+            if self._rs.non_tower_occluded is not None and case.shading.tower_shadow and rec.tower_radius > 0:
+                s = sun.sun_vector(el, az)
+                normals, *_ = optics.heliostat_geometry(fld.xyz, aim_xyz, s)
+                pts = shading.mirror_points(fld.xyz, *shading.mirror_frames(normals), hel,
+                                            shading.grid_offsets(case.shading.n_points))
+                tower = shading.ray_hits_tower(pts, s[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+                other = self._rs.non_tower_occluded[np.arange(fld.n), k]
+                sb = 1.0 - (other | tower).mean(axis=1)
+            else:
+                sb = self._rs.sb_k[np.arange(fld.n), k] if self._rs.sb_k is not None else self._rs.sb
         else:
             sb = np.ones(fld.n)
         sigma = optics.beam_sigma(slant, cos_inc, hel, case.sun)
@@ -190,7 +201,7 @@ class APSEngine:
         mask = region_mask(case.receiver, case.uniformity, self.grid.cell_az, self.grid.cell_z)
         metrics = uniformity_metrics(self.grid.to_map(q_abs), self.grid.to_map(mask))
         power_h = float(q_abs[mask].sum() * self.grid.cell_area)
-        load_ok = power_h >= max(case.uniformity.min_load_mw * 1e6, 1e-6)
+        load_ok = power_h >= max(case.uniformity.min_load_mw * 1e6, 0. if case.uniformity.mode == "weighted" else 1e-6)
         cv_ok = (case.uniformity.mode == "weighted" or
                  (np.isfinite(metrics["cv_2d"]) and metrics["cv_2d"] <= case.uniformity.max_cv))
         met = load_ok and cv_ok
@@ -307,8 +318,11 @@ class APSEngine:
                                                prev_active=prev[2] if prev is not None else None)
             choice = uniformity_result.choice
             if uniformity_result.status == "below_min_load":
-                choice = np.full(n, -1, dtype=int)
                 reasons.append("uniformity_below_min_load")
+                if case.aps.allow_defocus:
+                    ref_choice = prob.tracking_reference(prev[0:3] if prev is not None else None,
+                                                         prev[2] if prev is not None else None)
+                    choice = prob.keep_shadowed_targets(np.full(n, -1, dtype=int), ref_choice)
                 state = "infeasible"
             if uniformity_result.status == "not_reached":
                 reasons.append("uniformity_not_reached")
@@ -319,11 +333,51 @@ class APSEngine:
             reasons.append("solve_timeout")
         tm["solve_s"] = _time.perf_counter() - t0
 
-        # 5: check with current geometry; hotspots -> constraints -> repair
+        # Use the executed target even when it lies between candidate grid points.
+        def targets(ch):
+            azimuth, height = prob.aims(ch)
+            on = ch >= 0
+            if not (el > 0 and case.shading.enabled and case.shading.tower_shadow and case.receiver.tower_radius > 0):
+                return azimuth, height, on
+            ref_az, ref_z, ref_on = prev if prev is not None else (
+                rs.cand_az[:, rs.center_k], rs.cand_z[:, rs.center_k], np.ones(n, bool))
+            changed = avail & ((on != ref_on) | (azimuth != ref_az) | (height != ref_z))
+            if not case.aps.allow_defocus:
+                changed &= ref_on
+            if not changed.any():
+                return azimuth, height, on
+            s = sun.sun_vector(el, az)
+            def dark_at(aa, zz):
+                normal, *_ = optics.heliostat_geometry(self.fld.xyz[changed], surface_point(case.receiver, aa[changed], zz[changed]), s)
+                pts = shading.mirror_points(self.fld.xyz[changed], *shading.mirror_frames(normal), case.heliostat,
+                                            shading.grid_offsets(case.shading.n_points))
+                return shading.ray_hits_tower(pts, s, case.receiver.center[:2], case.receiver.tower_radius,
+                                              case.receiver.top).all(axis=1)
+            keep = np.flatnonzero(changed)[dark_at(azimuth, height) & dark_at(ref_az, ref_z)]
+            azimuth[keep], height[keep], on[keep] = ref_az[keep], ref_z[keep], ref_on[keep]
+            return azimuth, height, on
+
+        # 5: check the actual retained targets with current geometry and constraint DNI.
         t0 = _time.perf_counter()
-        aim_az, aim_z = prob.aims(choice)
-        active = choice >= 0
-        chk, beams = self._check(el, az, aim_az, aim_z, active, dni_con, prob.margin)
+        def verified_targets(ch):
+            aa, zz, on = targets(ch)
+            check, beams = self._check(el, az, aa, zz, on, dni_con, prob.margin)
+            # A retained off-grid pose can change neighbours' blocking. Try the original
+            # proposal before requesting any extra defocus if retention violates the limit.
+            original_az, original_z = prob.aims(ch)
+            altered = not (np.array_equal(aa, original_az) and np.array_equal(zz, original_z)
+                           and np.array_equal(on, ch >= 0))
+            if altered and (not check.ok or (case.uniformity.enabled and
+                                             not self._uniformity_summary(beams, on, dni_obj)["met"])):
+                original_on = ch >= 0
+                original_check, original_beams = self._check(el, az, original_az, original_z, original_on,
+                                                             dni_con, prob.margin)
+                if original_check.ok and (not case.uniformity.enabled or
+                                          self._uniformity_summary(original_beams, original_on, dni_obj)["met"]):
+                    return original_az, original_z, original_on, original_check, original_beams
+            return aa, zz, on, check, beams
+
+        aim_az, aim_z, active, chk, beams = verified_targets(choice)
         rounds = 0
         while not chk.ok and chk.hotspots and rounds < case.aps.verify_max_rounds:
             rs.add_points([h[0] for h in chk.hotspots], [h[1] for h in chk.hotspots])
@@ -335,11 +389,11 @@ class APSEngine:
                                                    prev_aim_xyz=prev_xyz,
                                                    prev_active=prev[2] if prev is not None else None)
                 choice = uniformity_result.choice
-                if uniformity_result.status == "below_min_load":
-                    choice = np.full(n, -1, dtype=int)
-            aim_az, aim_z = prob.aims(choice)
-            active = choice >= 0
-            chk, beams = self._check(el, az, aim_az, aim_z, active, dni_con, prob.margin)
+                if uniformity_result.status == "below_min_load" and case.aps.allow_defocus:
+                    ref_choice = prob.tracking_reference(prev[0:3] if prev is not None else None,
+                                                         prev[2] if prev is not None else None)
+                    choice = prob.keep_shadowed_targets(np.full(n, -1, dtype=int), ref_choice)
+            aim_az, aim_z, active, chk, beams = verified_targets(choice)
             rounds += 1
         if uniformity_result is None:
             state = "ready"
@@ -358,13 +412,6 @@ class APSEngine:
 
         # 6: output
         t0 = _time.perf_counter()
-        p_int = float(np.sum(dni_obj * beams["unit"] * beams["icpt"] * active))
-        if np.allclose(self.grid.alpha, self.grid.alpha[0]):
-            p_abs = p_int * float(self.grid.alpha[0])
-        else:
-            beam_flux = optics.footprints(self.grid, beams["aim_xyz"][active], beams["t"][active],
-                                          beams["sigma"][active], (beams["unit"] * dni_obj)[active])
-            p_abs = float(np.sum(beam_flux.sum(axis=0) * self.grid.alpha) * self.grid.cell_area)
         uniformity_summary = {}
         if case.uniformity.enabled:
             uniformity_summary = self._uniformity_summary(beams, active, dni_obj)
@@ -384,15 +431,29 @@ class APSEngine:
                         reasons.append("uniformity_fallback_hold_previous")
                         fallback_ok = True
                 if not fallback_ok:
-                    aim_az, aim_z = prob.aims(choice)
-                    active = np.zeros(n, dtype=bool)
+                    if case.aps.allow_defocus:
+                        ref_choice = prob.tracking_reference(prev[0:3] if prev is not None else None,
+                                                             prev[2] if prev is not None else None)
+                        retained = prob.keep_shadowed_targets(np.full(n, -1, dtype=int), ref_choice)
+                    else:
+                        retained = choice
+                    aim_az, aim_z = prob.aims(retained)
+                    active = retained >= 0
                     chk, beams = self._check(el, az, aim_az, aim_z, active, dni_con, prob.margin)
                     uniformity_summary = self._uniformity_summary(beams, active, dni_obj)
                     state = "infeasible"
                     reasons.append("uniformity_not_achievable_safe_plan_defocused")
             if not uniformity_summary["met"]:
                 reasons.append("uniformity_not_met_after_final_plan")
-        defocus_reason = ["" if a else ("unavailable" if not avail[i] else "uniformity or flux fallback")
+        p_int = float(np.sum(dni_obj * beams["unit"] * beams["icpt"] * active))
+        if np.allclose(self.grid.alpha, self.grid.alpha[0]):
+            p_abs = p_int * float(self.grid.alpha[0])
+        else:
+            beam_flux = optics.footprints(self.grid, beams["aim_xyz"][active], beams["t"][active],
+                                          beams["sigma"][active], (beams["unit"] * dni_obj)[active])
+            p_abs = float(np.sum(beam_flux.sum(axis=0) * self.grid.alpha) * self.grid.cell_area)
+        defocus_reason = ["" if a else "unavailable" if not avail[i] else
+                          "hold_previous_standby" if prev is not None and not prev[2][i] else "uniformity or flux fallback"
                           for i, a in enumerate(active)]
         n_moved = 0
         if prev is not None:
@@ -404,7 +465,7 @@ class APSEngine:
         resp = ControlResponse(
             self._plan_id, now, valid_from, valid_until, state, reasons, self.fld.ids.copy(), aim_az, aim_z,
             beams["aim_xyz"], active, defocus_reason, chk, basis, p_int, p_abs, n_moved, reused, tm,
-            uniformity_summary,
+            uniformity_summary, int(np.count_nonzero(avail & prev[2] & ~active)) if prev is not None else 0,
         )
         tm["output_s"] = _time.perf_counter() - t0
         tm["total_s"] = _time.perf_counter() - t_start
@@ -426,9 +487,12 @@ class APSEngine:
         if es.fallback == "none":
             return None
         if es.fallback == "hold_or_defocus" and prev is not None:
-            c2, b2 = self._check(el, az, prev[0], prev[1], prev[2], dni_con, prob.margin)
+            previous_active = prev[2] & prob.available
+            c2, b2 = self._check(el, az, prev[0], prev[1], previous_active, dni_con, prob.margin)
             if c2.ok:
-                return prev[0], prev[1], prev[2], c2, b2, "fallback_hold_previous"
+                return prev[0], prev[1], previous_active, c2, b2, "fallback_hold_previous"
+        if not self.case.aps.allow_defocus:
+            return None
         aim_az, aim_z = prob.aims(choice)
         active = (choice >= 0).copy()
         c2, b2 = chk, None

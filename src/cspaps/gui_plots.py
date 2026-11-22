@@ -28,11 +28,70 @@ def _base_layout(fig, title: str, height: int = 520):
     return fig
 
 
+def _tower_shadow(fig, case, xyz, sun_angles, *, scene=False):
+    """Silhouette of the finite tower cylinder at the nominal mirror pivot height (ENU)."""
+    if sun_angles is None or not (case.shading.enabled and case.shading.tower_shadow):
+        return
+    elevation, azimuth = np.radians(sun_angles)
+    rec = case.receiver
+    z = case.heliostat.pivot_height
+    radius = rec.tower_radius
+    if not 0 < elevation <= np.pi / 2 or radius <= 0 or z >= rec.top:
+        return
+    center = np.asarray(rec.center[:2])
+    away = -np.array([np.sin(azimuth), np.cos(azimuth)])
+    cross = np.array([-away[1], away[0]])
+    length = (rec.top - z) / np.tan(elevation)
+    # Clip an exceptionally long sunrise/sunset shadow beyond the visible field.
+    extent = np.vstack((center, np.asarray(xyz)[:, :2]))
+    if case.field.boundary is not None and not scene:
+        extent = np.vstack((extent, case.field.boundary))
+    clip = float(((extent - center) @ away).max()) + 2 * radius
+    theta = np.linspace(-np.pi / 2, np.pi / 2, 49)
+    arc = radius * (np.cos(theta)[:, None] * away + np.sin(theta)[:, None] * cross)
+    far = center + length * away + arc if length <= 2 * clip else center + clip * away + arc[[0, -1]]
+    points = np.vstack((far, center - arc))
+    x, y = points.T
+    name = f"塔影（镜轴高度 {z:g} m）"
+    if scene:
+        idx = np.arange(1, len(x) - 1)
+        fig.add_trace(go.Mesh3d(x=x, y=y, z=np.full(len(x), z), i=np.zeros(len(idx), int), j=idx, k=idx + 1,
+                                name=name, color="#594577", opacity=0.42, flatshading=True, showlegend=True,
+                                hoverinfo="skip"))
+    else:
+        fig.add_trace(go.Scatter(x=np.r_[x, x[0]], y=np.r_[y, y[0]], mode="lines", fill="toself",
+                                 line=dict(color="#66547e", width=1.5), fillcolor="rgba(99,76,130,.27)",
+                                 name=name, hoverinfo="skip"))
+
+
+def tower_shadow_fraction(case: Case, xyz, sun_elevation: float, sun_azimuth: float) -> np.ndarray:
+    """Projected tower blockage of mirror apertures under the nominal centre aiming pose."""
+    from . import optics, shading, sun
+    from .receiver import default_aim, surface_point
+
+    xyz = np.asarray(xyz, dtype=float).reshape(-1, 3)
+    if not len(xyz):
+        return np.zeros(0)
+    if not (case.shading.enabled and case.shading.tower_shadow and case.receiver.tower_radius > 0
+            and sun_elevation > 0):
+        return np.zeros(len(xyz))
+    aim_az, aim_z = default_aim(case.receiver, xyz)
+    direction = sun.sun_vector(sun_elevation, sun_azimuth)
+    normals, *_ = optics.heliostat_geometry(xyz, surface_point(case.receiver, aim_az, aim_z), direction)
+    points = shading.mirror_points(xyz, *shading.mirror_frames(normals), case.heliostat,
+                                   shading.grid_offsets(case.shading.n_points))
+    hit = shading.ray_hits_tower(points, direction, case.receiver.center[:2], case.receiver.tower_radius,
+                                 case.receiver.top)
+    return hit.mean(axis=1)
+
+
 def field_map(case: Case, xyz: np.ndarray, ids: np.ndarray, values=None, label: str = "", colorscale="Viridis",
               cmin=None, cmax=None, selected: int | None = None, title: str = "", hover: list[str] | None = None,
-              candidates: np.ndarray | None = None, inactive: np.ndarray | None = None, preview: bool = False):
+              candidates: np.ndarray | None = None, inactive: np.ndarray | None = None, preview: bool = False,
+              sun_angles=None, shadow_fraction=None):
     rec, spec = case.receiver, case.field
     fig = go.Figure()
+    _tower_shadow(fig, case, xyz, sun_angles)
     if spec.boundary is not None:
         b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
         fig.add_trace(go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", line=dict(color="black", dash="dash", width=1),
@@ -53,8 +112,18 @@ def field_map(case: Case, xyz: np.ndarray, ids: np.ndarray, values=None, label: 
     else:
         marker.update(color="#77cfc0" if preview else "#176f68")
     text = hover or [f"ID {i}" for i in ids]
+    if shadow_fraction is not None:
+        text = [f"{label}<br>塔影遮挡 {fraction:.0%}" for label, fraction in zip(text, shadow_fraction)]
     fig.add_trace(go.Scattergl(x=xyz[:, 0], y=xyz[:, 1], mode="markers", marker=marker, customdata=ids,
                                text=text, hovertemplate="%{text}<extra></extra>", name="定日镜"))
+    if shadow_fraction is not None:
+        held = np.asarray(shadow_fraction) == 1.
+        if inactive is not None:
+            held &= ~np.asarray(inactive, bool)
+        if held.any():
+            fig.add_trace(go.Scatter(x=xyz[held, 0], y=xyz[held, 1], mode="markers", name="全塔影 · 保持瞄准",
+                                     marker=dict(symbol="circle-open", size=size + 6, color="#624589", line_width=2),
+                                     customdata=np.asarray(ids)[held], hovertemplate="镜 %{customdata} · 全塔影 · 保持瞄准<extra></extra>"))
     if inactive is not None and np.any(inactive):
         k = np.flatnonzero(inactive)
         fig.add_trace(go.Scattergl(x=xyz[k, 0], y=xyz[k, 1], mode="markers", customdata=ids[k],
@@ -397,7 +466,7 @@ def _mirror_colors(values, cmin=None, cmax=None):
 
 
 def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_lines: int = 140,
-                 title: str = "", height: int = 520, cmin=None, cmax=None):
+                 title: str = "", height: int = 520, cmin=None, cmax=None, sun_angles=None, beam_power=None, shadow_fraction=None):
     """Whole plant in 3-D: heliostats coloured by DNI, a sample of beams from each mirror centre to its aim point."""
     from .receiver import surface_point
 
@@ -407,6 +476,7 @@ def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_li
     act = np.asarray(active, bool)
     v, lo, hi = _mirror_colors(dni, cmin, cmax)
     fig = go.Figure()
+    _tower_shadow(fig, case, xyz, sun_angles, scene=True)
     fig.add_trace(go.Scatter3d(x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers", name="定日镜（按 DNI 着色）",
                                marker=dict(size=2.8, color=v, colorscale=DNI_SCALE, cmin=lo, cmax=hi, showscale=True,
                                            colorbar=dict(title="DNI<br>W/m²", thickness=10, len=0.55, x=1.0)),
@@ -415,8 +485,14 @@ def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_li
         k = np.flatnonzero(~act)
         fig.add_trace(go.Scatter3d(x=xyz[k, 0], y=xyz[k, 1], z=xyz[k, 2], mode="markers", name="散焦",
                                    marker=dict(size=3.5, color=RED, symbol="x"), hoverinfo="skip"))
+    if shadow_fraction is not None:
+        held = act & (np.asarray(shadow_fraction) == 1.)
+        if held.any():
+            fig.add_trace(go.Scatter3d(x=xyz[held, 0], y=xyz[held, 1], z=xyz[held, 2], mode="markers",
+                                       name="全塔影 · 保持瞄准", marker=dict(symbol="circle-open", size=5, color="#624589"),
+                                       hovertemplate="全塔影 · 保持瞄准<extra></extra>"))
     aims = surface_point(rec, np.asarray(aim_az, float), np.asarray(aim_z, float))
-    on = np.flatnonzero(act)
+    on = np.flatnonzero(act & (np.asarray(beam_power if beam_power is not None else dni) > 0))
     if on.size:
         order = on[np.argsort(np.degrees(np.arctan2(xyz[on, 0] - cx, xyz[on, 1] - cy)) % 360.0, kind="stable")]
         pick = order[np.linspace(0, order.size - 1, min(max_lines, order.size)).astype(int)]
@@ -445,7 +521,7 @@ def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_li
 
 
 def receiver_aims_3d(case: Case, grid: ReceiverGrid, flux_w_m2, xyz: np.ndarray, aim_az, aim_z, active, dni=None,
-                     ids=None, title: str = "", height: int = 520, zmax=None, stub_m: float | None = None):
+                     ids=None, title: str = "", height: int = 520, zmax=None, stub_m: float | None = None, beam_power=None):
     """Receiver close-up: flux on the cylinder, every mirror's aim point and a short stub towards that mirror."""
     from .receiver import surface_point
 
@@ -462,16 +538,18 @@ def receiver_aims_3d(case: Case, grid: ReceiverGrid, flux_w_m2, xyz: np.ndarray,
     act = np.asarray(active, bool)
     on = np.flatnonzero(act)
     aims = surface_point(rec, np.asarray(aim_az, float), np.asarray(aim_z, float))
-    if on.size:
-        d = np.asarray(xyz, float)[on] - aims[on]
+    lit = on if beam_power is None else on[np.asarray(beam_power)[on] > 0]
+    if lit.size:
+        d = np.asarray(xyz, float)[lit] - aims[lit]
         d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
         stub = stub_m or 0.45 * rec.diameter
-        tip = aims[on] + stub * d
-        lx = np.column_stack([aims[on, 0], tip[:, 0], np.full(on.size, np.nan)]).ravel()
-        ly = np.column_stack([aims[on, 1], tip[:, 1], np.full(on.size, np.nan)]).ravel()
-        lz = np.column_stack([aims[on, 2], tip[:, 2], np.full(on.size, np.nan)]).ravel()
+        tip = aims[lit] + stub * d
+        lx = np.column_stack([aims[lit, 0], tip[:, 0], np.full(lit.size, np.nan)]).ravel()
+        ly = np.column_stack([aims[lit, 1], tip[:, 1], np.full(lit.size, np.nan)]).ravel()
+        lz = np.column_stack([aims[lit, 2], tip[:, 2], np.full(lit.size, np.nan)]).ravel()
         fig.add_trace(go.Scatter3d(x=lx, y=ly, z=lz, mode="lines", line=dict(color="rgba(79,195,247,0.18)", width=2),
                                    name="来光方向（指向镜子）", hoverinfo="skip"))
+    if on.size:
         vals = np.asarray(dni, float)[on] if dni is not None else None
         txt = [f"镜 {int(ids[i]) if ids is not None else i + 1}<br>瞄准 方位 {np.asarray(aim_az)[i] % 360:.1f}°, 高 {np.asarray(aim_z)[i]:.2f} m"
                + (f"<br>DNI {np.asarray(dni)[i]:.0f} W/m²" if dni is not None else "") for i in on]
@@ -545,7 +623,8 @@ def flux_diff_map(case: Case, grid: ReceiverGrid, flux_from, flux_to, title: str
 
 
 def field_dni_map(case: Case, xyz, ids, dni, dni_map=None, clouds=None, inactive=None, title: str = "",
-                  cmin=None, cmax=None, height: int = 480, map_scale: float = 1.0):
+                  cmin=None, cmax=None, height: int = 480, map_scale: float = 1.0, sun_angles=None,
+                  shadow_fraction=None):
     """Mirrors coloured by their DNI over an optional site raster (DNI map) and cloud outlines."""
     rec, spec = case.receiver, case.field
     fig = go.Figure()
@@ -553,6 +632,7 @@ def field_dni_map(case: Case, xyz, ids, dni, dni_map=None, clouds=None, inactive
     if dni_map is not None:
         fig.add_trace(go.Heatmap(x=dni_map.x, y=dni_map.y, z=dni_map.values * map_scale, colorscale=DNI_SCALE,
                                  zmin=lo, zmax=hi, showscale=False, opacity=0.32, name="DNI 地图", hoverinfo="skip"))
+    _tower_shadow(fig, case, xyz, sun_angles)
     if spec.boundary is not None:
         b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
         fig.add_trace(go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", line=dict(color=INK, dash="dash", width=1),
@@ -571,6 +651,25 @@ def field_dni_map(case: Case, xyz, ids, dni, dni_map=None, clouds=None, inactive
                                            colorbar=dict(title="DNI (W/m²)", thickness=12)),
                                customdata=ids, text=[f"镜 {i}<br>DNI {d:.0f} W/m²" for i, d in zip(ids, v)],
                                hovertemplate="%{text}<extra></extra>"))
+    if shadow_fraction is not None:
+        fraction = np.asarray(shadow_fraction)
+        held = fraction == 1.
+        if held.any():
+            fig.add_trace(go.Scatter(x=xyz[held, 0], y=xyz[held, 1], mode="markers",
+                                     name="全塔影 · 保持瞄准",
+                                     marker=dict(symbol="circle-open", size=size + 6, color="#624589",
+                                                 line=dict(width=2)),
+                                     customdata=ids[held],
+                                     text=[f"镜 {i} · 全塔影 · 保持瞄准 · 遮挡 100%" for i in ids[held]],
+                                     hovertemplate="%{text}<extra></extra>"))
+        partial = (fraction > 0) & (fraction < 1)
+        if partial.any():
+            fig.add_trace(go.Scatter(x=xyz[partial, 0], y=xyz[partial, 1], mode="markers",
+                                     name="部分塔影", marker=dict(symbol="circle-open", size=size + 5,
+                                                                  color="#9875ba"),
+                                     customdata=ids[partial],
+                                     text=[f"镜 {i} · 塔影遮挡 {v:.0%}" for i, v in zip(ids[partial], fraction[partial])],
+                                     hovertemplate="%{text}<extra></extra>"))
     if inactive is not None and np.any(inactive):
         k = np.flatnonzero(inactive)
         fig.add_trace(go.Scatter(x=xyz[k, 0], y=xyz[k, 1], mode="markers", name="散焦",

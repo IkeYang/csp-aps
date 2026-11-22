@@ -1,6 +1,7 @@
-"""Process pools that work from scripts, the CLI and the GUI.
+"""Pools for scripts and background application jobs.
 
-Start method:
+Background GUI jobs use threads so hot-reloadable module objects never cross
+a pickle boundary. Main-thread scripts use processes:
 * single-threaded process (CLI, plain scripts, tests) on Linux: ``fork`` -- the
   children do not re-import ``__main__``, so scripts without an
   ``if __name__ == "__main__":`` guard are safe;
@@ -14,6 +15,7 @@ Start method:
 from __future__ import annotations
 
 import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
 import os
 import sys
 import threading
@@ -35,4 +37,6 @@ def start_method() -> str:
 
 
 def pool(workers: int):
+    if threading.current_thread() is not threading.main_thread():
+        return ThreadPool(workers)
     return mp.get_context(start_method()).Pool(workers)

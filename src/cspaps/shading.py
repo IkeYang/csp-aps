@@ -78,6 +78,11 @@ def ray_hits_tower(o, d, center_xy, radius: float, z_top: float) -> np.ndarray:
     for s in (s1, s2):
         z = o[..., 2] + s * d[..., 2]
         hit |= ok & (s > 1e-6) & (z >= 0) & (z <= z_top)
+    # End caps also cover vertical rays and origins directly below or inside the cylinder.
+    dz = d[..., 2]
+    for plane in (0., z_top):
+        s = (plane - o[..., 2]) / np.where(np.abs(dz) > 1e-12, dz, 1.)
+        hit |= (np.abs(dz) > 1e-12) & (s > 1e-6) & ((ox + s*dx)**2 + (oy + s*dy)**2 <= radius**2)
     return hit
 
 
@@ -159,7 +164,7 @@ def shading_blocking(
     n = xyz.shape[0]
     ones = np.ones(n)
     if n == 0:
-        return {"shading": ones, "blocking": ones, "combined": ones}
+        return {"shading": ones, "blocking": ones, "combined": ones, "tower_fraction": np.zeros(n)}
     e_w, e_h = mirror_frames(normals)
     offsets = grid_offsets(n_points)
     pts = mirror_points(xyz, e_w, e_h, helio, offsets)
@@ -177,9 +182,12 @@ def shading_blocking(
     rel = xyz[j_all] - xyz[i_all]
 
     keep_s = _corridor(rel, np.broadcast_to(sun_vec, rel.shape), diag, np.full(rel.shape[0], r_shade + diag))
-    shaded = _hit_mask(pts, i_all[keep_s], j_all[keep_s], sun_vec, xyz, normals, e_w, e_h, helio, n)
+    shaded_mirrors = _hit_mask(pts, i_all[keep_s], j_all[keep_s], sun_vec, xyz, normals, e_w, e_h, helio, n)
+    tower_hits = np.zeros(shaded_mirrors.shape, dtype=bool)
+    tower_fraction = np.zeros(n)
     if tower_shadow and rec is not None and rec.tower_radius > 0:
-        shaded |= ray_hits_tower(pts, sun_vec[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+        tower_hits = ray_hits_tower(pts, sun_vec[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+        tower_fraction = tower_hits.mean(axis=1)
 
     t_pair = t[i_all]
     max_along = (helio.height + dz) / np.maximum(t_pair[:, 2], 0.03) + diag
@@ -187,11 +195,13 @@ def shading_blocking(
     blocked = _hit_mask(pts, i_all[keep_b], j_all[keep_b], t, xyz, normals, e_w, e_h, helio, n)
 
     p = offsets.shape[0]
-    eta_shade = 1.0 - shaded.sum(axis=1) / p
-    eta_comb = 1.0 - (shaded | blocked).sum(axis=1) / p
+    other_occlusion = shaded_mirrors | blocked
+    eta_shade = 1.0 - (shaded_mirrors | tower_hits).sum(axis=1) / p
+    eta_comb = 1.0 - (other_occlusion | tower_hits).sum(axis=1) / p
     with np.errstate(invalid="ignore", divide="ignore"):
         eta_block = np.where(eta_shade > 0, eta_comb / eta_shade, 1.0)
-    return {"shading": eta_shade, "blocking": eta_block, "combined": eta_comb}
+    return {"shading": eta_shade, "blocking": eta_block, "combined": eta_comb,
+            "tower_fraction": tower_fraction, "non_tower_occluded": other_occlusion}
 
 
 def shading_blocking_bruteforce(
@@ -210,16 +220,19 @@ def shading_blocking_bruteforce(
     offsets = grid_offsets(n_points)
     pts = mirror_points(xyz, e_w, e_h, helio, offsets)
     i_all, j_all = np.nonzero(~np.eye(n, dtype=bool))
-    shaded = _hit_mask(pts, i_all, j_all, sun_vec, xyz, normals, e_w, e_h, helio, n)
+    shaded_mirrors = _hit_mask(pts, i_all, j_all, sun_vec, xyz, normals, e_w, e_h, helio, n)
+    tower_hits = np.zeros(shaded_mirrors.shape, dtype=bool)
     if tower_shadow and rec is not None and rec.tower_radius > 0:
-        shaded |= ray_hits_tower(pts, sun_vec[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+        tower_hits = ray_hits_tower(pts, sun_vec[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
     blocked = _hit_mask(pts, i_all, j_all, t, xyz, normals, e_w, e_h, helio, n)
     p = offsets.shape[0]
-    eta_shade = 1.0 - shaded.sum(axis=1) / p
-    eta_comb = 1.0 - (shaded | blocked).sum(axis=1) / p
+    other_occlusion = shaded_mirrors | blocked
+    eta_shade = 1.0 - (shaded_mirrors | tower_hits).sum(axis=1) / p
+    eta_comb = 1.0 - (other_occlusion | tower_hits).sum(axis=1) / p
     with np.errstate(invalid="ignore", divide="ignore"):
         eta_block = np.where(eta_shade > 0, eta_comb / eta_shade, 1.0)
-    return {"shading": eta_shade, "blocking": eta_block, "combined": eta_comb}
+    return {"shading": eta_shade, "blocking": eta_block, "combined": eta_comb,
+            "non_tower_occluded": other_occlusion}
 
 
 def compare_screening(xyz, normals, sun_vec, t, helio, rec, n_points=8, tower_shadow=True) -> dict:

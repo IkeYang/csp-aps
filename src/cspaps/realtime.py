@@ -148,7 +148,7 @@ def run_realtime(
     for step, (t, dt) in enumerate(zip(times, intervals)):
         ts, el, az, dni_clear = sun_state(case, t)
         dni_now = clouds.dni(xy, ts, dni_clear)
-        frame = {"time": ts, "dni": dni_now, "plans": {}}
+        frame = {"time": ts, "dni": dni_now, "sun_angles": (el, az), "plans": {}}
         for strat in strategies:
             eng_time = np.nan
             reused = np.nan
@@ -157,12 +157,14 @@ def run_realtime(
                     pending[strat] = _decide(engines[strat], strat, case, fld, ts, measured, clouds, xy, None)
                 aim_az, aim_z, active, state, reasons, eng_time, reused = pending[strat]
                 prev = applied[strat]
+                n_defocus_commands = int(np.count_nonzero(prev[2] & ~active)) if step else 0
                 d_az = np.radians((aim_az - prev[0] + 180.0) % 360.0 - 180.0) * rec.radius
                 n_moved = int(np.sum((np.hypot(d_az, aim_z - prev[1]) > 0.01) | (active != prev[2]))) if step else 0
                 applied[strat] = (aim_az, aim_z, active, state, reasons)
             else:
                 aim_az, aim_z, active, state, reasons = applied[strat]
                 n_moved = 0
+                n_defocus_commands = 0
             snap = evaluate(case, fld, el, az, dni_now, aim=(aim_az, aim_z), active=active, grid=grid, time=ts)
             chk = snap.verify(rec) if snap.beams is not None and len(snap.beams["power"]) else None
             peak_ratio = chk.peak_ratio if chk is not None else 0.0
@@ -198,11 +200,13 @@ def run_realtime(
                 "flux_feasible": bool(flux_met), "operational_feasible": operational,
                 "feasible_absorbed_mw": snap.p_absorbed / 1e6 if operational else 0.0,
                 "n_defocused": int((~np.asarray(active)).sum()), "n_moved": n_moved,
+                "n_defocus_commands": n_defocus_commands,
                 "plan_state": state, "plan_reasons": reasons,
                 "engine_total_s": eng_time, "response_reused": reused,
             })
             frame["plans"][strat] = {"aim_azimuth": aim_az, "aim_z": aim_z, "active": np.asarray(active),
-                                     "flux": snap.flux, "check": chk.summary() if chk is not None else None,
+                                     "tower_fraction": snap.tower_fraction, "flux": snap.flux,
+                                     "check": chk.summary() if chk is not None else None,
                                      "state": state, "uniformity_status": uni_status,
                                      "uniformity_metrics": uni_metrics, "operational_feasible": operational}
             if strat not in worst or peak_ratio > worst[strat][0]:

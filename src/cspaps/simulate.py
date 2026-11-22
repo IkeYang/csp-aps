@@ -47,6 +47,8 @@ class Snapshot:
     margin: float = 0.0
     alpha_eff: np.ndarray | None = dc_field(default=None, repr=False)  # (N,) beam-spread absorptivity
 
+    tower_fraction: np.ndarray | None = dc_field(default=None, repr=False)
+
     @property
     def n(self) -> int:
         return int(self.aim_z.size)
@@ -183,7 +185,7 @@ def evaluate(
                   "power": np.empty(0), "index": np.empty(0, dtype=int)} if with_flux else None)
         return Snapshot(time, sun_elevation, sun_azimuth, dni_v, aim_az, aim_z, active,
                         {k: zeros.copy() for k in LOSSES}, {k: zeros.copy() for k in STAGES},
-                        np.zeros(grid.shape), grid, region, beams, case.aps.safety_margin)
+                        np.zeros(grid.shape), grid, region, beams, case.aps.safety_margin, tower_fraction=zeros.copy())
 
     s = sun.sun_vector(sun_elevation, sun_azimuth)
     aim_xyz = surface_point(rec, aim_az, aim_z)
@@ -221,7 +223,8 @@ def evaluate(
         flux_flat = np.zeros(grid.points.shape[0])
     alpha_eff = effective_absorptivity(rec, aim_az, sigma)
     return Snapshot(time, float(sun_elevation), float(sun_azimuth), dni_v, aim_az, aim_z, active,
-                    eta, power, grid.to_map(flux_flat), grid, region, beams, case.aps.safety_margin, alpha_eff)
+                    eta, power, grid.to_map(flux_flat), grid, region, beams, case.aps.safety_margin, alpha_eff,
+                    sb.get("tower_fraction", zeros))
 
 
 def sun_state(case: Case, time) -> tuple[pd.Timestamp, float, float, float]:

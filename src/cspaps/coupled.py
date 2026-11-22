@@ -62,7 +62,7 @@ def _weighted_upper(prob, beam, intercepted, allowed, snap, weight):
 
 
 def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials=None, shading_points=None,
-                       tighten_bound=True):
+                       tighten_bound=True, tracking_reference=None):
     """Evaluate joint poses with their actual neighbours. Certify the sampled model.
 
     The independent, unshaded per-mirror maxima dominate every feasible combination:
@@ -98,8 +98,11 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
     fallback = None
     separate_forecast = not np.array_equal(prob.dni_con, prob.dni_obj)
 
+    reference = prob.tracking_reference() if tracking_reference is None else tracking_reference
+    best_motion = None
+
     def consider(ch):
-        nonlocal best, best_value, fallback
+        nonlocal best, best_value, best_motion, fallback
         ch = np.asarray(ch, dtype=int)
         key = ch.tobytes()
         if key in seen:
@@ -111,8 +114,11 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
         args = dict(aim=prob.aims(ch), active=on, grid=prob.grid, shading_points=shading_points)
         snap = evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_obj, **args)
         value = snap.thermal_objective(uni)
-        if fallback is not None and (not legal or not value["uniformity_met"]
-                                     or value["objective_w"] <= best_value):
+        # Lexicographic tie-break on commands. The thermal score and its certificate stay in watts.
+        motion = (np.count_nonzero(on != (reference >= 0)), np.count_nonzero(ch != reference))
+        better = value["objective_w"] > best_value or (value["objective_w"] == best_value and
+                                                        (best_motion is None or motion < best_motion))
+        if fallback is not None and (not legal or not value["uniformity_met"] or not better):
             return
         forecast = (evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_con, **args)
                     if separate_forecast else snap)
@@ -120,8 +126,8 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
         entry = (ch.copy(), snap, value, check)
         if fallback is None:
             fallback = entry
-        if legal and value["uniformity_met"] and check.ok and value["objective_w"] > best_value:
-            best, best_value = entry, value["objective_w"]
+        if legal and value["uniformity_met"] and check.ok and better:
+            best, best_value, best_motion = entry, value["objective_w"], motion
 
     consider(seed.choice)
     if warm is not None:
@@ -148,7 +154,34 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
                 current[i] = rng.choice(choices[i])
             consider(current)
 
+    if best is not None:
+        # Reactivating a shaded centre target preserves the pose used for an inactive mirror.
+        # Also try its previous target; re-evaluate neighbours and verify before accepting.
+        centre = prob.tracking_reference()
+        retained = np.where((best[0] < 0) & (reference >= 0), centre, best[0])
+        retained = prob.keep_shadowed_targets(best[0], retained)
+        consider(retained)
+        consider(prob.keep_shadowed_targets(best[0], reference))
     choice, snap, value, check = best or fallback
+    # Minimum-load failure can make every candidate plan infeasible even though a fully
+    # tower-shadowed heliostat has no optical path to the receiver. Keep its tracking pose
+    # if restoring it is flux-safe and does not lower the thermal objective.
+    if best is None and case.aps.allow_defocus:
+        reference = prob.tracking_reference() if tracking_reference is None else tracking_reference
+        retained = prob.keep_shadowed_targets(choice, reference)
+        if not np.array_equal(retained, choice):
+            args = dict(aim=prob.aims(retained), active=retained >= 0, grid=prob.grid,
+                        shading_points=shading_points)
+            retained_snap = evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_obj, **args)
+            retained_value = retained_snap.thermal_objective(uni)
+            forecast = (evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_con, **args)
+                        if separate_forecast else retained_snap)
+            retained_check = forecast.verify(case.receiver, max_cells=spec.verify_max_cells)
+            retained_on = retained >= 0
+            retained_legal = np.all(allowed[np.flatnonzero(retained_on), retained[retained_on]])
+            if (retained_check.ok and retained_value["objective_w"] >= value["objective_w"]
+                    and retained_legal):
+                choice, snap, value, check = retained, retained_snap, retained_value, retained_check
     feasible = best is not None
     proven_empty = not feasible and (exact or impossible_load)
     energy_upper = upper

@@ -217,7 +217,7 @@ def solve_uniform(prob, base_choice: np.ndarray, spec: UniformitySpec | None = N
                 best = min(powered, key=lambda st: st.cv()) if powered else st0
     p_abs = _p_abs(best, absorb_power)
     p_h = best.s1
-    min_required_w = max(spec.min_load_mw * 1e6, 1e-6)
+    min_required_w = max(spec.min_load_mw * 1e6, 0. if weighted else 1e-6)
     if p_h < min_required_w:
         status = "below_min_load"
     elif weighted:

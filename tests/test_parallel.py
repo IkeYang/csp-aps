@@ -1,9 +1,33 @@
 import multiprocessing as mp
 import subprocess
 import sys
+import threading
 import textwrap
 
 from .conftest import ROOT
+
+
+def test_parallel_pool_in_background_thread_does_not_pickle(tmp_path):
+    from multiprocessing.pool import ThreadPool
+
+    from cspaps.parallel import pool
+
+    results = []
+
+    def run():
+        workers = pool(2)
+        try:
+            results.extend(workers.map(lambda value: value * value, [2, 3]))
+            results.append(isinstance(workers, ThreadPool))
+        finally:
+            workers.close()
+            workers.join()
+
+    task = threading.Thread(target=run)
+    task.start()
+    task.join(timeout=10)
+    assert not task.is_alive()
+    assert results == [4, 9, True]
 
 
 def test_parallel_run_from_script(tmp_path):

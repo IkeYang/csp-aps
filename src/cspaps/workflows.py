@@ -225,7 +225,8 @@ def task_aim(
             if (prob.k + 1) ** min(prob.n, 20) > case.aps.coupled_exact_limit and np.any(prob.dni_obj > 0):
                 res, _ = improve_and_certify(prob, res, case.aps, rounds=case.aps.certify_rounds,
                                              time_limit_s=case.aps.certify_time_s, prev=prev, prev_active=prev_active)
-            res, cert = search_joint_poses(prob, fld, res, warm=initial)
+            res, cert = search_joint_poses(prob, fld, res, warm=initial,
+                                           tracking_reference=prob.tracking_reference(prev, prev_active))
         else:
             res.info["global_optimality_proven"] = False
             res.info["solution_class"] = "joint_pose_verification"
@@ -268,6 +269,7 @@ def task_aim(
     }
     extra = {f"eta_{k}": np.round(snap.eta[k], 6) for k in LOSSES}
     extra["dni_w_m2"] = np.round(snap.dni, 2)
+    extra["tower_shadow_fraction"] = snap.tower_fraction
     extra["p_receiver_kw"] = np.round(snap.power["intercept"] / 1e3, 4)
     write_aims_csv(files["aims_csv"], fld, case, aim, active, extra)
     check_summary = chk_con.summary()
@@ -294,6 +296,7 @@ def task_aim(
     if res is not None and proposal_check is not None:
         summary["solver_flux_check"] = {"status": proposal_check.status, "peak_flux_kw_m2": round(proposal_check.peak_flux_kw_m2, 2),
                                         "basis": "solver response model (candidate aims)"}
+    summary["n_tracking_in_tower_shadow"] = int(np.sum(active & (snap.tower_fraction == 1.)))
     summary["aps"].pop("flux_check", None)
     summary["aps"].pop("certificate", None)
     if cert is not None:
@@ -1246,13 +1249,15 @@ def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, ra
         m = uniformity_metrics(snap.absorbed_flux, grid.to_map(snap.region))
         return {"key": key, "label": label, "dni": dni, "aim_azimuth": np.asarray(aim[0], float),
                 "aim_z": np.asarray(aim[1], float), "active": np.asarray(active, bool), "flux": snap.flux,
-                "absorbed_flux": snap.absorbed_flux, "p_abs_mw": th["power_w"] / 1e6, "p_int_mw": snap.p_receiver / 1e6,
+                "absorbed_flux": snap.absorbed_flux, "tower_fraction": snap.tower_fraction,
+                "p_abs_mw": th["power_w"] / 1e6, "p_int_mw": snap.p_receiver / 1e6,
                 "u_mw": th["spread_w"] / 1e6, "objective_mw": (th["power_w"] - lam * th["spread_w"]) / 1e6,
                 "cv_2d": th["cv_2d"], "cv_circ": m["cv_circ"], "cv_height": m["cv_height"],
                 "peak_flux_kw_m2": chk.peak_flux_kw_m2, "peak_to_allowed": chk.peak_ratio / max(chk.allowed_ratio, 1e-12),
                 "peak_to_limit": chk.peak_ratio, "flux_status": chk.status,
                 "hotspot": {"azimuth_deg": chk.hotspot_azimuth_deg, "z_m": chk.hotspot_z, "panel": int(chk.hotspot_panel)},
                 "n_active": int(np.sum(active)), "n_defocused": int(np.sum(~np.asarray(active, bool))),
+                "n_tracking_in_tower_shadow": int(np.sum(np.asarray(active) & (snap.tower_fraction == 1.))),
                 "mirror_power_kw": snap.power["intercept"] * (snap.alpha_eff if snap.alpha_eff is not None else 1.0) / 1e3,
                 "plan_status": plan.status if plan is not None else "kept",
                 "inner_gap": plan.gap if plan is not None else None}
@@ -1292,6 +1297,7 @@ def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, ra
     for s in states:
         aims[f"{s['key']}_dni"] = np.round(s["dni"], 3)
         aims[f"{s['key']}_active"] = s["active"].astype(int)
+        aims[f"{s['key']}_tower_shadow_fraction"] = s["tower_fraction"]
         aims[f"{s['key']}_aim_azimuth"] = np.round(s["aim_azimuth"], 5)
         aims[f"{s['key']}_aim_z"] = np.round(s["aim_z"], 5)
         aims[f"{s['key']}_power_kw"] = np.round(s["mirror_power_kw"], 4)

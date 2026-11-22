@@ -93,6 +93,9 @@ class ResponseSet:
     version: int = 0
     sb_k: np.ndarray | None = None  # (N, K) shading x blocking of every candidate aim (its own mirror normal / beam)
 
+    tower_dark: np.ndarray | None = None  # (N, K) all aperture samples in tower shadow for this aim
+    non_tower_occluded: np.ndarray | None = None  # (N, K, P) cached other-mirror blockage masks
+
     @property
     def n(self) -> int:
         return self.cand_az.shape[0]
@@ -165,6 +168,7 @@ def build_response(
     spec: APSSpec | None = None,
     shading_points: int | None = None,
     chunk: int = 48,
+    store_occlusion_samples: bool = False,
 ) -> ResponseSet:
     """Geometry, shading, intercept and sparse unit-DNI flux responses of all candidates."""
     t0 = _time.perf_counter()
@@ -183,12 +187,22 @@ def build_response(
     if case.shading.enabled and n:
         # each candidate has its own mirror normal and reflected beam, so shading and blocking are evaluated
         # per candidate (they differ by up to tens of percent at low sun near the field edge)
-        sb_k = np.stack([shading.shading_blocking(
-            fld.xyz, normals[:, j], s, t[:, j], hel, rec, fld.pairs,
-            n_points=shading_points or case.shading.n_points, tower_shadow=case.shading.tower_shadow,
-        )["combined"] for j in range(k)], axis=1)
+        sb_k = np.empty((n, k))
+        tower_dark = np.zeros((n, k), dtype=bool)
+        non_tower_occluded = (np.empty((n, k, case.shading.n_points ** 2), dtype=bool)
+                              if store_occlusion_samples else None)
+        for j in range(k):
+            shadow = shading.shading_blocking(fld.xyz, normals[:, j], s, t[:, j], hel, rec, fld.pairs,
+                                              n_points=shading_points or case.shading.n_points,
+                                              tower_shadow=case.shading.tower_shadow)
+            sb_k[:, j] = shadow["combined"]
+            tower_dark[:, j] = shadow["tower_fraction"] == 1.
+            if non_tower_occluded is not None:
+                non_tower_occluded[:, j] = shadow["non_tower_occluded"]
     else:
         sb_k = np.ones((n, k))
+        tower_dark = None
+        non_tower_occluded = None
     sb = sb_k[:, center]
     sigma = optics.beam_sigma(slant, cos_inc, hel, case.sun)
     unit_beam = hel.area * hel.reflectivity * hel.cleanliness * sb_k * cos_inc * optics.attenuation(slant, case.atmosphere)
@@ -214,7 +228,8 @@ def build_response(
     return ResponseSet(
         case, grid, float(sun_elevation), float(sun_azimuth), cand_az, cand_z, aim_xyz, t, sigma,
         unit_beam, unit_power, sb, center, grid.points.copy(), grid.normals.copy(), grid.cell_az, grid.cell_z,
-        grid.limit.copy(), grid.alpha.copy(), cells, resp, peaks, _time.perf_counter() - t0, sb_k=sb_k,
+        grid.limit.copy(), grid.alpha.copy(), cells, resp, peaks, _time.perf_counter() - t0, sb_k=sb_k, tower_dark=tower_dark,
+        non_tower_occluded=non_tower_occluded,
     )
 
 
@@ -332,6 +347,30 @@ class AimProblem:
         k = np.where(choice >= 0, choice, self.center_k)
         rows = np.arange(self.n)
         return self.cand_az[rows, k], self.cand_z[rows, k]
+
+    def tracking_reference(self, prev=None, prev_active=None):
+        """Target to retain on a thermal tie. With no history use the nominal centre target."""
+        if prev is None:
+            return np.full(self.n, self.center_k)
+        delta = (self.cand_az - np.asarray(prev[0])[:, None] + 180.) % 360. - 180.
+        distance = np.hypot(np.radians(delta) * self.case.receiver.radius, self.cand_z - np.asarray(prev[1])[:, None])
+        ref = distance.argmin(axis=1)
+        return np.where(prev_active, ref, -1) if prev_active is not None else ref
+
+    def keep_shadowed_targets(self, choice, reference):
+        """Avoid a switch or aim move if both choices deliver zero light due to the tower."""
+        dark = self.rs.tower_dark
+        if dark is None or not dark.any():
+            return choice
+        row = np.arange(self.n)
+        # An inactive mirror uses its centre orientation in the joint optical model.
+        old_k = np.where(choice >= 0, choice, self.center_k)
+        new_k = np.where(reference >= 0, reference, self.center_k)
+        keep = self.available & (choice != reference) & dark[row, old_k] & dark[row, new_k]
+        if self.reach is not None:
+            keep &= (reference < 0) | self.reach[row, new_k]
+        keep &= (reference >= 0) | self.case.aps.allow_defocus
+        return np.where(keep, reference, choice)
 
     def verify(self, choice: np.ndarray, max_cells: int | None = None) -> FluxCheck:
         on = np.flatnonzero(choice >= 0)
@@ -769,8 +808,8 @@ def solve(
 
         ures = solve_uniform(prob, choice, uni, prev_aim_xyz=prev_xyz, prev_active=prev_active)
         choice = ures.choice
-        if ures.status == "below_min_load":
-            choice = np.full(prob.n, -1)  # preheater cannot reach its minimum load: receiver off
+        if ures.status == "below_min_load" and spec.allow_defocus:
+            choice = np.full(prob.n, -1)  # shut down only when permitted; otherwise keep mirrors aimed
         if spec.verify:
             check = prob.verify(choice)
             r2 = 0
@@ -797,6 +836,11 @@ def solve(
         info["hotspot_points_added"] = added
         if final and uni.enabled:
             info.update(uniformity_info(prob, choice, uni))
+    if info.get("uniformity_status") != "below_min_load":
+        retained = prob.keep_shadowed_targets(choice, prob.tracking_reference(prev, prev_active))
+        if not np.array_equal(retained, choice):
+            choice = retained
+            check = prob.verify(choice) if spec.verify else None
     return finalize(prob, method, choice, info, check, spec, t0)
 
 
@@ -808,7 +852,7 @@ def uniformity_info(prob: AimProblem, choice: np.ndarray, uni, ures=None) -> dic
     absorbed = prob.flux(choice, basis="objective")[:prob.rs.n_grid] * prob.rs.grid.alpha[:prob.rs.n_grid]
     h_power = float(absorbed[h_mask].sum() * prob.rs.grid.cell_area)
     metrics = uniformity_metrics(prob.rs.grid.to_map(absorbed), prob.rs.grid.to_map(h_mask))
-    if h_power < max(uni.min_load_mw * 1e6, 1e-6):
+    if h_power < max(uni.min_load_mw * 1e6, 0. if uni.mode == "weighted" else 1e-6):
         uni_status = "below_min_load"
     elif uni.mode == "weighted":
         uni_status = "weighted"
@@ -893,7 +937,8 @@ def optimize_aims(
         from .coupled import search_joint_poses
 
         res, cert = search_joint_poses(prob, fld, res, trials=joint_trials,
-                                      shading_points=shading_points, tighten_bound=joint_trials is None)
+                                      shading_points=shading_points, tighten_bound=joint_trials is None,
+                                      tracking_reference=prob.tracking_reference(prev, prev_active))
         res.info["certificate"] = cert
     res.solve_time_s = _time.perf_counter() - t0
     return res

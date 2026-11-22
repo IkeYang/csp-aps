@@ -1183,6 +1183,7 @@ def _scenario_source_inputs(case, key: str) -> list[str]:
 
 def _scenario_browser(case, layouts: dict, key: str) -> None:
     """Scenario list; click a row to preview its map with every mirror's interpolated DNI; click a mirror for its value."""
+    from cspaps.gui_plots import tower_shadow_fraction
     from cspaps.scenarios import build_scenarios
 
     try:
@@ -1213,6 +1214,9 @@ def _scenario_browser(case, layouts: dict, key: str) -> None:
         ids = np.concatenate(allids) if allids else np.zeros(0, int)
         dni = sset.dni_at(i, xyz[:, :2]) if len(xyz) else np.zeros(0)
         ev2 = st.plotly_chart(field_dni_map(case, xyz, ids, dni, dni_map=m,
+                                            sun_angles=(sset.samples.elevation[i], sset.samples.azimuth[i]),
+                                            shadow_fraction=tower_shadow_fraction(case, xyz, sset.samples.elevation[i],
+                                                                                  sset.samples.azimuth[i]),
                                             map_scale=float(sset.samples.dni[i]) if m.unit == "factor" else 1.0,
                                             title=f"{sid} · 地图 {m.map_id}", cmin=0, height=420),
                               theme=None, key=f"scen_map_{key}_{i}", on_select="rerun", selection_mode=("points",),
@@ -1555,11 +1559,12 @@ def _scenario_check_section(case) -> None:
     l, r = st.columns(2)
     with l:
         _chart(field_dni_map(c, fld.xyz, fld.ids, p.dni, title=f"{rec.scenario_id} 各镜读到的 DNI", cmin=0,
-                             inactive=~p.active, height=420), "scen_dni")
+                             inactive=~p.active, height=420, sun_angles=(rec.elevation_deg, rec.azimuth_deg)), "scen_dni")
     with r:
         _chart(receiver_aims_map(c, grid, p.flux, p.aim_azimuth, p.aim_z, p.active, fld.ids, p.dni,
                                  title="吸热器热流与每面镜中心的瞄准点", height=420, cmin=0), "scen_rec")
-    _chart(aim_scene_3d(c, fld.xyz, p.dni, p.aim_azimuth, p.aim_z, p.active, title="三维示意（抽样光束）", cmin=0),
+    _chart(aim_scene_3d(c, fld.xyz, p.dni, p.aim_azimuth, p.aim_z, p.active, title="三维示意（抽样光束）", cmin=0,
+                       sun_angles=(rec.elevation_deg, rec.azimuth_deg), beam_power=p.mirror_power_w),
            "scen_3d")
     _show_files(res, images=[])
 
@@ -1640,8 +1645,11 @@ def _aps_results(res: dict) -> None:
             st.session_state["single_executed"] = str(run)
             st.rerun()
     aims_top = pd.read_csv(res["files"]["aims_csv"])
-    st.markdown("**逐镜瞄准表**（编号、坐标、是否工作、瞄准方位与高度、送达功率；完整表在“逐镜方案”中下载）")
-    st.dataframe(aims_top[["id", "x", "y", "active", "aim_azimuth_deg", "aim_z", "dni_w_m2", "p_receiver_kw"]].rename(columns={
+    shade = aims_top.get("tower_shadow_fraction", pd.Series(0., index=aims_top.index))
+    aims_top["瞄准状态"] = np.select([aims_top["active"] == 0, shade == 1, shade > 0],
+                                       ["散焦", "保持瞄准 · 全塔影", "瞄准 · 部分塔影"], default="瞄准")
+    st.markdown("**逐镜瞄准表**（完整表在“逐镜方案”中下载）")
+    st.dataframe(aims_top[["id", "x", "y", "瞄准状态", "aim_azimuth_deg", "aim_z", "dni_w_m2", "p_receiver_kw"]].rename(columns={
         "id": "镜子 ID", "x": "x 东 (m)", "y": "y 北 (m)", "active": "工作", "aim_azimuth_deg": "瞄准方位 (°)",
         "aim_z": "瞄准高度 (m)", "dni_w_m2": "DNI (W/m²)", "p_receiver_kw": "送达功率 (kW)"}), hide_index=True, height=220)
     tabs = st.tabs(["吸热器热流与瞄准点", "三维瞄准示意", "镜场", "最优性证书", "效率与损失", "逐镜方案"])
@@ -1659,17 +1667,23 @@ def _aps_results(res: dict) -> None:
         l, r = st.columns(2)
         with l:
             _chart(aim_scene_3d(case, fld.xyz, snap.dni, snap.aim_azimuth, snap.aim_z, snap.active,
+                                sun_angles=(snap.sun_elevation, snap.sun_azimuth), beam_power=snap.power["intercept"],
+                                shadow_fraction=snap.tower_fraction,
                                 title="镜面中心 → 瞄准点（抽样光束，镜子按 DNI 着色）"), "s_scene3d")
         with r:
             _chart(receiver_aims_3d(case, snap.grid, snap.flux, fld.xyz, snap.aim_azimuth, snap.aim_z, snap.active,
-                                    snap.dni, fld.ids, title="吸热器近景：入射热流与全部瞄准点"), "s_rec3d")
+                                    snap.dni, fld.ids, beam_power=snap.power["intercept"], title="吸热器近景：入射热流与全部瞄准点"), "s_rec3d")
     with tabs[2]:
         color_by = st.radio("着色", ["DNI", "瞄准高度", "光学效率"], horizontal=True, key="s_field_color")
         vals, label, scale = {"DNI": (snap.dni, "DNI (W/m²)", "Blues"),
                               "瞄准高度": (snap.aim_z, "瞄准高度 z (m)", "RdBu"),
                               "光学效率": (snap.eta_total, "光学效率", "Viridis")}[color_by]
         _chart(field_map(case, fld.xyz, fld.ids, values=vals, label=label, colorscale=scale,
-                         title=f"镜场 · 按{color_by}着色（× 为散焦镜面）", inactive=~snap.active), "s_field")
+                         title=f"镜场 · 按{color_by}着色（× 为散焦镜面）", inactive=~snap.active,
+                         sun_angles=(snap.sun_elevation, snap.sun_azimuth), shadow_fraction=snap.tower_fraction), "s_field")
+        if snap.tower_fraction is not None and snap.tower_fraction.any():
+            st.caption(f"紫色区域为塔影在镜轴高度处的投影。全遮挡且保持瞄准 {sum(snap.active & (snap.tower_fraction == 1))} 面，"
+                       f"部分遮挡 {sum((snap.tower_fraction > 0) & (snap.tower_fraction < 1))} 面。悬停可查看逐镜遮挡比例。")
     with tabs[3]:
         _certificate_tab(res, cert)
     with tabs[4]:
@@ -1695,7 +1709,9 @@ def _aps_headline(s: dict, case, res: dict, inputs: dict) -> None:
     peak = chk["peak_flux_kw_m2"]
     limit_kw = peak / frac if frac else case.receiver.max_flux_kw_m2
     if p <= 1e-9:
-        text = "全部镜子散焦，吸收功率为零，CV 无法评价。"
+        tracking = int(res["snapshot"].active.sum())
+        text = ("全部镜子散焦，吸收功率为零，CV 无法评价。" if not tracking
+                else f"{tracking} 面镜保持瞄准，当前吸收功率为零，CV 无法评价。")
     else:
         text = f"采用目前的瞄准方案，接收器吸收 {p:.2f} MW。"
         ref = s.get("center_reference")
@@ -2450,7 +2466,8 @@ def _hotspot_text(case, p) -> None:
     msg = (f"最热点：第 {p.info['hotspot_panel']} 号管屏，方位 {p.info['hotspot_azimuth_deg']:.0f}°、高度 "
            f"{p.info['hotspot_z_m']:.2f} m，{p.peak_flux_kw_m2:.0f} kW/m²（设备上限的 {100 * frac:.0f}%，项目允许 {100 * allowed:.0f}%）。")
     if p.status == "feasible_shutdown" or p.p_abs_w <= 0:
-        msg = "吸收功率为零（全部散焦），CV 无法评价。"
+        msg = ("吸收功率为零（全部散焦），CV 无法评价。" if not p.n_active
+               else f"{p.n_active} 面镜保持瞄准，当前吸收功率为零，CV 无法评价。")
     _callout(tone, "热点", msg)
 
 
@@ -2638,6 +2655,7 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
                        ("峰值", f"{p.peak_flux_kw_m2:.0f}", "kW/m²", f"散焦 {p.n_defocused} 面")])
                 v = values[name]
                 _chart(field_dni_map(case, v.xyz, v.ids, p.dni, dni_map=m,
+                                     sun_angles=(sset.samples.elevation[i], sset.samples.azimuth[i]),
                                      map_scale=float(sset.samples.dni[i]) if m.unit == "factor" else 1.0,
                                      title=f"{sid} 镜场 DNI（底图为该工况的场地 DNI 地图）", cmin=0, cmax=dmax, height=400),
                        f"{key}_dni_{name}_{sid}")
@@ -2819,6 +2837,8 @@ def _ops_replay(case) -> None:
         ("最高通量（复核）", f"{row['peak_flux_kw_m2']:.1f} kW/m²，{int(row['hotspot_panel'])} 号管屏"),
         ("距上限余量", f"{(limit_kw - row['peak_flux_kw_m2']):.1f} kW/m²"),
         ("散焦镜数", f"{int(row['n_defocused'])} 面"),
+        ("新增散焦指令", f"{int(row.get('n_defocus_commands', 0))} 面"),
+        ("全塔影且保持瞄准", f"{int(row.get('n_tracking_in_tower_shadow', 0))} 面"),
         ("二维 / 周向 / 高度 CV", " / ".join(
             f"{row[k]:.3f}" if np.isfinite(row[k]) else "—"
             for k in ("uniformity_cv_2d", "uniformity_cv_circ", "uniformity_cv_height"))),
@@ -2832,7 +2852,8 @@ def _ops_replay(case) -> None:
         fig = field_map(case, fld.xyz, fld.ids, values=frame["dni"], label="DNI (W/m²)", colorscale="Blues",
                         cmin=0, title="镜场 DNI（图层：模拟）", selected=sel_id,
                         hover=[f"ID {i}<br>DNI {d:.0f} W/m²" for i, d in zip(fld.ids, frame["dni"])],
-                        inactive=~plan["active"])
+                        inactive=~plan["active"], sun_angles=frame.get("sun_angles"),
+                        shadow_fraction=plan["tower_fraction"])
         ev = st.plotly_chart(theme=None, figure_or_data=fig, on_select="rerun", selection_mode=("points",), key=f"ops_field_{k}_{strat}")
         pts = getattr(getattr(ev, "selection", None), "points", None) or []
         if pts and pts[0].get("customdata") is not None:
@@ -3091,8 +3112,9 @@ def _cloud_results(res: dict) -> None:
         _state_numbers(a)
         l, r = st.columns([1, 1.25])
         with l:
-            _chart(field_dni_map(case, fld.xyz, fld.ids, a["dni"], title="镜场 DNI（晴空，全场均匀）", cmin=cmin, cmax=cmax,
-                                 height=430), "cc_dni_a")
+            _chart(field_dni_map(case, fld.xyz, fld.ids, a["dni"], sun_angles=(summ["sun_elevation_deg"], summ["sun_azimuth_deg"]),
+                                 shadow_fraction=a["tower_fraction"], title="镜场 DNI（晴空，全场均匀）", cmin=cmin,
+                                 cmax=cmax, height=430), "cc_dni_a")
         with r:
             _chart(receiver_aims_map(case, grid, a["flux"], a["aim_azimuth"], a["aim_z"], a["active"], fld.ids, a["dni"],
                                      title="吸热器展开 · 热流与每面镜中心的瞄准点（点色 = 该镜 DNI）", zmax=zmax, cmin=cmin, cmax=cmax, height=430),
@@ -3100,23 +3122,29 @@ def _cloud_results(res: dict) -> None:
         l, r = st.columns(2)
         with l:
             _chart(aim_scene_3d(case, fld.xyz, a["dni"], a["aim_azimuth"], a["aim_z"], a["active"],
+                                sun_angles=(summ["sun_elevation_deg"], summ["sun_azimuth_deg"]), beam_power=a["mirror_power_kw"],
+                                shadow_fraction=a["tower_fraction"],
                                 title="三维示意：镜面中心 → 瞄准点（抽样光束）", cmin=cmin, cmax=cmax), "cc_3d_a")
         with r:
             _chart(receiver_aims_3d(case, grid, a["flux"], fld.xyz, a["aim_azimuth"], a["aim_z"], a["active"], a["dni"],
-                                    fld.ids, title="吸热器近景：热流与全部瞄准点（短线指向各自的镜子）", zmax=zmax), "cc_r3d_a")
+                                    fld.ids, beam_power=a["mirror_power_kw"],
+                                    title="吸热器近景：热流与送达镜子的瞄准点", zmax=zmax), "cc_r3d_a")
     with tabs[1]:
         tau = res["transmittance"]
-        _kpis([("平均 DNI（云前 → 云来）", f"{np.mean(a['dni']):.0f} → {np.mean(b['dni']):.0f}", "W/m²"),
+        _kpis([("塔影下的镜子", f"{a['n_tracking_in_tower_shadow']} 面保持瞄准", "全塔影", "不发散焦指令"),
+               ("平均 DNI（云前 → 云来）", f"{np.mean(a['dni']):.0f} → {np.mean(b['dni']):.0f}", "W/m²"),
                ("最低 DNI", f"{np.min(b['dni']):.0f}", "W/m²", "云影中心"),
                ("被遮挡（透过率 < 95%）", f"{summ['shaded_heliostats']}", "面", f"占 {100 * summ['shaded_heliostats'] / fld.n:.0f}%"),
                ("云影", f"{len(res['clouds'])}", "块", " · ".join(f"r {cl.radius:.0f} m, τ {cl.transmittance:.2f}"
                                                                   for cl in res["clouds"][:3]))])
         l, r = st.columns(2)
         with l:
-            _chart(field_dni_map(case, fld.xyz, fld.ids, a["dni"], title="云来之前", cmin=cmin, cmax=cmax, height=430),
+            _chart(field_dni_map(case, fld.xyz, fld.ids, a["dni"], sun_angles=(summ["sun_elevation_deg"], summ["sun_azimuth_deg"]),
+                                 shadow_fraction=a["tower_fraction"], title="云来之前", cmin=cmin, cmax=cmax, height=430),
                    "cc_dni_a2")
         with r:
-            _chart(field_dni_map(case, fld.xyz, fld.ids, b["dni"], clouds=res["clouds"], title="云来之后（虚线为云影边界）",
+            _chart(field_dni_map(case, fld.xyz, fld.ids, b["dni"], sun_angles=(summ["sun_elevation_deg"], summ["sun_azimuth_deg"]),
+                                 shadow_fraction=b["tower_fraction"], clouds=res["clouds"], title="云来之后（紫色为塔影，虚线为云影边界）",
                                  cmin=cmin, cmax=cmax, height=430), "cc_dni_b")
         st.caption(f"透过率分布：最小 {tau.min():.2f}，中位 {np.median(tau):.2f}；云影边缘按平滑过渡建模。")
     with tabs[2]:
@@ -3140,10 +3168,12 @@ def _cloud_results(res: dict) -> None:
         l, r = st.columns(2)
         with l:
             _chart(aim_scene_3d(case, fld.xyz, c["dni"], c["aim_azimuth"], c["aim_z"], c["active"],
+                                sun_angles=(summ["sun_elevation_deg"], summ["sun_azimuth_deg"]), beam_power=c["mirror_power_kw"],
+                                shadow_fraction=c["tower_fraction"],
                                 title="三维示意：云下的新方案", cmin=cmin, cmax=cmax), "cc_3d_c")
         with r:
             _chart(receiver_aims_3d(case, grid, c["flux"], fld.xyz, c["aim_azimuth"], c["aim_z"], c["active"], c["dni"],
-                                    fld.ids, title="吸热器近景：新瞄准点", zmax=zmax), "cc_r3d_c")
+                                    fld.ids, beam_power=c["mirror_power_kw"], title="吸热器近景：送达镜子的瞄准点", zmax=zmax), "cc_r3d_c")
         st.caption(f"{c['n_changed_vs_a']} 面镜子改变了瞄准点，平均移动 {c['mean_aim_shift_m']:.2f} m（吸热器表面）。"
                    "方案 A 也参与了重新求解的比较，所以重新 APS 的目标值不会低于沿用 A。")
     with tabs[4]:
