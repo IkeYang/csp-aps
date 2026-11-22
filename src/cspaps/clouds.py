@@ -134,7 +134,9 @@ def load_dni_map(path, xy: np.ndarray) -> np.ndarray:
     """Per-heliostat DNI from a CSV of measurements with columns x,y,dni (linear, nearest outside)."""
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
-    df = pd.read_csv(path)
+    from .tables import read_user_csv
+
+    df = read_user_csv(path)
     clean, problems = check_dni_table(df)
     if problems:
         raise ValueError(f"{Path(path).name}: " + " ".join(p["message"] for p in problems[:5]))

@@ -23,6 +23,7 @@ import numpy as np
 
 from cspaps import load_case
 from cspaps import workflows as wf
+from cspaps.tables import export_name
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -101,7 +102,7 @@ def robustness(name: str, keys: list[str], out: Path) -> dict:
     layouts = {}
     for key in keys:
         r = done[key]
-        layouts[key] = str(Path(r["run_dir"]) / "formal" / "values" / r["winner"].replace("+", "_plus_") / "layout.csv")
+        layouts[key] = str(Path(r["run_dir"]) / "formal" / "values" / export_name(r["winner"]) / "layout.csv")
     layouts["initial"] = "initial"
     res = {}
     base = load_case(ROOT / "cases" / f"{name}.yaml")

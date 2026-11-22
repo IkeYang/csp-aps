@@ -262,7 +262,9 @@ def load_map_file(case, path, unit: str = "factor", normalize: str = "site_mean"
     """Map library CSV: map_id,x,y,value. Regular grids are used as given; scattered points are rasterised."""
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
-    df = pd.read_csv(path)
+    from .tables import read_user_csv
+
+    df = read_user_csv(path)
     if not {"map_id", "x", "y", "value"} <= set(df.columns):
         raise ValueError(f"{path}: DNI map library needs columns map_id,x,y,value")
     out = {}

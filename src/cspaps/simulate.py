@@ -227,6 +227,26 @@ def evaluate(
                     sb.get("tower_fraction", zeros))
 
 
+def beam_spots(case: Case, xyz: np.ndarray, aim_azimuth, aim_z, sun_elevation: float, sun_azimuth: float,
+               k: float = 2.0) -> dict:
+    """Size of every mirror's spot on the receiver for a plan (variable geometry from the case).
+
+    Beam std ``sigma_m`` in the image plane (HFLCAL: sun shape, slope / tracking / specular errors,
+    astigmatism at the slant range), its k-sigma ellipse on the surface (``optics.surface_spot``) and the
+    intercepted fraction of the beam (``optics.intercept_fraction``)."""
+    rec = case.receiver
+    xyz = np.asarray(xyz, dtype=float).reshape(-1, 3)
+    aim_az = np.asarray(aim_azimuth, dtype=float).reshape(-1)
+    aim_zz = np.asarray(aim_z, dtype=float).reshape(-1)
+    aim_xyz = surface_point(rec, aim_az, aim_zz)
+    _, t, slant, cos_inc = optics.heliostat_geometry(xyz, aim_xyz, sun.sun_vector(sun_elevation, sun_azimuth))
+    sigma = optics.beam_sigma(slant, cos_inc, case.heliostat, case.sun)
+    out = optics.surface_spot(rec, aim_az, t, sigma, k)
+    out["slant_m"] = slant
+    out["intercept"] = optics.intercept_fraction(rec, aim_xyz, t, sigma)
+    return out
+
+
 def sun_state(case: Case, time) -> tuple[pd.Timestamp, float, float, float]:
     """(timestamp, elevation, azimuth, clear-sky DNI) at a local time."""
     idx = sun.to_times(time, case.site.timezone)

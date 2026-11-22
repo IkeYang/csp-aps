@@ -105,9 +105,13 @@ def test_projected_shadow_and_beam_visibility(shadow_field):
     snap = evaluate(case, field, 20., 180., 800.)
     kw = dict(sun_angles=(20., 180.))
     plan = field_map(case, field.xyz, field.ids, **kw)
-    poly = next(t for t in plan.data if t.name.startswith("塔影"))
-    assert max(poly.y) == pytest.approx((case.receiver.top - case.heliostat.pivot_height)
-                                         / np.tan(np.radians(20.)) + case.receiver.tower_radius)
+    poly = [t for t in plan.data if t.name and t.name.startswith("塔影")]
+    # tower (its radius, up to the tower top) and receiver (its radius, bottom to top): the far end of the
+    # shadow is the farther of the two stadiums -- every height from the case, nothing fixed
+    rec, z = case.receiver, case.heliostat.pivot_height
+    tan = np.tan(np.radians(20.))
+    far = max((rec.tower_top - z) / tan + rec.tower_radius, (rec.top - z) / tan + rec.radius)
+    assert max(max(t.y) for t in poly) == pytest.approx(far)
     scene = aim_scene_3d(case, field.xyz, snap.dni, snap.aim_azimuth, snap.aim_z, snap.active,
                          beam_power=snap.power["intercept"], **kw)
     assert any(t.type == "mesh3d" and np.all(t.z == case.heliostat.pivot_height) for t in scene.data)

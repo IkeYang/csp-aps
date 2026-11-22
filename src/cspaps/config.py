@@ -35,6 +35,7 @@ class Receiver:
     n_azimuth: int = 72  # flux-map cells around the circumference
     n_height: int = 32  # flux-map cells along the height
     tower_diameter: float | None = None  # for the tower shadow; None = receiver diameter, 0 = off
+    tower_height: float | None = None  # tower top above the ground, m; None = bottom of the receiver
     absorptivity: float = 0.95  # absorbed / incident flux
     flux_limit_basis: str = "incident"  # the flux limits apply to "incident" or "absorbed" flux
     # Tube panels: n_panels equal azimuth sectors, panel 1 starts at panel_start_azimuth_deg
@@ -61,6 +62,15 @@ class Receiver:
     @property
     def top(self) -> float:
         return self.center[2] + 0.5 * self.height
+
+    @property
+    def bottom(self) -> float:
+        return self.center[2] - 0.5 * self.height
+
+    @property
+    def tower_top(self) -> float:
+        """Height of the tower top above the ground (the receiver sits on it unless set otherwise)."""
+        return self.bottom if self.tower_height is None else float(self.tower_height)
 
 
 @dataclass
@@ -412,6 +422,14 @@ def _validate(case: Case) -> None:
                 raise ValueError(f"receiver.{name} needs {rec.n_panels} values (one per panel), got {len(values)}")
             if any(not v > 0 for v in values):
                 raise ValueError(f"receiver.{name} values must be > 0")
+    if rec.tower_diameter is not None and rec.tower_diameter < 0:
+        raise ValueError("receiver.tower_diameter must be >= 0 (0 = no tower shadow)")
+    if rec.tower_height is not None and not rec.tower_height > 0:
+        raise ValueError(f"receiver.tower_height must be > 0 m (got {rec.tower_height})")
+    if not hel.pivot_height > 0:
+        raise ValueError(f"heliostat.pivot_height must be > 0 m (got {hel.pivot_height})")
+    if rec.bottom <= 0:
+        raise ValueError("receiver.center z must be above half the receiver height (the receiver stands on a tower)")
     if rec.flux_limit_basis not in ("incident", "absorbed"):
         raise ValueError("receiver.flux_limit_basis must be 'incident' or 'absorbed'")
     if not 0 < rec.absorptivity <= 1:

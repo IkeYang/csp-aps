@@ -153,6 +153,42 @@ def intercept_fraction(
     return np.clip(np.where(ok, frac, 0.0), 0.0, 1.0).reshape(shape)
 
 
+def surface_spot(rec: Receiver, aim_azimuth_deg, t: np.ndarray, sigma, k: float = 2.0) -> dict:
+    """Footprint of each Gaussian beam on the receiver surface around its aim point (local tangent plane).
+
+    Tangent axes at compass azimuth phi: e_phi = (cos phi, -sin phi, 0) (towards increasing azimuth) and
+    e_z. A surface offset w = (u, v) lies at image-plane distance |w - (w.t) t|, so with
+    a = (t.e_phi, t.e_z) the flux falls off as exp(-w^T (I - a a^T) w / (2 sigma^2)) (the same Gaussian as
+    ``footprints_at``). The footprint covariance is therefore
+        Sigma = sigma^2 (I - a a^T)^-1 = sigma^2 (I + a a^T / cos^2 i),   cos i = |t.n| = sqrt(1 - |a|^2),
+    i.e. the circular image is stretched by 1 / cos i along a. Returned per beam: ``sigma_m``,
+    ``incidence_deg``, the k-sigma ellipse (``semi_major_m`` = k sigma / cos i, ``semi_minor_m`` = k sigma,
+    ``major_angle_deg`` from the circumferential axis towards +z), its bounding extents ``width_m``
+    (circumferential) and ``height_m`` (vertical), and ``cov`` (N, 2, 2) in (u, v) metres."""
+    phi = np.radians(np.atleast_1d(np.asarray(aim_azimuth_deg, dtype=float)))
+    t = np.asarray(t, dtype=float).reshape(-1, 3)
+    sig = np.broadcast_to(np.asarray(sigma, dtype=float), phi.shape).astype(float)
+    e_phi = np.stack([np.cos(phi), -np.sin(phi), np.zeros_like(phi)], axis=-1)
+    n_out = np.stack([np.sin(phi), np.cos(phi), np.zeros_like(phi)], axis=-1)
+    a = np.stack([np.einsum("nk,nk->n", t, e_phi), t[:, 2]], axis=-1)
+    cos_i = np.clip(np.abs(np.einsum("nk,nk->n", t, n_out)), 1e-3, 1.0)
+    cov = sig[:, None, None] ** 2 * (np.eye(2)[None] + a[:, :, None] * a[:, None, :] / cos_i[:, None, None] ** 2)
+    major = np.where(np.hypot(a[:, 0], a[:, 1]) > 1e-12, np.degrees(np.arctan2(a[:, 1], a[:, 0])), 0.0)
+    return {"sigma_m": sig, "incidence_deg": np.degrees(np.arccos(cos_i)), "k": float(k),
+            "semi_major_m": k * sig / cos_i, "semi_minor_m": k * sig, "major_angle_deg": major,
+            "width_m": 2 * k * np.sqrt(cov[:, 0, 0]), "height_m": 2 * k * np.sqrt(cov[:, 1, 1]), "cov": cov}
+
+
+def spot_outline(rec: Receiver, aim_azimuth_deg, aim_z, cov, k: float = 2.0, n: int = 36) -> tuple[np.ndarray, np.ndarray]:
+    """k-sigma ellipses of ``surface_spot`` in unrolled receiver coordinates (azimuth deg, z m), (N, n) each."""
+    th = np.linspace(0.0, 2.0 * np.pi, n)
+    circle = np.stack([np.cos(th), np.sin(th)])  # (2, n)
+    chol = np.linalg.cholesky(np.asarray(cov, dtype=float))  # (N, 2, 2)
+    w = k * chol @ circle  # (N, 2, n) metres on the tangent plane
+    az = np.asarray(aim_azimuth_deg, dtype=float)[:, None] + np.degrees(w[:, 0] / rec.radius)
+    return az, np.asarray(aim_z, dtype=float)[:, None] + w[:, 1]
+
+
 def footprints(
     grid: ReceiverGrid,
     aim_xyz: np.ndarray,

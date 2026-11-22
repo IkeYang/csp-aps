@@ -48,6 +48,7 @@ import pandas as pd
 from .config import Case
 from .field import Field
 from .receiver import ReceiverGrid, build_grid, default_aim
+from .tables import safe_filename
 
 STATUS_RULES = {
     "feasible": "verified plan with active heliostats; adds h_s (P_s - lambda_L U_s)",
@@ -434,7 +435,7 @@ class LayoutValue:
             names = []
             for r in self.records:
                 p = r.plan
-                path = aim_dir / f"{r.scenario_id}.csv"
+                path = aim_dir / f"{safe_filename(r.scenario_id)}.csv"
                 pd.DataFrame({"id": self.ids, "x": self.xyz[:, 0], "y": self.xyz[:, 1], "z": self.xyz[:, 2],
                               "dni_w_m2": np.round(p.dni, 4), "active": p.active.astype(int),
                               "aim_azimuth_deg": np.round(p.aim_azimuth, 6), "aim_z": np.round(p.aim_z, 6),

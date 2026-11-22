@@ -60,8 +60,33 @@ def ray_hits_rect(o, d, c, n, e_w, e_h, half_w, half_h) -> np.ndarray:
     return (np.abs(denom) > 1e-12) & (s > 1e-6) & (np.abs(a) <= half_w) & (np.abs(b) <= half_h)
 
 
-def ray_hits_tower(o, d, center_xy, radius: float, z_top: float) -> np.ndarray:
-    """Does the ray o + s d (s > 0) hit a vertical cylinder from z = 0 to z_top?"""
+def shadow_cylinders(rec) -> list[tuple[float, float, float]]:
+    """The tower and the receiver as vertical cylinders (radius, z_bottom, z_top), m.
+
+    Tower: ``receiver.tower_radius`` from the ground to ``receiver.tower_top`` (the tower height variable;
+    by default the bottom of the receiver). Receiver: its own radius from its bottom to its top. A tower
+    diameter of 0 switches the tower shadow off."""
+    if rec is None or rec.tower_radius <= 0:
+        return []
+    out = []
+    if rec.tower_top > 0:
+        out.append((float(rec.tower_radius), 0.0, float(rec.tower_top)))
+    if rec.radius > 0 and rec.top > rec.bottom:
+        out.append((float(rec.radius), float(rec.bottom), float(rec.top)))
+    return out
+
+
+def ray_hits_structure(o, d, rec) -> np.ndarray:
+    """Does the ray o + s d (s > 0) hit the tower or the receiver on it (``shadow_cylinders``)?"""
+    o = np.asarray(o, dtype=float)
+    hit = np.zeros(np.broadcast_shapes(o.shape, np.shape(d))[:-1], dtype=bool)
+    for radius, z0, z1 in shadow_cylinders(rec):
+        hit |= ray_hits_tower(o, d, rec.center[:2], radius, z1, z0)
+    return hit
+
+
+def ray_hits_tower(o, d, center_xy, radius: float, z_top: float, z_bottom: float = 0.0) -> np.ndarray:
+    """Does the ray o + s d (s > 0) hit a vertical cylinder from z_bottom to z_top?"""
     ox = o[..., 0] - center_xy[0]
     oy = o[..., 1] - center_xy[1]
     dx, dy = d[..., 0], d[..., 1]
@@ -77,10 +102,10 @@ def ray_hits_tower(o, d, center_xy, radius: float, z_top: float) -> np.ndarray:
     hit = np.zeros(ok.shape, dtype=bool)
     for s in (s1, s2):
         z = o[..., 2] + s * d[..., 2]
-        hit |= ok & (s > 1e-6) & (z >= 0) & (z <= z_top)
+        hit |= ok & (s > 1e-6) & (z >= z_bottom) & (z <= z_top)
     # End caps also cover vertical rays and origins directly below or inside the cylinder.
     dz = d[..., 2]
-    for plane in (0., z_top):
+    for plane in (z_bottom, z_top):
         s = (plane - o[..., 2]) / np.where(np.abs(dz) > 1e-12, dz, 1.)
         hit |= (np.abs(dz) > 1e-12) & (s > 1e-6) & ((ox + s*dx)**2 + (oy + s*dy)**2 <= radius**2)
     return hit
@@ -186,7 +211,7 @@ def shading_blocking(
     tower_hits = np.zeros(shaded_mirrors.shape, dtype=bool)
     tower_fraction = np.zeros(n)
     if tower_shadow and rec is not None and rec.tower_radius > 0:
-        tower_hits = ray_hits_tower(pts, sun_vec[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+        tower_hits = ray_hits_structure(pts, sun_vec[None, None, :], rec)
         tower_fraction = tower_hits.mean(axis=1)
 
     t_pair = t[i_all]
@@ -223,7 +248,7 @@ def shading_blocking_bruteforce(
     shaded_mirrors = _hit_mask(pts, i_all, j_all, sun_vec, xyz, normals, e_w, e_h, helio, n)
     tower_hits = np.zeros(shaded_mirrors.shape, dtype=bool)
     if tower_shadow and rec is not None and rec.tower_radius > 0:
-        tower_hits = ray_hits_tower(pts, sun_vec[None, None, :], rec.center[:2], rec.tower_radius, rec.top)
+        tower_hits = ray_hits_structure(pts, sun_vec[None, None, :], rec)
     blocked = _hit_mask(pts, i_all, j_all, t, xyz, normals, e_w, e_h, helio, n)
     p = offsets.shape[0]
     other_occlusion = shaded_mirrors | blocked
