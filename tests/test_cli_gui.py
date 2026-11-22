@@ -90,6 +90,11 @@ def test_gui_walkthrough(monkeypatch):
     at.run()
     assert not at.exception  # overview page
     at.radio(key="page").set_value("云影回放").run()
+    sections = [item.value for item in at.markdown]
+    preview_index = next(i for i, text in enumerate(sections) if "场地预览" in text)
+    settings_index = next(i for i, text in enumerate(sections) if "回放设置" in text)
+    assert preview_index < settings_index
+    assert at.get("plotly_chart")[0].key == "replay_site_preview"
     at.button(key="btn_rt").click().run()
     assert not at.exception and not at.error
     cards = " ".join(m.value for m in at.markdown)
@@ -98,6 +103,11 @@ def test_gui_walkthrough(monkeypatch):
     at.radio(key="page").set_value("布局优化").run()
     assert at.radio(key="layout_mode").value == "compare"  # the engineer's main path opens first
     at.radio(key="layout_mode").set_value("search").run()
+    sections = [item.value for item in at.markdown]
+    preview_index = next(i for i, text in enumerate(sections) if "场地预览" in text)
+    inputs_index = next(i for i, text in enumerate(sections) if "场地、设备与位置" in text)
+    assert preview_index < inputs_index
+    assert at.get("plotly_chart")[0].key == "site_map"
     at.slider(key="1:pref_opt").set_value(0.5).run()
     assert at.session_state["case_dict"]["layout_opt"]["uniformity_weight"] == 0.5
     at.button(key="btn_opt").click().run()
@@ -136,6 +146,11 @@ def test_single_result_keeps_completed_objective(monkeypatch, tmp_path):
     at.radio(key="page").set_value("瞄准优化").run()
     at.button(key="btn_single").click().run()
     assert not at.exception and not at.error
+    sections = [item.value for item in at.markdown]
+    preview_index = next(i for i, text in enumerate(sections) if "场地预览" in text)
+    inputs_index = next(i for i, text in enumerate(sections) if "运行工况" in text)
+    assert preview_index < inputs_index
+    assert at.get("plotly_chart")[0].key == "site_aps"
     cert = at.session_state["res_single"]["summary"]["certificate"]
     assert cert["status"] == "certified" and cert["upper_bound_mw"] >= cert["objective_found_mw"]
     at.slider(key="1:uniformity.weight").set_value(2.0).run()

@@ -43,6 +43,11 @@ def test_task1_home_example_single_instant_hotspot_and_margin(monkeypatch, tmp_p
     assert at.button(key="home_aps_demo") and at.button(key="home_layout_demo")
     at.button(key="home_aps_demo").click().run()
     assert at.session_state["page"] == "瞄准优化" and at.session_state["demo_data"]
+    sections = [item.value for item in at.markdown]
+    preview_index = next(i for i, text in enumerate(sections) if "场地预览" in text)
+    inputs_index = next(i for i, text in enumerate(sections) if "运行工况" in text)
+    assert preview_index < inputs_index
+    assert at.get("plotly_chart")[0].key == "site_aps"
     at.button(key="btn_single").click().run()
     assert not at.exception and not at.error
     s = at.session_state["res_single"]["summary"]

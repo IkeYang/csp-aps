@@ -1398,16 +1398,21 @@ def page_aps(case) -> None:
     if case is None:
         st.warning("请先在「参数设置」中修正当前算例。")
         return
-    if st.session_state.get("own_data") == "aps":
-        _templates(["heliostats", "dni_points"], "aps")
     ver = st.session_state["ver"]
     data = st.session_state["case_dict"]
+    result_tab = None
+    with _card("aps_preview"):
+        _section(None, "场地预览", "核对镜场与场地边界、塔位和禁排区的相对位置。")
+        fld = build_field(case)
+        _site_check(case, {"镜场": (fld.xyz, fld.ids)}, "aps")
     if st.session_state.get("res_single") is not None:
-        right, left = st.tabs(["计算结果", "调整参数"])
+        result_tab, left = st.tabs(["计算结果", "调整参数"])
     else:
-        left, right = st.columns([1, 2.05], gap="large")
+        left = st.container()
     up_now = up_fc = up_prev = None
     with left:
+        if st.session_state.get("own_data") == "aps":
+            _templates(["heliostats", "dni_points"], "aps")
         with _card("aps_conditions"):
             _section(1, "运行工况", "选择时刻与镜场 DNI 分布。太阳位置由经纬度和时区计算。")
             default_time = pd.Timestamp(case.realtime.start)
@@ -1500,15 +1505,9 @@ def page_aps(case) -> None:
     if st.session_state.get("res_recalc") is not None:  # the recomputation replaces the shown result
         st.session_state["res_single"] = st.session_state.pop("res_recalc")
         st.rerun()
-    with right:
-        res = st.session_state.get("res_single")
-        if res is None:
-            with _card("aps_preview"):
-                _section(None, "先确认场地", "核对塔、禁排区和镜位后再计算。结果会先给出吸收功率、热点所在管屏和热流余量，"
-                         "再给出逐镜瞄准表。")
-                fld = build_field(case)
-                _site_check(case, {"镜场": (fld.xyz, fld.ids)}, "aps")
-        else:
+    res = st.session_state.get("res_single")
+    if res is not None and result_tab is not None:
+        with result_tab:
             done = load_case(Path(res["run_dir"]) / "inputs_case.yaml")
             if res.get("input_digest") != digest:
                 _callout("warn", "参数已修改，需要重新计算",
@@ -2817,25 +2816,23 @@ def _ops_replay(case) -> None:
     if case is None:
         st.warning("请先在「全部参数」中修正当前算例。")
         return
-    preview, controls = st.columns([1.45, 1], gap="medium")
-    with preview:
-        if "res_rt" not in st.session_state:
-            try:
-                field = build_field(case)
-                st.plotly_chart(field_map(case, field.xyz, field.ids, title=f"当前镜场 · {field.n:,} 面定日镜",
-                                          preview=True), theme=None, key="replay_site_preview")
-            except (OSError, ValueError) as exc:
-                st.error(f"镜场坐标无法读取。{exc}")
-        else:
-            st.markdown("**回放工况**")
-            last_case = load_case(Path(st.session_state["res_rt"]["run_dir"]) / "inputs_case.yaml")
-            st.write(f"{last_case.realtime.start} · {last_case.site.timezone}")
-    with controls:
-        with _card("replay_settings"):
-            st.subheader("回放设置")
-            _section_form("realtime", expanded=True, fields=["scenario", "duration_min", "step_s"], title="云影与时间")
-            _job_button("rt", "运行回放", wf.task_realtime, progress=True)
-            st.caption("使用当前算例即可运行，结果可按时刻查看。")
+    if "res_rt" not in st.session_state:
+        _section(None, "场地预览", "当前镜场、塔位与塔周禁排区。")
+        try:
+            field = build_field(case)
+            st.plotly_chart(field_map(case, field.xyz, field.ids, title=f"当前镜场 · {field.n:,} 面定日镜",
+                                      preview=True), theme=None, key="replay_site_preview")
+        except (OSError, ValueError) as exc:
+            st.error(f"镜场坐标无法读取。{exc}")
+    else:
+        st.markdown("**回放工况**")
+        last_case = load_case(Path(st.session_state["res_rt"]["run_dir"]) / "inputs_case.yaml")
+        st.write(f"{last_case.realtime.start} · {last_case.site.timezone}")
+    with _card("replay_settings"):
+        _section(None, "回放设置")
+        _section_form("realtime", expanded=True, fields=["scenario", "duration_min", "step_s"], title="云影与时间")
+        _job_button("rt", "运行回放", wf.task_realtime, progress=True)
+        st.caption("使用当前算例即可运行，结果可按时刻查看。")
     case, _ = _case()
     _job_error("rt")
     advanced = [f.name for f in dataclasses.fields(_SECTIONS["realtime"])
