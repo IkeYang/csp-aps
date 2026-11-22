@@ -64,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
                             help="maximise P_abs subject to CV_2D <= this value (enables uniformity)")
     sp = add("aps-refine", "problem 1 on nested, finer candidate grids: convergence of the certified optimum")
     sp.add_argument("--time", required=True)
+    sp.add_argument("--azimuth-span", type=float, help="maximum azimuth offset in either direction (deg)")
+    sp.add_argument("--dni-map", help="CSV x,y,dni for the fixed field")
+    sp.add_argument("--weight", type=float, help="uniformity weight for all candidate grids")
     sp.add_argument("--levels", default="3x7,5x13,9x25", help="azimuth x height candidates per level, e.g. 3x7,5x13")
     sp = add("pareto", "power vs uniformity trade-off over the weight lambda (with optimality gaps)")
     sp.add_argument("--time", required=True)
@@ -102,6 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--seeds", type=int, nargs="*", default=[1, 2], help="outer: random seeds")
     sp.add_argument("--limit-factor", type=float, default=None, help="scale every flux limit (make them bind)")
     sp.add_argument("--weight", type=float, default=None, help="inner lambda_APS (default: the case's)")
+    sp = sub.add_parser("replay-layout", help="re-solve a saved layout comparison with its frozen inputs")
+    sp.add_argument("folder")
+    sp.add_argument("--out", default="results")
     sp = sub.add_parser("rescore", help="recompute V(L) from exported scenario_values.csv files for another lambda_L")
     sp.add_argument("folder")
     sp.add_argument("--lambda-layout", type=float, required=True)
@@ -154,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.case:
             cmd += ["--case", str(Path(args.case).resolve())]
         return subprocess.call(cmd)
+    if args.command == "replay-layout":
+        return _print(wf.replay_layout_value(args.folder, args.out, progress=_progress))
     if args.command == "rescore":
         res = wf.task_rescore(args.folder, args.lambda_layout)
         print(json.dumps(res["summary"], indent=2, ensure_ascii=False, default=str))
@@ -179,7 +187,12 @@ def main(argv: list[str] | None = None) -> int:
                           certify=certify, progress=_progress)
     elif args.command == "aps-refine":
         levels = [tuple(int(v) for v in lv.lower().split("x")) for lv in args.levels.split(",") if lv.strip()]
-        res = wf.task_aps_refinement(case, out, args.time, levels=levels, progress=_progress)
+        if args.weight is not None:
+            if not 0 <= args.weight < float("inf"):
+                raise ValueError("weight must be finite and nonnegative")
+            case.uniformity.enabled, case.uniformity.mode, case.uniformity.weight = True, "weighted", args.weight
+        res = wf.task_aps_refinement(case, out, args.time, levels=levels, progress=_progress,
+                                     azimuth_span=args.azimuth_span, dni_map=args.dni_map)
     elif args.command == "pareto":
         res = wf.task_pareto(case, out, args.time, lambdas=args.lambdas, dni_map=args.dni_map,
                              certify=not args.no_certify, progress=_progress)
@@ -202,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "layout-value":
         names = args.layouts or ["initial"]
         layouts = {("initial" if v == "initial" else Path(v).stem): v for v in names}
+        if len(layouts) != len(names):
+            raise ValueError("布局文件名重复，请为待比较的布局使用不同的文件名。")
         res = wf.task_layout_value(case, out, layouts, scenarios_dir=args.scenarios, lam_layout=args.lambda_layout,
                                    progress=_progress)
     elif args.command == "cloud-compare":

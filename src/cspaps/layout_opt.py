@@ -89,10 +89,10 @@ def make_samples(case: Case, method: str, n_bins: int, dni_bands: int = 1, hourl
     (``scenarios``): the hours of each regime are binned separately, so the maps' DNI energy is preserved."""
     from .scenarios import attach_regimes, build_scenarios, is_spatial
 
+    if case.scenarios.source == "file":
+        return build_scenarios(case).samples
     hourly = hourly if hourly is not None else sun.hourly_samples(case)
     if is_spatial(case):
-        if case.scenarios.source == "file":
-            return build_scenarios(case).samples
         hourly = hourly if hourly.spatial else attach_regimes(case, hourly)
         if method == "hourly":
             return hourly
@@ -325,7 +325,7 @@ def _refine_positions(case, ev, samples, rng):
     spec = case.layout_opt
     if not spec.position_trials or not ev.n or ev.n != spec.n_heliostats or ev.search_aiming != "center":
         return
-    spacing = case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
+    spacing = design_spacing(case)
     original = ev.xyz.copy()
     accepted = 0
     for step in range(spec.position_trials):
@@ -365,25 +365,46 @@ def _refine_positions(case, ev, samples, rng):
                     "position_improvements": accepted}
 
 
-def validate_layout(case: Case, xyz: np.ndarray, n_required: int | None, spacing_m: float) -> dict:
+def design_spacing(case: Case) -> float:
+    spec = case.layout_opt
+    return case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
+
+
+def validate_layout(case: Case, xyz: np.ndarray, n_required: int | None, spacing_m: float, ids=None) -> dict:
     """Final site checks of a layout; status ok / capacity_shortfall / constraint_violation."""
-    keep, reason = site_mask(case, xyz)
+    xyz = np.asarray(xyz, dtype=float)
+    labels = np.arange(1, len(xyz) + 1) if ids is None else np.asarray(ids)
+    finite = np.isfinite(xyz).all(axis=1)
+    keep, _ = site_mask(case, xyz[finite])
+    valid_ids = labels[finite]
     out_idx = np.flatnonzero(~keep)
     min_d = float("inf")
     close = 0
-    if len(xyz) > 1:
-        tree = cKDTree(xyz[:, :2])
-        d, _ = tree.query(xyz[:, :2], k=2)
-        min_d = float(d[:, 1].min())
-        close = int(len(tree.query_pairs(spacing_m * (1 - 1e-9))))
+    close_pair = None
+    if finite.sum() > 1:
+        points = xyz[finite, :2]
+        tree = cKDTree(points)
+        d, neighbors = tree.query(points, k=2)
+        i = int(d[:, 1].argmin())
+        min_d = float(d[i, 1])
+        close = len(tree.query_pairs(spacing_m * (1 - 1e-9)))
+        close_pair = (valid_ids[i], valid_ids[neighbors[i, 1]])
     n = int(len(xyz))
     shortfall = max(0, int(n_required) - n) if n_required else 0
     violations = []
+    if (not n and not n_required) or (n_required and n > n_required):
+        violations.append(f"镜数要求 {n_required or '≥1'}，实际 {n}")
+    if not finite.all():
+        violations.append(f"坐标非有限值，镜号 {labels[~finite][:5].tolist()}")
+    if len(np.unique(labels)) != n:
+        violations.append("镜号重复")
     if out_idx.size:
-        violations.append(f"{out_idx.size} heliostats outside the site: " + "; ".join(reason[i] for i in out_idx[:5]))
+        violations.append(f"场地边界或禁排区违规 {out_idx.size} 面，镜号 {valid_ids[out_idx][:5].tolist()}")
     if close:
-        violations.append(f"{close} pairs closer than the minimum spacing {spacing_m:.3f} m")
+        violations.append(f"{close} 对镜距不足 {spacing_m:.3f} m，最近镜号 {close_pair[0]}、{close_pair[1]}")
     status = "constraint_violation" if violations else ("capacity_shortfall" if shortfall else "ok")
+    if shortfall:
+        violations.append(f"镜数要求 {n_required}，实际 {n}")
     return {
         "status": status, "n_heliostats": n, "n_required": n_required, "shortfall": shortfall,
         "min_distance_m": round(min_d, 4) if np.isfinite(min_d) else None,
@@ -511,10 +532,11 @@ def optimize_layout(
     from . import layout_uniformity as lu
 
     lam = float(spec.uniformity_weight)
-    from .scenarios import attach_regimes
+    from .scenarios import attach_regimes, build_scenarios
 
     formal = spec.ranking == "aps_value" and spec.refine_top > 0  # refine_top = 0: fast search only, no review
-    hourly = attach_regimes(case, sun.hourly_samples(case))  # map regime of every hour (spatial DNI)
+    hourly = (build_scenarios(case).samples if case.scenarios.source == "file"
+              else attach_regimes(case, sun.hourly_samples(case)))
     search_aiming = spec.search_aiming
     if search_aiming == "auto":
         # formal ranking: the search is a fast centre-aim pre-screen; APS runs on the formal scenario set
@@ -612,6 +634,7 @@ def optimize_layout(
     # formal ranking replaces the 0.4 constrained-APS review (APS runs on the formal scenario set instead)
     use_aps = spec.refine_top > 0 and review_aiming != "center" and not formal
     evals: list[LayoutEval] = []
+    unmoved: list[LayoutEval] = []
     rows = []
     for rank, (_, row) in enumerate(top.iterrows(), start=1):
         params = {**spec.fixed, **{k: float(row[k]) for k in names}}
@@ -621,7 +644,10 @@ def optimize_layout(
         original = replace(ev)
         _refine_positions(case, ev, samples, np.random.default_rng(spec.seed + rank))
         scored = None
-        if spec.refine_top > 0 and ev.xyz is not original.xyz:
+        if formal and ev.xyz is not original.xyz:
+            # Both geometries must compete under the same nested objective.
+            unmoved.append(original)
+        if not formal and spec.refine_top > 0 and ev.xyz is not original.xyz:
             # A move profitable on the search quadrature can lose energy over the year.
             # Keep the unmoved layout as an incumbent under the final ranking objective.
             reference = hourly if spec.review_check_hourly else review_center
@@ -750,7 +776,7 @@ def optimize_layout(
     # ---- formal ranking: every shortlisted layout (and the initial field) gets its own APS plan per scenario
     formal_info = {}
     if formal and not stop():
-        formal_info = formal_ranking(case, evals, hourly, samples, say, stop)
+        formal_info = formal_ranking(case, evals + unmoved, hourly, samples, say, stop)
         win = formal_info.get("winner")
         if win is not None:
             value = formal_info["values"][win]
@@ -764,7 +790,7 @@ def optimize_layout(
             best.aps_energy_mwh = value.totals()["energy_mwh"]
 
     # ---- final checks and capacity
-    dm = case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
+    dm = design_spacing(case)
     validation = validate_layout(case, best.xyz, spec.n_heliostats, dm)
     capacity = {}
     if validation["status"] == "capacity_shortfall":
@@ -779,7 +805,9 @@ def optimize_layout(
     if cancelled:
         validation["cancelled"] = True
     bound, pmap = {}, None
-    if formal_info and spec.upper_bound and spec.n_heliostats:
+    common_height = not formal_info or all(np.allclose(v.xyz[:, 2], case.heliostat.pivot_height, rtol=0, atol=1e-9)
+                                           for v in formal_info["values"].values())
+    if formal_info and spec.upper_bound and spec.n_heliostats and common_height:
         from .certify import layout_upper_bound, potential_map
 
         say("certificate: lone-heliostat potential map and packing bound on the formal scenario set")
@@ -790,11 +818,13 @@ def optimize_layout(
                                    found_energy_mwh=tot["energy_mwh"] if tot else None)
         bound["sampling"] = {"method": "formal scenario set", "n_states": len(sset), "fingerprint": sset.fingerprint()}
         bound["found_energy_basis"] = "per-scenario APS plans of the winner (joint poses, verified), absorbed energy E"
-        if tot and bound.get("upper_bound_mwh"):
+        if tot and bound.get("upper_bound_mwh") and bound["status"] == "ok":
             bound["value_found_mwh"] = tot["value_mwh"]
             bound["gap_value_conservative"] = max(0.0, 1.0 - tot["value_mwh"] / bound["upper_bound_mwh"])
             bound["applies_to"] = (f"the formal scenario set ({len(sset)} scenarios, maps {sorted(sset.subset_maps())}); "
                                    "any layout of N heliostats in the site, any aim points; V <= E <= bound")
+    elif formal_info and spec.upper_bound and not common_height:
+        bound = {"status": "height_out_of_scope", "applies_to": "The site bound assumes the specified pivot height."}
     elif spec.upper_bound and spec.n_heliostats and not formal:
         from .certify import hourly_site_upper_bound, layout_upper_bound, potential_map
 
@@ -857,6 +887,34 @@ def optimize_layout(
                            review_aps if use_aps else review_center, capacity, evals, bound, pmap, formal_info)
 
 
+def _position_proposal(case, value, samples, trial):
+    """Move a low-yield mirror along feasible directions, guided by its isolated annual potential."""
+    from .certify import lone_heliostat_energy
+
+    xyz = value.xyz
+    order = np.argsort(value.mirror_energy_mwh(), kind="stable")
+    i = order[trial % len(order)]
+    spacing = design_spacing(case)
+    # Include shorter steps so a mirror at the site edge can move along it.
+    steps = spacing * np.array([1., 0.5, 0.125]) / (1 + trial // len(order))
+    angles = (np.arange(16) + (trial % 2) / 2) * (2 * np.pi / 16)
+    directions = np.column_stack((np.cos(angles), np.sin(angles)))
+    xy = xyz[i, :2] + (steps[:, None, None] * directions).reshape(-1, 2)
+    points = np.column_stack((xy, np.full(len(xy), xyz[i, 2])))
+    keep, _ = site_mask(case, points)
+    neighbors = np.delete(xyz[:, :2], i, axis=0)
+    if len(neighbors):
+        distance, _ = cKDTree(neighbors).query(xy)
+        keep &= distance >= spacing * (1 - 1e-9)
+    if not keep.any():
+        return None
+    legal = points[keep]
+    scores = lone_heliostat_energy(case, legal[:, :2], samples)
+    proposed = xyz.copy()
+    proposed[i] = legal[np.argmax(scores)]
+    return proposed
+
+
 def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, samples: sun.Samples,
                    say: Callable[[str], None] = lambda m: None, stop: Callable[[], bool] = lambda: False) -> dict:
     """Rank layouts by V(L) = sum_s h_s (P_s - lambda_L U_s) with their own APS plan in every scenario.
@@ -868,8 +926,9 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
     the initial field are re-evaluated on a denser scenario set (sampling error of the representative set).
     """
     from .field import Field
-    from .layout_value import baseline_layout, compare_values, displacement, evaluate_layout_value, inner_settings
-    from .scenarios import build_scenarios
+    from .layout_value import (baseline_layout, compare_values, displacement, evaluate_layout_value,
+                               inner_settings, refine_competing_plans)
+    from .scenarios import build_scenarios, validation_scenarios
 
     spec = case.layout_opt
     n_req = spec.n_heliostats or (evals[0].n if evals else 0)
@@ -883,7 +942,9 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
     for k, ev in enumerate(evals, start=1):
         if stop() or not ev.n or ev.n != n_req:
             continue
-        key = np.round(np.sort(ev.xyz[:, :2], axis=0), 4).tobytes()
+        if validate_layout(case, ev.xyz, n_req, design_spacing(case))["status"] != "ok":
+            continue
+        key = tuple(sorted(map(tuple, ev.xyz)))
         if key in seen:
             continue
         seen.add(key)
@@ -895,7 +956,7 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
     base_note = None
     if spec.baseline == "initial" and not stop():
         b = baseline_layout(case, n_req)
-        if b is not None:
+        if b is not None and validate_layout(case, b[0], n_req, design_spacing(case), b[1])["status"] == "ok":
             base_note = b[2]
             say(f"formal ranking: APS on {len(sset)} scenarios for the initial field")
             values["initial"] = evaluate_layout_value(case, b[0], sset, "initial", ids=b[1], settings=settings,
@@ -923,6 +984,8 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
             add = unused[np.argsort(-price[unused])[:m]]
             drop = np.argsort(cur.mirror_energy_mwh(), kind="stable")[:len(add)]
             new_xyz = np.vstack([np.delete(cur.xyz, drop, axis=0), ev.candidates_xyz[add]])
+            if validate_layout(case, new_xyz, n_req, design_spacing(case))["status"] != "ok":
+                continue
             name = f"{lead}+swap{r + 1}"
             say(f"formal swap round {r + 1}: {len(add)} heliostats, APS on {len(sset)} scenarios")
             new = evaluate_layout_value(case, new_xyz, sset, name, settings=settings, progress=say, cancel=stop,
@@ -938,6 +1001,30 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
     if not values:
         return {"scenario_set": sset, "settings": settings, "values": {}, "owners": {}, "winner": None,
                 "ranking": pd.DataFrame(), "swaps": swaps, "baseline_note": base_note}
+    for trial in range(spec.formal_position_trials):
+        if stop():
+            break
+        complete = [name for name, val in values.items() if val.totals()["complete"]]
+        if not complete:
+            break
+        lead = max(complete, key=lambda name: values[name].totals()["value_mwh"])
+        cur = values[lead]
+        xyz = _position_proposal(case, cur, sset.samples, trial)
+        if xyz is None:
+            continue
+        key = tuple(sorted(map(tuple, xyz)))
+        if key in seen:
+            continue
+        seen.add(key)
+        name = f"position_{trial + 1}"
+        say(f"formal position {trial + 1}/{spec.formal_position_trials}: {len(sset)} APS scenarios")
+        candidate = evaluate_layout_value(case, xyz, sset, name, ids=cur.ids, settings=settings,
+                                          progress=say, cancel=stop, tags={"kind": "free_position", "from": lead})
+        values[name] = candidate
+        parent = owners[lead]
+        params = dict(parent.params) if parent is not None else {}
+        owners[name] = LayoutEval(params, n_req, xyz, candidate.totals()["value_mwh"], search_aiming="formal_aps_value")
+    refine_competing_plans(case, values, sset, say, stop)
     ranking = compare_values(list(values.values()), reference="initial" if "initial" in values else None)
     winner = str(ranking.loc[0, "name"]) if bool(ranking.loc[0, "rankable"]) else None
     out = {"scenario_set": sset, "settings": settings, "values": values, "owners": owners, "winner": winner,
@@ -961,8 +1048,11 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
         out["cross_maps"] = {"seed": other.scenarios.seed, "fingerprint": cross_set.fingerprint(), "rows": rows,
                              "lead_formal_mwh": rows[0]["value_formal_mwh"] - rows[1]["value_formal_mwh"],
                              "lead_independent_mwh": lead, "winner_still_ahead": bool(lead > 0)}
-    if spec.dense_check_scenarios > 0 and winner is not None and not stop():
-        dense_set = build_scenarios(case, spec.dense_check_scenarios, hourly)
+    if (spec.dense_check_scenarios > 0 or case.scenarios.validation_file) and winner is not None and not stop():
+        dense_set, verification = validation_scenarios(case, sset, spec.dense_check_scenarios, hourly)
+        out["validation_set"] = verification
+        if not verification["new_states"]:
+            return out
         rows = []
         for name in dict.fromkeys([winner, "initial", *[n for n in ranking["name"] if n not in (winner, "initial")][:1]]):
             if name not in values or stop():
@@ -993,13 +1083,15 @@ def formal_summary(formal: dict) -> dict:
         rows.append({k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in r.items()
                      if k in ("rank", "name", "value_mwh", "energy_mwh", "penalty_mwh", "weighted_penalty_mwh",
                               "delta_value_mwh", "delta_energy_mwh", "delta_uniformity_mwh", "complete",
-                              "inner_gap_annual", "max_inner_gap", "status_counts", "status_hours", "circ_penalty_mwh",
+                              "inner_gap_annual", "max_inner_gap", "value_interval_mwh", "status_counts", "status_hours", "circ_penalty_mwh",
                               "cv_2d_power_weighted", "kind", "note", "reference")})
     win = formal.get("winner")
     out = {"scenario_set": {k: v for k, v in sset.record().items() if k != "map_records"},
            "inner_settings": settings.record(), "lambda_aps": settings.lam_aps,
            "lambda_layout": float(ranking["lambda_layout"].iloc[0]) if len(ranking) else None,
            "ranking": rows, "winner": win, "swaps": formal.get("swaps", []),
+           "comparison_status": ranking.iloc[0]["comparison_status"] if len(ranking) else "no_valid_layout",
+           "validation_set": formal.get("validation_set"),
            "baseline_note": formal.get("baseline_note"), "dense_check": formal.get("dense"),
            "cross_maps": formal.get("cross_maps"),
            "winner_totals": formal["values"][win].totals() if win else {"value_mwh": float("nan"), "energy_mwh": 0.0,

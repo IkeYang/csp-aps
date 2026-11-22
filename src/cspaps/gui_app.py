@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import sys
@@ -133,6 +134,9 @@ LABELS = {
     "layout_opt.refine_top": "复核前几名", "layout_opt.polish_rounds": "局部微调轮数",
     "layout_opt.ranking": "正式排名口径", "layout_opt.aps_weight": "运行权重 λ_APS（空 = 与评价权重 λ_L 相同）",
     "layout_opt.baseline": "初始布局对照", "layout_opt.formal_swap_rounds": "正式排名后的换位轮数（按 V 接受）",
+    "layout_opt.formal_position_trials": "按年度 APS 实算的自由镜位试探次数",
+    "layout_opt.ranking_refine_states": "区间重叠时每布局追加求解的工况数",
+    "scenarios.validation_file": "复核工况表（与设计工况共用地图库）",
     "layout_opt.inner_joint_trials": "每个工况的联合姿态搜索次数", "layout_opt.inner_certify_rounds": "每个工况的松弛取整次数（0 = 关）",
     "layout_opt.inner_certify_iters": "每个工况的对偶上界迭代数", "layout_opt.dense_check_scenarios": "更密工况复核的工况数（0 = 关）",
     "layout_opt.cross_check_maps": "云影地图：用独立云图复核胜出布局",
@@ -293,9 +297,12 @@ def _case():
 
 
 def _save_upload(upload) -> Path:
-    UPLOADS.mkdir(parents=True, exist_ok=True)
-    path = UPLOADS / upload.name
-    path.write_bytes(upload.getvalue())
+    content = upload.getvalue()
+    directory = UPLOADS / hashlib.sha256(content).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / Path(upload.name).name
+    if not path.exists():
+        path.write_bytes(content)
     return path
 
 
@@ -568,8 +575,35 @@ def _annual_dni(case_yaml: str, base_dir: str) -> float | None:
 
 # --------------------------------------------------------------------------- background jobs
 
+def _input_digest(case, args, options):
+    """Identify the actual solve inputs before filenames are rewritten in the run snapshot."""
+    def file_hash(path):
+        p = Path(path)
+        return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
+
+    settings = case.to_dict()
+    for section, attr in (("weather", "file"), ("field", "layout_file"), ("scenarios", "file"),
+                          ("scenarios", "map_file"), ("scenarios", "validation_file")):
+        path = settings[section].get(attr)
+        if path:
+            settings[section][attr] = file_hash(case.resolve(path))
+    inputs = {k: v for k, v in options.items() if k not in ("progress", "cancel") and v is not None}
+    for key in ("dni_map", "forecast_dni_map", "prev_aims"):
+        if key in inputs:
+            inputs[key] = file_hash(inputs[key])
+    if "layouts" in inputs:
+        inputs["layouts"] = {name: (file_hash(case.resolve(v)) if isinstance(v, (str, Path)) and str(v) != "initial"
+                                    else v) for name, v in inputs["layouts"].items()}
+    if "scenarios_dir" in inputs:
+        folder = Path(inputs["scenarios_dir"])
+        inputs["scenarios_dir"] = [file_hash(folder / name) for name in ("scenarios.csv", "dni_maps.csv", "dni_maps.json")]
+    payload = json.dumps([settings, args, inputs], sort_keys=True, default=wf._default)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 class Job:
-    def __init__(self, fn, *args, **kwargs):
+    def __init__(self, fn, *args, input_digest=None, **kwargs):
+        self.input_digest = input_digest
         self.messages: list[str] = []
         self.result = None
         self.error: str | None = None
@@ -589,6 +623,8 @@ class Job:
     def _run(self, fn, args, kwargs):
         try:
             self.result = fn(*args, **kwargs)
+            if self.input_digest:
+                self.result["input_digest"] = self.input_digest
         except Exception:  # noqa: BLE001
             self.error = traceback.format_exc()
 
@@ -605,7 +641,7 @@ class Job:
 
 
 def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help: str | None = None,
-                blockers: list[str] | None = None, completed_case=None, **kwargs) -> None:
+                blockers: list[str] | None = None, completed_case=None, **kwargs) -> str | None:
     """Start a background job; the result lands in st.session_state['res_<key>'].
 
     The button is disabled while the case is invalid or any input problem is
@@ -617,12 +653,13 @@ def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help
         st.button(label, key=f"btn_{key}", type="primary", disabled=True, width="stretch")
         st.error("无法开始计算：" + "；".join(dict.fromkeys(problems)))
         return
+    digest = _input_digest(case, args, kwargs) if key in ("lv", "single", "opt", "recalc") else None
     job = st.session_state.get(f"job_{key}")
     if job is None or job.done:
         if st.button(label, key=f"btn_{key}", type="primary", help=help, width="stretch"):
             if cancellable:
                 kwargs["cancel"] = True
-            job = Job(fn, case, RESULTS, *args, **kwargs)
+            job = Job(fn, case, RESULTS, *args, input_digest=digest, **kwargs)
             if os.environ.get("CSPAPS_GUI_SYNC"):
                 job.collect(key)
             else:
@@ -630,6 +667,7 @@ def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help
             st.rerun()
     if st.session_state.get(f"job_{key}") is not None:
         _job_status(key)
+    return digest
 
 
 @st.fragment(run_every=1.0)
@@ -1091,6 +1129,10 @@ def _scenario_source_inputs(case, key: str) -> list[str]:
     src = st.radio("工况从哪里来", ["weather", "file"], index=0 if case.scenarios.source == "weather" else 1,
                    horizontal=True, key=f"scen_src_{key}",
                    format_func={"weather": "由站址全年气象自动生成", "file": "导入工况清单与 DNI 地图"}.get)
+    if key == "opt":
+        check_file = st.file_uploader("独立复核工况 CSV（可选，共用地图库）", type=["csv"], key="validation_scenarios")
+        if check_file is not None:
+            sc["validation_file"] = str(_save_upload(check_file))
     if src == "file":
         sc["source"] = "file"
         c1, c2 = st.columns(2)
@@ -1114,7 +1156,11 @@ def _scenario_source_inputs(case, key: str) -> list[str]:
         except Exception as exc:  # noqa: BLE001
             st.error(f"地图库无法读取：{exc}")
             return blockers + ["地图库无法读取"]
-        table = pd.read_csv(c2_.resolve(c2_.scenarios.file), dtype=str, keep_default_na=False)
+        try:
+            table = pd.read_csv(c2_.resolve(c2_.scenarios.file), dtype=str, keep_default_na=False)
+        except (OSError, ValueError) as exc:
+            st.error(f"工况清单无法读取：{exc}")
+            return blockers + ["工况清单无法读取"]
         problems = check_scenario_table(c2_, table, maps, Path(c2_.scenarios.map_file or "地图库").name)
         for p in problems[:8]:
             st.error(p["message"])
@@ -1232,7 +1278,7 @@ def _compare_workspace(case) -> None:
             n = {k: len(v[0]) for k, v in layouts.items()}
             if len(set(n.values())) > 1:
                 _callout("warn", "两套布局镜数不同", "、".join(f"{k} {v} 面" for k, v in n.items()) +
-                         "。可以比较，但不满足“等镜数”比较的前提。")
+                         "。正式排名要求两套布局均达到目标镜数。")
     with _card("cmp_scen"):
         _section(2, "看看日照落在哪些镜子上", "工况 = 太阳方向 + 代表小时数 + 场地 DNI 地图。" + DNI_DEFINITION + "。")
         blockers += _scenario_source_inputs(case, "cmp")
@@ -1268,18 +1314,20 @@ def _compare_workspace(case) -> None:
             sdir = Path(st.session_state["res_opt"]["run_dir"]) / "formal" / "scenario_set"
             if sdir.exists() and st.checkbox("沿用本次布局优化冻结的工况集", value=True, key="cmp_frozen"):
                 frozen = str(sdir)
-        _job_button("lv", "▶  按年度价值比较两套布局", wf.task_layout_value, layouts=sources, scenarios_dir=frozen,
+        digest = _job_button("lv", "▶  按年度价值比较两套布局", wf.task_layout_value, layouts=sources, scenarios_dir=frozen,
                     blockers=blockers, progress=True, cancellable=True)
         _job_error("lv")
     res = st.session_state.get("res_lv")
     if res is not None:
         rc = res_case(res)
-        if c5 is not None and c5.to_dict() != rc.to_dict():
+        if res.get("input_digest") != digest:
             _callout("warn", "参数已修改，需要重新计算",
                      f"下面的结果对应上一次的参数：λ = {rc.layout_opt.uniformity_weight:g}，"
                      f"工况 {len(res['scenario_set'])} 个，来源 {res['scenario_set'].meta.get('source', '—')}。")
-        if not res["summary"].get("equal_heliostat_count"):
-            st.warning("两套布局镜数不同，年度价值可以比较，但不满足“等镜数”的验收口径。")
+        for name, problems in res["summary"].get("excluded_layouts", {}).items():
+            st.error(f"{wf.layout_label(name)} 未参与排名 · {'，'.join(problems)}")
+        if res["ranking"].empty:
+            return
         _render_values(rc, res["values"], res["ranking"], res["scenario_set"], "lv", run_dir=res["run_dir"])
 
 
@@ -1433,7 +1481,7 @@ def page_aps(case) -> None:
         _run_summary([("镜数", f"{n_now} 面"), ("时刻", stamp), ("日照", DNI_SOURCES[dni_src]),
                       ("考核区域", "整个吸热面" if not case.uniformity.panels and not case.uniformity.z_range else "部分区域"),
                       ("安全裕度", f"{case.aps.safety_margin:.0%}"), ("算法", CHOICE_LABELS["aps.method"].get(method, method))])
-        _job_button("single", "▶  计算瞄准方案", wf.task_aim, stamp, method=method, blockers=aps_blockers,
+        digest = _job_button("single", "▶  计算瞄准方案", wf.task_aim, stamp, method=method, blockers=aps_blockers,
                     dni_map=_save_upload(up_now) if up_now else None,
                     forecast_dni_map=_save_upload(up_fc) if up_fc else None,
                     prev_aims=_save_upload(up_prev) if up_prev else None,
@@ -1452,7 +1500,7 @@ def page_aps(case) -> None:
                 _site_check(case, {"镜场": (fld.xyz, fld.ids)}, "aps")
         else:
             done = load_case(Path(res["run_dir"]) / "inputs_case.yaml")
-            if case.to_dict() != done.to_dict():
+            if res.get("input_digest") != digest:
                 _callout("warn", "参数已修改，需要重新计算",
                          f"下面的结果对应上一次的参数（均匀度目标 "
                          f"{'λ = %g' % done.uniformity.weight if done.uniformity.enabled and done.uniformity.mode == 'weighted' else ('CV ≤ %g' % done.uniformity.max_cv if done.uniformity.enabled else '功率优先')}，"
@@ -1704,7 +1752,10 @@ def _certificate_tab(res: dict, cert: dict | None) -> None:
              "观察本方案与上界随瞄准分辨率的收敛——当候选网格达到瞄准控制的指令分辨率时，证书即覆盖实际可执行的全部方案。"
              "三级（21 / 65 / 225 个候选点）约需 4 分钟。")
     inputs = json.loads((Path(res["run_dir"]) / "run.json").read_text(encoding="utf-8"))["arguments"]
-    _job_button("refine", "运行加密收敛分析", wf.task_aps_refinement, inputs["time"],
+    case = res_case(res)
+    span = st.number_input("加密搜索的最大方位偏移 (°)", min_value=0., max_value=89.,
+                           value=float(min(89., max(map(abs, case.aps.azimuth_offsets_deg or [0.])))), key="refine_az_span")
+    _job_button("refine", "运行加密收敛分析", wf.task_aps_refinement, inputs["time"], azimuth_span=span,
                 completed_case=load_case(Path(res["run_dir"]) / "inputs_case.yaml"), dni=inputs.get("dni"),
                 forecast_dni_map=inputs.get("forecast_dni_map"), dni_map=inputs.get("dni_map"),
                 dni_source=inputs.get("dni_source", "site"), progress=True)
@@ -1889,7 +1940,7 @@ def page_layout(case) -> None:
                 _fields("scenarios", ["map_include_uniform", "map_assignment", "map_sequence", "map_cell_m",
                                       "dni_bands"], n_cols=2)
                 _fields("annual", ["representative_dni"], n_cols=1)
-                _fields("layout_opt", ["formal_swap_rounds", "dense_check_scenarios", "inner_joint_trials",
+                _fields("layout_opt", ["formal_swap_rounds", "formal_position_trials", "ranking_refine_states", "dense_check_scenarios", "inner_joint_trials",
                                        "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"], n_cols=2)
         with _card("layout_search"):
             _section(4, "搜索设置", "初筛按中心瞄准的全年理论热量减周向不均匀惩罚评价参数化布局；入围布局与初始布局"
@@ -1900,7 +1951,7 @@ def page_layout(case) -> None:
             with st.expander("搜索范围、采样精度与计算资源"):
                 common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight",
                           "uniformity_metric", "ranking", "baseline", "aps_weight", "formal_swap_rounds",
-                          "dense_check_scenarios", "inner_joint_trials", "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"}
+                          "dense_check_scenarios", "formal_position_trials", "ranking_refine_states", "inner_joint_trials", "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"}
                 _fields("layout_opt", [f.name for f in dataclasses.fields(_SECTIONS["layout_opt"]) if f.name not in common])
             with st.expander("APS 复核使用的瞄准设置"):
                 _fields("aps", ["method", "n_height_levels", "azimuth_offsets_deg"])
@@ -1925,7 +1976,7 @@ def page_layout(case) -> None:
                           ("安全裕度", f"{case.aps.safety_margin:.0%}"),
                           ("参加排名", f"搜索前 {lo.refine_top} 名" + (" + 初始镜场" if lo.baseline == "initial" else "")),
                           ("偏好 λ", f"{lo.uniformity_weight:.2f}")])
-            _job_button("opt", "▶  开始布局优化", wf.task_optimize_layout, progress=True, cancellable=True,
+            digest = _job_button("opt", "▶  开始布局优化", wf.task_optimize_layout, progress=True, cancellable=True,
                         blockers=scen_blockers)
             _job_error("opt")
     with right:
@@ -1944,8 +1995,7 @@ def page_layout(case) -> None:
                     st.error(f"无法生成镜场：{exc}")
         else:
             completed = load_case(Path(res["run_dir"]) / "inputs_case.yaml")
-            edited, _ = _case()
-            if edited and res.get("input_parameters") and edited.to_dict() != res["input_parameters"]:
+            if res.get("input_digest") != digest:
                 _callout("warn", "参数已修改，需要重新计算",
                          f"下面的图表、指标和导出文件对应上一次的参数：镜数 {completed.layout_opt.n_heliostats}，"
                          f"λ = {completed.layout_opt.uniformity_weight:g}，正式工况 {completed.scenarios.n_scenarios} 个，"
@@ -1957,6 +2007,8 @@ def page_layout(case) -> None:
                          f"{s_['n_heliostats']} 面镜 · {len(f['scenario_set'])} 个工况 · λ_APS = {f['settings'].lam_aps:g} · "
                          f"λ_L = {completed.layout_opt.uniformity_weight:g} · 用时 {s_['runtime_s']:.0f} s · "
                          f"场地校验 {'通过' if s_['status'] == 'ok' else s_['status']}")
+                if f.get("validation_set") and not f["validation_set"]["new_states"]:
+                    st.info("复核表与设计表使用相同工况。请导入另一张复核工况表以检查排序稳定性。")
                 _render_values(completed, f["values"], f["ranking"], f["scenario_set"], "opt", bound=res["result"].bound,
                                dense=f.get("dense"), run_dir=res["run_dir"], swaps=f.get("swaps"),
                                cross=f.get("cross_maps"))
@@ -2062,7 +2114,8 @@ def _layout_results(case, res: dict) -> None:
         except ValueError:
             lams = None
             st.error("λ_L 序列格式错误")
-        best_params = {k: v for k, v in r.best.params.items()}
+        # This tab explores the generator before formal APS refinement.
+        best_params = r.best.params if r.best.params and "source" not in r.best.params else None
         with c2:
             if lams:
                 _job_button("ltrade", "计算布局权衡曲线", wf.task_layout_tradeoff, lambdas=lams, params=best_params,
@@ -2294,7 +2347,7 @@ def _sector_share(value, case, n_sectors: int = 12):
     acc = np.zeros(na)
     for r in value.records:
         if r.plan.counts and r.plan.flux is not None and r.plan.flux.shape == grid.shape:
-            acc += r.hours * r.plan.flux.sum(axis=0)
+            acc += r.hours * (r.plan.flux * grid.to_map(grid.alpha)).sum(axis=0)
     sector = np.minimum((grid.azimuth_deg // (360.0 / n_sectors)).astype(int), n_sectors - 1)
     tot = np.bincount(sector, weights=acc, minlength=n_sectors)
     share = tot / tot.sum() if tot.sum() > 0 else tot
@@ -2331,12 +2384,28 @@ def _decision_callout(values: dict, ranking: pd.DataFrame) -> None:
     first = ranking.iloc[0]
     ref = first["reference"]
     lab = wf.layout_label
+    status = first["comparison_status"]
+    if status == "incomplete":
+        _callout("warn", "年度比较尚未完成", "补齐未求解工况后可以判断两套布局的年度价值。")
+        return
+    if status == "certified_tie":
+        _callout("ok", "给定候选点上已证并列最高", "在这组代表工况与候选瞄准点上，领先布局的年度最优值得分相同。")
+        return
+    if status == "single_layout":
+        _callout("ok", "一套布局已完成年度评分", "比较优劣需要另一套符合场地约束的等镜数布局。")
+        return
+    if status in ("overlapping_bounds", "feasible_scores_only"):
+        _callout("warn", "当前可行方案得分领先 · 优劣尚待确认",
+                 f"{lab(first['name'])} 的可行得分为 {first['value_mwh']:,.2f} MWh 等效。"
+                 + ("候选瞄准模型的年度区间重叠。" if status == "overlapping_bounds"
+                    else "此次两层权重或运行状态无法给出可比较的最优值区间。"))
+        return
     if first["name"] == ref and len(ranking) > 1:
         second = ranking.iloc[1]
         dv = -second["delta_value_mwh"]
         de, du = -second["delta_energy_mwh"], -second["delta_uniformity_mwh"]
-        _callout("ok", f"{lab(first['name'])} 得分最高",
-                 f"比第 2 名 {lab(second['name'])} 多 {dv:,.1f} MWhₜₕ：其中吸热量贡献 {de:+,.1f}，更均匀受热贡献 {du:+,.1f}。")
+        _callout("ok", f"{lab(first['name'])} 得分最高 · 已证领先受比较布局",
+                 f"在当前工况和候选瞄准点上比第 2 名 {lab(second['name'])} 多 {dv:,.1f} MWh 等效：其中吸热量贡献 {de:+,.1f}，更均匀受热贡献 {du:+,.1f}。")
         return
     row = ranking.loc[ranking["name"] == ref].iloc[0] if (ranking["name"] == ref).any() else None
     if row is None:
@@ -2396,7 +2465,7 @@ def _ab_block(values: dict, ranking: pd.DataFrame, key: str) -> None:
                      "complete": r["complete"], "n_solved": r["n_solved"], "n_scenarios": r["n_scenarios"],
                      "interval": r["value_interval_mwh"], "overlap": r.get("interval_overlaps_leader")})
     shown = rows[:4]
-    a, b = st.columns([1.15, 1])
+    a, b = st.container(), st.container()
     with a:
         _chart(ab_compare_chart(shown), f"{key}_ab")
     with b:
@@ -2498,9 +2567,9 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
 
     key = f"fv_{key}"  # widget keys of this view never collide with the pre-screen view
     labels = _labels(values)
+    _decision_callout(values, ranking)
     _ab_block(values, ranking, key)
     _value_kpis(values, ranking, bound, sset)
-    _decision_callout(values, ranking)
     _calc_basis(case, values, ranking, sset)
     _status_legend()
     tabs = st.tabs(["排名与优势分解", "逐工况明细", "工况与 DNI 地图", "与初始布局对照", "最优性与误差", "导出与复算"])
@@ -3313,8 +3382,11 @@ def _solver_benchmark(case) -> None:
         with st.expander("逐工况明细"):
             st.dataframe(r["inner"], hide_index=True, width="stretch")
     if "outer_summary" in r:
-        _section(None, "外层：布局搜索", "V(L) 为训练工况上的正式年度价值；留出工况换了代表太阳位置与云图；"
-                 "标准差来自不同随机种子。")
+        verification = r["summary"]["outer"]["held_out"]
+        _section(None, "外层：布局搜索", f"设计工况得到年度价值 V。复核集包含 {verification['new_states']} 个新工况，"
+                 f"{verification['shared_states']} 个工况与设计集相同。")
+        if not verification["new_states"]:
+            st.info("同组工况不能验证排名的泛化能力。可在工况参数中指定另一张复核工况表。")
         st.dataframe(r["outer_summary"].drop(columns=["method"], errors="ignore"), hide_index=True, width="stretch")
         with st.expander("每次运行"):
             st.dataframe(r["outer"], hide_index=True, width="stretch")
@@ -3340,7 +3412,7 @@ def page_runs(case) -> None:
     if runs.empty:
         st.info("还没有运行记录")
         return
-    task_names = {"layout": "镜场生成", "snapshot": "单时刻基准", "aps": "APS 瞄准优化",
+    task_names = {"layout_value": "年度布局比较", "layout": "镜场生成", "snapshot": "单时刻基准", "aps": "APS 瞄准优化",
                   "realtime": "云影回放", "annual": "全年评估", "layout_opt": "布局优化",
                   "uniformity": "均匀受热分析", "validate": "光线追迹校验",
                   "pareto": "功率–均匀度曲线", "soltrace_export": "SolTrace 对标导出", "shading_check": "遮挡筛选复核",
@@ -3364,6 +3436,18 @@ def page_runs(case) -> None:
                 st.json(json.loads(j.read_text(encoding="utf-8")))
         for img in sorted(d.glob("*.png")):
             st.image(str(img), caption=img.name, width="stretch")
+        if task == "layout_value" and (d / "layout_value.json").is_file():
+            key = f"replay_{d.name}_{d.parent.name}"
+            if st.button("用冻结的布局与工况重新求解", key=f"start_{key}", disabled=f"job_{key}" in st.session_state):
+                st.session_state[f"job_{key}"] = Job(wf.replay_layout_value, d, RESULTS, progress=True, cancel=True)
+                st.rerun()
+            if f"job_{key}" in st.session_state:
+                _job_status(key)
+            _job_error(key)
+            replay = st.session_state.get(f"res_{key}")
+            if replay and not replay["ranking"].empty:
+                st.dataframe(_ranking_table(replay["ranking"]), hide_index=True)
+                st.caption(f"复算结果目录 {replay['run_dir']}")
         if (d / "inputs_case.yaml").exists():
             if st.button("载入这次运行的输入参数"):
                 _load_into_state(yaml.safe_load((d / "inputs_case.yaml").read_text(encoding="utf-8")), d)

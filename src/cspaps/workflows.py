@@ -8,6 +8,7 @@ Each runner returns ``{"summary": dict, "files": {label: path}, "run_dir": Path,
 
 from __future__ import annotations
 
+import itertools
 import json
 import shutil
 import time as _time
@@ -22,11 +23,11 @@ from . import __version__, sun
 from .aps import build_problem, optimize_aims, solve, solve_greedy
 from .certify import improve_and_certify
 from .clouds import load_dni_map
-from .config import Case
+from .config import Case, load_case
 from .coupled import search_joint_poses
 from .engine import APSEngine, request_from_dict, response_to_dict
 from .field import Field, build_field, generate, save_layout_csv
-from .layout_opt import optimize_layout
+from .layout_opt import design_spacing, optimize_layout, validate_layout
 from .mcrt import compare, convergence, trace_repeated
 from .plotting import (
     plot_annual_monthly, plot_flux_compare, plot_flux_map, plot_history, plot_layout,
@@ -70,21 +71,24 @@ def out_dir(base: str | Path, case: Case, task: str = "run") -> Path:
     """A new run folder; the case inputs are saved in it."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     root = Path(base) / case.name
-    out = root / f"{task}_{stamp}"
-    k = 1
-    while out.exists():
-        k += 1
-        out = root / f"{task}_{stamp}-{k}"
-    out.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
+    for k in itertools.count(1):
+        out = root / (f"{task}_{stamp}" if k == 1 else f"{task}_{stamp}-{k}")
+        try:
+            out.mkdir()
+            break
+        except FileExistsError:
+            continue
     snapshot = case.copy()
     snapshot.base_dir = out
-    for section, attr in (("weather", "file"), ("field", "layout_file")):
+    for section, attr in (("weather", "file"), ("field", "layout_file"),
+                          ("scenarios", "file"), ("scenarios", "map_file"), ("scenarios", "validation_file")):
         value = getattr(getattr(case, section), attr)
         if not value:
             continue
         source = case.resolve(value)
         if source.is_file():
-            dest = out / f"input_{section}_{source.name}"
+            dest = out / f"input_{section}_{attr}_{source.name}" if section == "scenarios" else out / f"input_{section}_{source.name}"
             shutil.copy2(source, dest)
             setattr(getattr(snapshot, section), attr, dest.name)
         else:
@@ -337,7 +341,7 @@ def existence_statement_aps(case: Case, cert: dict) -> dict:
 
 def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map: str | Path | None = None,
                         dni_source: str = "site", progress: Progress | None = None, dni: float | None = None,
-                        forecast_dni_map: str | Path | None = None) -> dict:
+                        forecast_dni_map: str | Path | None = None, azimuth_span: float | None = None) -> dict:
     """Problem 1 on nested, increasingly fine candidate grids: how the certified optimum converges.
 
     The certificate of ``task_aim`` holds for the discrete candidate set. Real aim
@@ -357,16 +361,28 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
 
         dni_v = cloud_dni_snapshot(case, fld, ts, float(dni_model))
     levels = levels or [(3, 7), (5, 13), (9, 25)]
-    off_max = max((abs(float(o)) for o in case.aps.azimuth_offsets_deg), default=0.0)
+    if any(a < 1 or z < 1 for a, z in levels):
+        raise ValueError("Candidate grid dimensions must be positive")
+    for coarse, fine in zip(levels, levels[1:]):
+        for m, n in zip(coarse, fine):
+            if n < m or (m > 1 and (n - 1) % (m - 1)) or (m == 1 and n % 2 == 0):
+                raise ValueError("Refinement levels must retain every preceding aim point")
+    off_max = max((abs(float(o)) for o in case.aps.azimuth_offsets_deg), default=0.0) if azimuth_span is None else azimuth_span
+    if not np.isfinite(off_max) or not 0 <= off_max <= 90:
+        raise ValueError("Azimuth span must be in [0, 90] degrees")
+    from .layout_value import eval_grid_shape
+    n_z_grid, n_az_grid = eval_grid_shape(case)
+    grid = build_grid(case.receiver, n_az_grid, n_z_grid)
     rows, prev = [], None
     for j, (n_az, n_z) in enumerate(levels):
         if progress:
             progress(f"refinement level {j + 1}/{len(levels)}: {n_az} x {n_z} candidates")
         c = case.copy()
-        c.aps.azimuth_offsets_deg = [float(v) for v in np.linspace(-off_max, off_max, n_az)] if off_max > 0 else [0.0]
+        c.aps.auto_grid = False
+        c.aps.azimuth_offsets_deg = np.linspace(-off_max, off_max, n_az).tolist() if off_max and n_az > 1 else [0.]
         c.aps.n_height_levels = int(n_z)
         t_lvl = _time.perf_counter()
-        prob = build_problem(c, fld, el, az, dni_v, forecast, grid=build_grid(c.receiver))
+        prob = build_problem(c, fld, el, az, dni_v, forecast, grid=grid)
         init = None
         if prev is not None:  # nested grids: the previous plan's aims are candidates of this level
             d_az = (prob.cand_az - np.asarray(prev[0])[:, None] + 180.0) % 360.0 - 180.0
@@ -374,10 +390,11 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
             init = np.where(prev[2], np.argmin(dist, axis=1), -1)
         res = solve(prob, case.aps.method if case.aps.method != "center" else "greedy", c.aps, init=init)
         budget = min(120.0, c.aps.certify_time_s * max(1.0, (prob.k / 21.0) ** 0.75))
-        res, cert = improve_and_certify(prob, res, c.aps, rounds=c.aps.certify_rounds, time_limit_s=budget)
+        if (prob.k + int(c.aps.allow_defocus)) ** min(prob.n, 20) > c.aps.coupled_exact_limit:
+            res, _ = improve_and_certify(prob, res, c.aps, rounds=c.aps.certify_rounds, time_limit_s=budget)
         res, cert = search_joint_poses(prob, fld, res, warm=init)
         prev = (res.aim[0], res.aim[1], res.active)
-        rows.append({"n_azimuth": n_az, "n_height": n_z, "n_candidates": int(prob.k),
+        rows.append({"n_azimuth": len(c.aps.azimuth_offsets_deg), "n_height": n_z, "n_candidates": int(prob.k),
                      "azimuth_step_deg": (2 * off_max / (n_az - 1)) if n_az > 1 else None,
                      "height_step_m": (c.receiver.height * c.aps.height_span / (n_z - 1)) if n_z > 1 else None,
                      "objective_found_mw": cert.get("objective_found_mw"), "upper_bound_mw": cert["upper_bound_mw"],
@@ -387,7 +404,8 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
                      "time_s": round(_time.perf_counter() - t_lvl, 1)})
     files = {"summary_json": out / "aps_refinement.json", "table_csv": out / "aps_refinement.csv"}
     pd.DataFrame(rows).to_csv(files["table_csv"], index=False)
-    summary = {"time": ts.isoformat(), "levels": rows,
+    summary = {"time": ts.isoformat(), "levels": rows, "azimuth_span_deg": off_max,
+               "evaluation_grid": [n_z_grid, n_az_grid],
                "note": "certificates hold for each discrete candidate set; nested refinement shows the convergence "
                        "towards continuous aim points"}
     _json(files["summary_json"], summary)
@@ -546,21 +564,18 @@ def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None
         files["potential_npz"] = out / "site_potential.npz"
         np.savez_compressed(files["potential_npz"], x=res.potential.x, y=res.potential.y,
                             energy_mwh=res.potential.energy_mwh, cell_m=res.potential.cell_m)
-    new_case = case.copy()
+    new_case = load_case(out / "inputs_case.yaml")
     new_case.field.layout_file = files["layout_csv"].name
     new_case.field.generator = None
     new_case.name = f"{case.name}_optimized"
     new_case.base_dir = out
-    copied_weather = out / f"input_weather_{Path(case.weather.file).name}" if case.weather.file else None
-    if copied_weather is not None and copied_weather.exists():
-        new_case.weather.file = copied_weather.name
     files["case_yaml"].write_text(new_case.to_yaml(), encoding="utf-8")
     summary = res.summary()
     summary["search_settings"] = {k: getattr(case.layout_opt, k) for k in (
         "generator", "n_heliostats", "bounds", "fixed", "search_sampling", "n_sun_bins", "review_sampling",
         "search_aiming", "review_n_sun_bins", "review_dni_bands", "maxiter", "popsize", "seed", "polish_rounds", "refine_top",
         "swap_rounds", "swap_fraction", "uniformity_weight", "ranking", "aps_weight", "baseline", "formal_swap_rounds",
-        "inner_joint_trials", "inner_certify_rounds", "dense_check_scenarios")}
+        "formal_position_trials", "ranking_refine_states", "inner_joint_trials", "inner_certify_rounds", "dense_check_scenarios")}
     if res.formal and res.formal.get("values"):
         fdir = out / "formal"
         files.update(save_scenario_set(res.formal["scenario_set"], fdir / "scenario_set", case))
@@ -964,6 +979,8 @@ def layout_label(name: str) -> str:
         return LAYOUT_NAMES_ZH[name]
     if len(name) == 1 and name.isalpha():
         return f"布局 {name}"
+    if name.startswith("position_"):
+        return f"自由镜位 {name.removeprefix('position_')}"
     if name.startswith("search_"):
         base, _, swap = name.partition("+swap")
         txt = f"搜索候选 {base.removeprefix('search_')}"
@@ -989,7 +1006,10 @@ def _layout_source(case: Case, source) -> tuple[np.ndarray, np.ndarray, str]:
             raise ValueError("the case's initial field has fewer heliostats than layout_opt.n_heliostats")
         return b
     if isinstance(source, (str, Path)):
-        xyz, ids = read_layout(case.resolve(source), case.heliostat.pivot_height)
+        path = case.resolve(source)
+        if not path.is_file() and Path(source).is_file():
+            path = Path(source)
+        xyz, ids = read_layout(path, case.heliostat.pivot_height)
         return xyz, (np.arange(1, len(xyz) + 1) if ids is None else ids), f"layout CSV {Path(source).name}"
     xyz = np.asarray(source, dtype=float).reshape(-1, 3)
     return xyz, np.arange(1, len(xyz) + 1), "layout array"
@@ -1082,7 +1102,8 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
 
     ``layouts`` maps a name to 'initial', a layout CSV or an (N, 3) array (default: the initial field).
     """
-    from .layout_value import STATUS_RULES, compare_values, displacement, evaluate_layout_value, inner_settings
+    from .layout_value import (STATUS_RULES, compare_values, displacement, evaluate_layout_value, inner_settings,
+                               refine_competing_plans)
 
     t0 = _time.perf_counter()
     out = out_dir(base, case, "layout_value")
@@ -1090,17 +1111,54 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
     files = save_scenario_set(sset, out / "scenario_set", case)
     settings = inner_settings(case)
     lam = case.layout_opt.uniformity_weight if lam_layout is None else float(lam_layout)
+    if not 0 <= lam < float("inf"):
+        raise ValueError("The uniformity weight must be finite and nonnegative")
     layouts = layouts or {"initial": "initial"}
-    values, notes = {}, {}
-    for name, src in layouts.items():  # a cancelled run keeps every layout; unsolved scenarios are marked
-        xyz, ids, note = _layout_source(case, src)
+    values, notes, excluded, inputs = {}, {}, {}, {}
+    archived_layouts = {}
+    input_dir = out / "input_layouts"
+    input_dir.mkdir()
+    for index, (name, src) in enumerate(layouts.items(), 1):
+        destination = input_dir / f"layout_{index}.csv"
+        if isinstance(src, str) and src == "initial":
+            archived_layouts[name] = "initial"
+        else:
+            archived_layouts[name] = destination.relative_to(out).as_posix()
+            if isinstance(src, (str, Path)):
+                path = case.resolve(src)
+                if not path.is_file() and Path(src).is_file():
+                    path = Path(src)
+                if path.is_file():
+                    shutil.copy2(path, destination)
+                    src = destination.resolve()
+            else:
+                points = np.asarray(src, dtype=float).reshape(-1, 3)
+                pd.DataFrame(points, columns=["x", "y", "z"]).to_csv(destination, index=False, float_format="%.17g")
+        try:
+            inputs[name] = _layout_source(case, src)
+        except (OSError, ValueError) as exc:
+            excluded[name] = [str(exc)]
+    counts = {len(xyz) for xyz, _, _ in inputs.values()}
+    required = case.layout_opt.n_heliostats
+    for name, (xyz, ids, note) in inputs.items():
+        check = validate_layout(case, xyz, required, design_spacing(case), ids)
+        if check["status"] != "ok":
+            excluded[name] = check["violations"]
+            continue
+        if required is None and len(counts) > 1:
+            excluded[name] = ["比较需要等镜数，请指定目标镜数"]
+            continue
         notes[name] = note
         values[name] = evaluate_layout_value(case, xyz, sset, name, ids=ids, settings=settings, lam_layout=lam,
                                              progress=progress, cancel=cancel, tags={"note": note})
-    counts = {v.n for v in values.values()}
+    refine_competing_plans(case, values, sset, progress, cancel)
     ranking = compare_values(list(values.values()), lam, reference="initial" if "initial" in values else None)
     files.update(export_values(values, out / "values", ranking))
-    summary = {"status": "done" if all(v.totals()["complete"] for v in values.values()) else "incomplete",
+    status = "constraint_violation" if excluded else "done"
+    if any(not v.totals()["complete"] for v in values.values()):
+        status = "incomplete"
+    summary = {"status": status, "excluded_layouts": excluded, "input_layouts": archived_layouts,
+               "comparison_status": ranking.iloc[0]["comparison_status"] if len(ranking) else "no_valid_layout",
                "equal_heliostat_count": len(counts) == 1, "lambda_aps": settings.lam_aps, "lambda_layout": lam,
                "scenario_set": {k: v for k, v in sset.record().items() if k != "map_records"},
                "inner_settings": settings.record(), "ranking": ranking.to_dict("records"),
@@ -1118,18 +1176,34 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
             "scenario_set": sset}
 
 
+def replay_layout_value(folder, base, progress=None, cancel=None):
+    """Re-solve a saved comparison using only inputs and layouts beneath the exported run folder."""
+    folder = Path(folder).resolve()
+    summary = json.loads((folder / "layout_value.json").read_text(encoding="utf-8"))
+    case = load_case(folder / "inputs_case.yaml")
+    layouts = summary.get("input_layouts")
+    if layouts:
+        layouts = {name: ("initial" if path == "initial" else folder / path) for name, path in layouts.items()}
+    else:  # Historical comparisons store their positions with the per-scenario results.
+        layouts = {r["name"]: folder / "values" / r["name"].replace("+", "_plus_") / "layout.csv"
+                   for r in summary["ranking"]}
+    return task_layout_value(case, base, layouts, folder / "scenario_set", summary["lambda_layout"], progress, cancel)
+
+
 def task_rescore(folder: str | Path, lam_layout: float) -> dict:
     """Recompute every layout's V for another outer weight from exported scenario tables only (no solver)."""
     from .layout_value import recompute_from_csv
 
     folder = Path(folder)
+    if not 0 <= lam_layout < float("inf"):
+        raise ValueError("The uniformity weight must be finite and nonnegative")
     rows = []
     for csv in sorted(folder.rglob("scenario_values.csv")):
         r = recompute_from_csv(csv, lam_layout)
         rows.append({"layout": csv.parent.name, **r, "file": str(csv)})
     df = pd.DataFrame(rows).sort_values("value_mwh", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
     if len(df):
-        df["rank"] = np.arange(1, len(df) + 1)
+        df["rank"] = df["value_mwh"].where(df["complete"]).rank(ascending=False, method="min")
     return {"summary": {"lambda_layout": lam_layout, "layouts": df.to_dict("records")}, "files": {}, "run_dir": folder}
 
 

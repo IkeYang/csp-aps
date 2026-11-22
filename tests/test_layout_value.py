@@ -374,6 +374,7 @@ def test_formal_ranking_cross_checks_cloud_maps():
     case = _case(map_model="clouds", cloud_maps=2, cloud_n=2, n_scenarios=2)
     case.layout_opt.n_heliostats = 30
     case.layout_opt.formal_swap_rounds = 0
+    case.layout_opt.formal_position_trials = 0  # compare the two identical layouts without generating new ones
     base = baseline_layout(case, 30)[0]
     # the search layout equals the initial field: equal V, the stable sort ranks the search layout first
     evals = [LayoutEval({"x": 1}, 30, base.copy(), 0.0)]

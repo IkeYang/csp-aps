@@ -244,7 +244,11 @@ def check_scenario_table(case, df: pd.DataFrame, maps: dict[str, DNIMap], map_fi
         return [{"scenario": None, "field": ", ".join(missing),
                  "message": f"工况表缺少列：{', '.join(missing)}。需要 scenario_id、太阳方向（elevation_deg、azimuth_deg，°）"
                             "或当地时间 time、hours（代表小时，h）、dni_w_m2（W/m²）、map_id。"}]
+    if df.empty:
+        return [{"scenario": None, "field": "hours", "message": "工况表为空。"}]
     ids = df["scenario_id"].astype(str)
+    if df["scenario_id"].isna().any() or ids.str.strip().eq("").any():
+        out.append({"scenario": None, "field": "scenario_id", "message": "工况编号不能为空。"})
     for sid in ids[ids.duplicated()].unique():
         out.append({"scenario": sid, "field": "scenario_id", "message": f"工况名 {sid} 重复出现，请让每个工况名唯一。"})
     numeric = [("hours", "h", True), ("dni_w_m2", "W/m²", True)]
@@ -252,7 +256,7 @@ def check_scenario_table(case, df: pd.DataFrame, maps: dict[str, DNIMap], map_fi
         numeric += [("elevation_deg", "°", False), ("azimuth_deg", "°", False)]
     for col, unit, nonneg in numeric:
         num = pd.to_numeric(df[col], errors="coerce")
-        bad = num.isna() | (num < 0 if nonneg else False)
+        bad = ~np.isfinite(num) | (num < 0 if nonneg else False)
         for i in np.flatnonzero(bad.to_numpy()):
             out.append({"scenario": ids.iloc[i], "field": col,
                         "message": f"工况 {ids.iloc[i]} 的 {col} 是 {df[col].iloc[i]}。请输入{'非负' if nonneg else ''}数，单位 {unit}。"})
@@ -294,6 +298,38 @@ def load_table(case, path, maps: dict[str, DNIMap] | None = None) -> ScenarioSet
     examples = list(df["example_time"].fillna("")) if "example_time" in df else (
         list(df["time"].fillna("")) if "time" in df else None)
     return ScenarioSet(samples, maps, {"source": f"scenario table {Path(path).name}"}, examples)
+
+
+def validation_scenarios(case, train, n_scenarios, hourly, seed_offset=0):
+    """Identify genuinely new operating states, even if a table relabels or reweights them."""
+    other = case.copy()
+    other.scenarios.seed += seed_offset
+    if other.scenarios.validation_file:
+        validation = load_table(other, other.resolve(other.scenarios.validation_file))
+        source = "separate_table"
+    elif other.scenarios.source == "file":
+        validation, source = train, "same_table"
+    else:
+        validation = build_scenarios(other, n_scenarios, hourly)
+        source = "same_weather_year"
+
+    def state_keys(sset):
+        keys = []
+        s = sset.samples
+        for i in range(len(sset)):
+            m = s.map_of(i)
+            dni = m.values * (s.dni[i] if m.unit == "factor" else 1.0)
+            h = hashlib.sha256()
+            for part in (m.x, m.y, dni):
+                h.update(np.round(part, 6).astype("<f8").tobytes())
+            keys.append((round(s.elevation[i], 6), round(s.azimuth[i], 6), h.digest()))
+        return keys
+
+    known = set(state_keys(train))
+    overlap = sum(k in known for k in state_keys(validation))
+    info = {"n": len(validation), "fingerprint": validation.fingerprint(), "seed": other.scenarios.seed,
+            "source": source, "shared_states": overlap, "new_states": len(validation) - overlap}
+    return validation, info
 
 
 def load_folder(folder) -> ScenarioSet:

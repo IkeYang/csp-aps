@@ -266,6 +266,8 @@ class LayoutOpt:
     ranking: str = "aps_value"  # "aps_value" (per-scenario APS on the scenario set) | "legacy" (0.4 review)
     aps_weight: float | None = None  # inner (operating) lambda_APS of P - lambda_APS U; None = uniformity_weight (one lambda)
     baseline: str = "initial"  # "initial": the case's own field (N heliostats nearest the tower) is ranked too | "none"
+    formal_position_trials: int = 4  # feasible XY proposals evaluated with full per-scenario APS
+    ranking_refine_states: int = 2  # highest uncertainty states per competing layout; 0 disables
     formal_swap_rounds: int = 1  # swap rounds on the winner, accepted only if V(L) increases
     inner_joint_trials: int = 2  # joint-pose neighbourhood trials per scenario solve
     inner_certify_rounds: int = 0  # relaxation roundings + dual bound per scenario (0 = off; fixed iterations)
@@ -288,6 +290,7 @@ class ScenarioSpec:
 
     source: str = "weather"  # "weather": representative states of the weather year | "file": scenario table CSV
     file: str | None = None  # scenario table: scenario_id,elevation_deg,azimuth_deg,hours,dni_w_m2,map_id[,time]
+    validation_file: str | None = None  # separate scenario table, using the case's map library
     n_scenarios: int = 20  # representative scenarios generated from the weather year
     dni_bands: int = 1  # split each representative sun position into DNI bands
     map_model: str = "uniform"  # uniform | half_swap | gradient | clouds | file
@@ -425,7 +428,7 @@ def _validate(case: Case) -> None:
         raise ValueError("layout_opt.min_spacing_factor must be positive")
     if u.mode not in ("cv_limit", "weighted"):
         raise ValueError("uniformity.mode must be cv_limit|weighted")
-    if u.weight < 0:
+    if not 0 <= u.weight < math.inf:
         raise ValueError("uniformity.weight must be >= 0")
     if u.panels is not None and any(not 1 <= p <= rec.n_panels for p in u.panels):
         raise ValueError(f"uniformity.panels must be panel numbers 1..{rec.n_panels}")
@@ -439,7 +442,7 @@ def _validate(case: Case) -> None:
     for name in ("search_sampling", "review_sampling"):
         if getattr(case.layout_opt, name) not in ("sun_bins", "sun_grid", "hourly"):
             raise ValueError(f"layout_opt.{name} must be sun_bins|sun_grid|hourly")
-    if case.layout_opt.uniformity_weight < 0:
+    if not 0 <= case.layout_opt.uniformity_weight < math.inf:
         raise ValueError("layout_opt.uniformity_weight must be >= 0")
     if case.layout_opt.uniformity_metric not in ("circumferential", "surface"):
         raise ValueError("layout_opt.uniformity_metric must be circumferential|surface")
@@ -454,10 +457,13 @@ def _validate(case: Case) -> None:
         raise ValueError("layout_opt.ranking must be aps_value|legacy")
     if lo.baseline not in ("initial", "none"):
         raise ValueError("layout_opt.baseline must be initial|none")
-    if lo.aps_weight is not None and lo.aps_weight < 0:
+    if lo.aps_weight is not None and not 0 <= lo.aps_weight < math.inf:
         raise ValueError("layout_opt.aps_weight must be >= 0")
-    if min(lo.formal_swap_rounds, lo.inner_joint_trials, lo.inner_certify_rounds, lo.inner_certify_iters,
-           lo.dense_check_scenarios) < 0:
+    if lo.n_heliostats is not None and (not isinstance(lo.n_heliostats, int) or lo.n_heliostats <= 0):
+        raise ValueError("layout_opt.n_heliostats must be a positive integer")
+    budgets = (lo.formal_position_trials, lo.ranking_refine_states, lo.formal_swap_rounds, lo.inner_joint_trials,
+               lo.inner_certify_rounds, lo.inner_certify_iters, lo.dense_check_scenarios)
+    if any(not isinstance(v, int) or v < 0 for v in budgets):
         raise ValueError("layout_opt formal-ranking budgets must be nonnegative")
     sc = case.scenarios
     if sc.source not in ("weather", "file"):

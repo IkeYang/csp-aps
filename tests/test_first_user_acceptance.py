@@ -122,6 +122,7 @@ def test_task4_preference_change_and_where_the_basis_is(monkeypatch, tmp_path):
     at = _app(monkeypatch, tmp_path)
     _run_layout_example(at)
     before = at.session_state["res_lv"]
+    assert not any("需要重新计算" in m.value for m in at.markdown)
     basis = next(f for f in _frames(at) if "项目" in f.columns and "本次取值" in f.columns)
     items = set(basis["项目"])
     assert {"偏好 λ", "安全裕度", "数据来源", "DNI 地图", "候选瞄准点（求解范围）", "工况集指纹 / 设置指纹"} <= items

@@ -232,12 +232,14 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     n = fld.n
     dni_v = np.broadcast_to(np.asarray(dni, dtype=float), (n,)).copy()
     zeros = np.zeros(n)
+    if not np.isfinite(dni_v).all() or np.any(dni_v < 0):
+        raise ValueError("DNI must be finite and nonnegative")
     if elevation <= 0 or n == 0 or not np.any(dni_v > 0):
         return PlanResult("no_sun", 0.0, 0.0, 0.0, 0.0, None, None, 0.0, 0.0, 0.0, 0.0, "no_sun", True, 0.0, 0.0,
                           "ok", 0, n, dni_v, zeros.copy(), zeros.copy(), np.zeros(n, bool), zeros.copy(),
                           np.zeros(grid.shape) if keep_flux else None, _time.perf_counter() - t0)
     prob = build_problem(c, fld, elevation, azimuth, dni_v, dni_constraint, grid=grid)
-    res = solve(prob, settings.method, c.aps)
+    res = solve(prob, settings.method, c.aps, init=warm)
     solver_info = {k: res.info[k] for k in ("subfield_serial_s", "subfield_parallel_s", "milp_status",
                                              "final_repair_rounds") if k in res.info}
     initial = res.choice.copy()
@@ -321,6 +323,7 @@ class ScenarioRecord:
             "hotspot_azimuth_deg": p.info.get("hotspot_azimuth_deg"), "hotspot_z_m": p.info.get("hotspot_z_m"),
             "dni_map_digest": self.map_digest, "actual_hours": self.actual_hours,
             "solve_time_s": round(p.solve_time_s, 3),
+            "additional_joint_trials": p.info.get("additional_joint_trials", 0),
         }
 
 
@@ -397,7 +400,7 @@ class LayoutValue:
             "inner_gap_annual": (1.0 - inner_j / inner_ub) if inner_ub > 0 else None,
             # with equal weights V is the hour sum of J_s, so [V, sum h UB_s] brackets the layout's best value
             "value_interval_mwh": ([inner_j, inner_ub] if abs(lam - self.lam_aps) < 1e-12 and np.isfinite(inner_ub)
-                                   else None),
+                                   and not status.get("no_feasible_found") else None),
             "max_inner_gap": float(t["inner_gap"].dropna().max()) if len(t) and t["inner_gap"].notna().any() else None,
             "circ_penalty_mwh": e_circ, "cv_2d_power_weighted": cv_w,
             "scenario_fingerprint": self.scenario_fingerprint, "settings_digest": self.settings.digest(),
@@ -441,7 +444,7 @@ class LayoutValue:
         t.to_csv(files["scenario_csv"], index=False)
         files["layout_csv"] = folder / "layout.csv"
         pd.DataFrame({"id": self.ids, "x": self.xyz[:, 0], "y": self.xyz[:, 1], "z": self.xyz[:, 2]}).to_csv(
-            files["layout_csv"], index=False, float_format="%.6f")
+            files["layout_csv"], index=False, float_format="%.17g")
         files["summary_json"] = folder / "layout_value.json"
         summary = {**self.totals(), "settings": self.settings.record(), "status_rules": STATUS_RULES,
                    "formula": "V = sum_s hours * (p_abs_mw - lambda_layout * u_mw) over rows with counts_in_value"}
@@ -562,9 +565,13 @@ def compare_values(values: list[LayoutValue], lam_l: float | None = None, refere
         return pd.DataFrame()
     fps = {v.scenario_fingerprint for v in values}
     digs = {v.settings.digest() for v in values}
+    if len({v.n for v in values}) > 1:
+        raise ValueError("比较布局的镜数必须相同")
     if len(fps) > 1 or len(digs) > 1:
         raise ValueError("layouts must be compared on the same scenario set and inner settings")
     lam = values[0].lam_layout if lam_l is None else float(lam_l)
+    if not 0 <= lam < math.inf:
+        raise ValueError("The uniformity weight must be finite and nonnegative")
     rows = [v.totals(lam) for v in values]
     df = pd.DataFrame(rows)
     df["rankable"] = df["complete"]
@@ -587,7 +594,70 @@ def compare_values(values: list[LayoutValue], lam_l: float | None = None, refere
         return bool(iv[1] >= lead_lo)
 
     df["interval_overlaps_leader"] = df.apply(overlap, axis=1)
+    intervals = df["value_interval_mwh"].tolist()
+    if not df["complete"].all():
+        decision = "incomplete"
+    elif len(df) == 1:
+        decision = "single_layout"
+    elif any(iv is None for iv in intervals) or any(
+            r.plan.status == "no_feasible_found" for v in values for r in v.records):
+        decision = "feasible_scores_only"
+    elif all(abs(iv[1] - iv[0]) < 1e-10 for iv in intervals) and abs(intervals[1][0] - intervals[0][0]) < 1e-10:
+        decision = "certified_tie"
+    elif not np.isfinite(intervals).all():
+        decision = "feasible_scores_only"
+    elif intervals[0][0] > max(iv[1] for iv in intervals[1:]) + 1e-10:
+        decision = "certified_leader"
+    else:
+        decision = "overlapping_bounds"
+    df["comparison_status"] = decision
     return df
+
+
+def refine_competing_plans(case, values, sset, progress=None, cancel=None):
+    """Spend the same extra state budget per contender, ordered by hours times unresolved power."""
+    budget = case.layout_opt.ranking_refine_states
+    if not budget or len(values) < 2:
+        return
+    rank = compare_values(list(values.values()))
+    if rank.iloc[0]["comparison_status"] != "overlapping_bounds":
+        return
+    lead = rank.iloc[0]["value_mwh"]
+    for value in values.values():
+        interval = value.totals()["value_interval_mwh"]
+        if interval is None or interval[1] < lead:
+            continue
+        candidates = [r for r in value.records if r.plan.upper_bound_w is not None and
+                      not r.plan.proven_optimal and r.hours > 0 and
+                      r.plan.status in ("feasible", "feasible_shutdown", "no_feasible_found")]
+        candidates.sort(key=lambda r: r.hours * (r.plan.upper_bound_w - r.plan.objective_w), reverse=True)
+        field = Field(value.xyz, value.ids)
+        settings = replace(value.settings, joint_trials=max(8, 2 * value.settings.joint_trials),
+                           certify_rounds=max(2, value.settings.certify_rounds))
+        for row in candidates[:budget]:
+            if cancel and cancel():
+                return
+            if progress:
+                progress(f"APS refinement: {value.name}, {row.scenario_id}")
+            old = row.plan
+            new = solve_instant(case, field, row.elevation_deg, row.azimuth_deg, old.dni, settings,
+                                keep_flux=old.flux is not None, warm=old.choice)
+            value.runtime_s += new.solve_time_s
+            # Both joint bounds cover the identical feasible set. Retain the strongest of each result.
+            feasible = ("feasible", "feasible_shutdown")
+            chosen = new if new.status in feasible and (old.status not in feasible or
+                                                       new.objective_w >= old.objective_w) else old
+            bounds = [ub for ub in (old.upper_bound_w, new.upper_bound_w) if ub is not None]
+            upper = min(bounds)
+            if chosen.status in feasible and upper < chosen.objective_w - 1e-6:
+                raise ArithmeticError("Refined joint bound below the incumbent")
+            chosen.upper_bound_w = upper
+            if chosen.status in feasible:
+                chosen.gap = max(0., upper - chosen.objective_w) / max(abs(upper), 1e-12)
+            if new.upper_bound_w != old.upper_bound_w:
+                chosen.bound_method = "best_joint_bound_across_runs"
+            chosen.info["additional_joint_trials"] = settings.joint_trials
+            row.plan = chosen
 
 
 def rescore(values: list[LayoutValue], lam_l: float, reference: str | None = None) -> pd.DataFrame:
@@ -600,18 +670,24 @@ def rescore(values: list[LayoutValue], lam_l: float, reference: str | None = Non
 def enumerate_layouts(case: Case, candidates_xyz: np.ndarray, n_select: int, sset,
                       settings: InnerSettings | None = None, lam_layout: float | None = None) -> pd.DataFrame:
     """V(L) of every N-subset of a small candidate set (brute force of the outer layer)."""
+    from .layout_opt import design_spacing, validate_layout
+
     settings = settings or inner_settings(case)
     rows = []
     cand = np.asarray(candidates_xyz, dtype=float).reshape(-1, 3)
     for combo in combinations(range(len(cand)), n_select):
-        val = evaluate_layout_value(case, cand[list(combo)], sset, name=str(combo), settings=settings,
+        xyz = cand[list(combo)]
+        if validate_layout(case, xyz, n_select, design_spacing(case))["status"] != "ok":
+            continue
+        val = evaluate_layout_value(case, xyz, sset, name=str(combo), settings=settings,
                                     lam_layout=lam_layout, workers=1, keep_flux=False)
         t = val.totals()
         rows.append({"subset": combo, "value_mwh": t["value_mwh"], "energy_mwh": t["energy_mwh"],
                      "penalty_mwh": t["penalty_mwh"], "proven_optimal_all": all(r.plan.proven_optimal or
                                                                                  r.plan.status == "no_sun"
                                                                                  for r in val.records)})
-    return pd.DataFrame(rows).sort_values("value_mwh", ascending=False).reset_index(drop=True)
+    columns = ["subset", "value_mwh", "energy_mwh", "penalty_mwh", "proven_optimal_all"]
+    return pd.DataFrame(rows, columns=columns).sort_values("value_mwh", ascending=False).reset_index(drop=True)
 
 
 def displacement(baseline_xyz: np.ndarray, layout_xyz: np.ndarray) -> dict:

@@ -608,7 +608,7 @@ def lone_heliostat_energy(case, xy: np.ndarray, samples, chunk: int = 4000) -> n
         e = np.zeros(len(p))
         spatial = getattr(samples, "spatial", False)
         for k, (el, sa, dni, w) in enumerate(zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h)):
-            if el <= 0 or dni <= 0 or w <= 0:
+            if el <= 0 or w <= 0 or (not spatial and dni <= 0):
                 continue
             if spatial:  # the DNI map of the state, read at each position
                 dni = samples.dni_at(k, p)
@@ -671,7 +671,7 @@ def cell_energy_upper_bound(case, centers_xy: np.ndarray, half_m: float, samples
     const = hel.area * hel.reflectivity * hel.cleanliness
     states = [(k, float(el), float(sa), float(dni) * float(w)) for k, (el, sa, dni, w) in
               enumerate(zip(samples.elevation, samples.azimuth, samples.dni, samples.weight_h))
-              if el > 0 and dni > 0 and w > 0]
+              if el > 0 and w > 0 and (samples.spatial or dni > 0)]
     spatial = getattr(samples, "spatial", False)
     for start in range(0, len(xy), chunk):
         p = xy[start:start + chunk]

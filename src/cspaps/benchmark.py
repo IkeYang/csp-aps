@@ -9,7 +9,7 @@ solved by
   greedy_rounding  greedy + relaxation-guided rounding and a dual bound (iteration budget)
 
 Every plan is verified on the fine grid; only "feasible" plans count. The common reference per state is the
-lowest valid upper bound any method produced (all bounds hold for the same candidate model), so every method
+lowest joint-pose upper bound any method produced. Fixed-response duals are diagnostic only. Every method
 is measured against the same number.
 
 Outer (layout): the same site, N, scenario set, weights and wall-time budget for
@@ -82,7 +82,7 @@ def inner_benchmark(case: Case, fld: Field, states: list[dict], methods=INNER_ME
                 p = solve_instant(c, fld, st["elevation"], st["azimuth"], st["dni"], settings, keep_flux=False)
             except ValueError as exc:  # e.g. MILP too large for the candidate model
                 rows.append({"state": st["label"], "method": m, "status": "not_run", "note": str(exc)[:160],
-                             "time_s": _time.perf_counter() - t0})
+                             "time_s": _time.perf_counter() - t0, "hours": st["hours"], "within_budget": False})
                 continue
             t = _time.perf_counter() - t0
             info = p.info
@@ -100,11 +100,17 @@ def inner_benchmark(case: Case, fld: Field, states: list[dict], methods=INNER_ME
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # common reference: the lowest valid bound of the state (dual bounds included)
-    ub_cols = [col for col in ("upper_bound_mw", "dual_bound_mw") if col in df]
-    ub = df[ub_cols].min(axis=1, skipna=True)
-    df["state_best_bound_mw"] = ub.groupby(df["state"]).transform("min")
-    counts = df["status"].eq("feasible")
+    # Fixed-response duals price a different shading geometry. Only joint-pose bounds are comparable.
+    for col in ("upper_bound_mw", "objective_mw", "within_budget"):
+        if col not in df:
+            df[col] = np.nan
+    df["state_best_bound_mw"] = df.groupby("state")["upper_bound_mw"].transform("min")
+    counts = df["status"].isin(("feasible", "feasible_shutdown"))
+    incumbent = df["objective_mw"].where(counts).groupby(df["state"]).transform("max")
+    invalid = df["state_best_bound_mw"] < incumbent - 1e-9 * incumbent.abs().clip(lower=1)
+    if invalid.any():
+        raise ArithmeticError(f"Joint-pose bound below a verified plan in {list(df.loc[invalid, 'state'].unique())}")
+    df["state_best_bound_mw"] = np.maximum(df["state_best_bound_mw"], incumbent.fillna(-np.inf))
     df["gap_to_best_bound"] = np.where(counts, (df["state_best_bound_mw"] - df["objective_mw"])
                                        / df["state_best_bound_mw"].abs().clip(lower=1e-12), np.nan)
     best = df["objective_mw"].where(counts).groupby(df["state"]).transform("max")
@@ -156,8 +162,9 @@ def surrogate_score(case: Case, xyz: np.ndarray, samples) -> float:
 
 
 def _spacing(case: Case) -> float:
-    spec = case.layout_opt
-    return case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
+    from .layout_opt import design_spacing
+
+    return design_spacing(case)
 
 
 def _potential_gradient(pmap):
@@ -294,19 +301,18 @@ def outer_benchmark(case: Case, methods=OUTER_METHODS, seeds=(1, 2), budget_s: f
     from .certify import potential_map
     from .layout_opt import make_samples, validate_layout
     from .layout_value import evaluate_layout_value, inner_settings
-    from .scenarios import attach_regimes, build_scenarios
+    from .scenarios import attach_regimes, build_scenarios, validation_scenarios
 
     say = progress or (lambda m: None)
     spec = case.layout_opt
     if not spec.n_heliostats:
         raise ValueError("layout_opt.n_heliostats must be set for the layout benchmark")
-    hourly = attach_regimes(case, sun.hourly_samples(case))
+    hourly = (build_scenarios(case).samples if case.scenarios.source == "file"
+              else attach_regimes(case, sun.hourly_samples(case)))
     samples = make_samples(case, spec.search_sampling, spec.n_sun_bins, 1, hourly, spec.seed)
     pmap = potential_map(case, samples)
     train = build_scenarios(case, hourly=hourly)
-    other = case.copy()
-    other.scenarios.seed += int(held_out_seed_offset)
-    held = build_scenarios(other, int(case.scenarios.n_scenarios) + int(held_out_extra), hourly)
+    held, validation = validation_scenarios(case, train, len(train) + held_out_extra, hourly, held_out_seed_offset)
     settings = inner_settings(case)
     spacing = _spacing(case)
     rows = []
@@ -324,8 +330,11 @@ def outer_benchmark(case: Case, methods=OUTER_METHODS, seeds=(1, 2), budget_s: f
             val = validate_layout(case, r["xyz"], spec.n_heliostats, spacing)
             say(f"layout benchmark: V(L) of {name} on {len(train)} + {len(held)} scenarios")
             v_train = evaluate_layout_value(case, r["xyz"], train, name, settings=settings, keep_flux=False)
-            v_held = evaluate_layout_value(other, r["xyz"], held, name, settings=settings, keep_flux=False)
-            tt, th = v_train.totals(), v_held.totals()
+            tt = v_train.totals()
+            if validation["new_states"]:
+                th = evaluate_layout_value(case, r["xyz"], held, name, settings=settings, keep_flux=False).totals()
+            else:
+                th = {"value_mwh": np.nan, "coverage": np.nan}
             layouts[name] = r["xyz"]
             rows.append({"name": name, "method": m, "seed": sd, "time_s": r["time_s"], "evaluations": r["evaluations"],
                          "start": r["start"], "surrogate_mwh": r["surrogate_mwh"], "site_status": val["status"],
@@ -336,8 +345,8 @@ def outer_benchmark(case: Case, methods=OUTER_METHODS, seeds=(1, 2), budget_s: f
                          "held_out_value_mwh": th["value_mwh"], "held_out_coverage": th.get("coverage")})
     df = pd.DataFrame(rows)
     if not df.empty:
-        df["rank_train"] = df["value_mwh"].rank(ascending=False, method="min").astype(int)
-        df["rank_held_out"] = df["held_out_value_mwh"].rank(ascending=False, method="min").astype(int)
+        df["rank_train"] = df["value_mwh"].where(df.site_status == "ok").rank(ascending=False, method="min")
+        df["rank_held_out"] = df["held_out_value_mwh"].where(df.site_status == "ok").rank(ascending=False, method="min")
     summary = (df.groupby("method", sort=False)
                .agg(runs=("name", "size"), value_mean_mwh=("value_mwh", "mean"), value_std_mwh=("value_mwh", "std"),
                     held_out_mean_mwh=("held_out_value_mwh", "mean"), held_out_std_mwh=("held_out_value_mwh", "std"),
@@ -348,5 +357,5 @@ def outer_benchmark(case: Case, methods=OUTER_METHODS, seeds=(1, 2), budget_s: f
         summary["方法"] = summary["method"].map(OUTER_ZH).fillna(summary["method"])
     return {"runs": df, "summary": summary, "layouts": layouts, "budget_s": budget_s, "seeds": list(seeds),
             "train": {"n": len(train), "fingerprint": train.fingerprint()},
-            "held_out": {"n": len(held), "fingerprint": held.fingerprint(), "seed": other.scenarios.seed},
+            "held_out": validation,
             "settings_digest": settings.digest()}
