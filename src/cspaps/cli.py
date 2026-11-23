@@ -56,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--forecast-dni-map", default=None, help="CSV x,y,dni: highest DNI expected before the next update")
         sp.add_argument("--prev-aims", default=None, help="aims CSV of the last executed plan (matched by id)")
         if name == "aps":
+            sp.add_argument("--mode", choices=["fast", "standard", "deep"], default=None,
+                            help="depth: fast (one greedy pass) | standard (joint poses + rounding + gap) | "
+                                 "deep (denser candidates, more rounds); see `cspaps advise`")
             sp.add_argument("--no-certify", action="store_true",
                             help="skip the optimality certificate (upper bound and relaxation rounding)")
             sp.add_argument("--weight", type=float, default=None,
@@ -78,6 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--method", choices=["sun_bins", "sun_grid", "representative_days", "hourly"], default=None)
     sp.add_argument("--aiming", choices=["center", "kfactor", "greedy", "milp", "subfield"], default=None)
     sp = add("optimize-layout", "optimise the field layout for constrained annual energy")
+    sp.add_argument("--mode", choices=["fast", "standard", "deep"], default=None,
+                    help="depth of the search and the formal ranking (see `cspaps advise --task search`)")
     sp.add_argument("--uniformity-weight", type=float, default=None,
                     help="lambda_L: weight of the circumferential receiver non-uniformity (0 = energy only)")
     sp = add("layout-tradeoff", "annual energy vs circumferential uniformity of the layout over lambda_L")
@@ -89,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scenarios", default=None, help="saved scenario-set folder (default: build from the case)")
     sp.add_argument("--layout", default=None, help="layout CSV id,x,y[,z] or 'initial' (default: the case field)")
     sp = add("layout-value", "rank layouts by V(L) = sum_s h_s (P_s - lambda_L U_s) with per-scenario APS")
+    sp.add_argument("--mode", choices=["fast", "standard", "deep"], default=None,
+                    help="depth of every scenario solve and of the scenario set (see `cspaps advise --task compare`)")
     sp.add_argument("--layouts", nargs="*", default=None, help="layout CSV files (and/or 'initial')")
     sp.add_argument("--scenarios", default=None, help="saved scenario-set folder (default: build from the case)")
     sp.add_argument("--lambda-layout", type=float, default=None, help="outer weight lambda_L (default layout_opt)")
@@ -108,6 +115,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("replay-layout", help="re-solve a saved layout comparison with its frozen inputs")
     sp.add_argument("folder")
     sp.add_argument("--out", default="results")
+    sp = add("advise", "which algorithm depth fits the field size and the time budget (fast / standard / deep)")
+    sp.add_argument("--task", choices=["aim", "compare", "search"], default="aim")
+    sp.add_argument("--budget-min", type=float, default=15.0, help="time budget per run, minutes")
+    sp.add_argument("--workers", type=int, default=None, help="parallel workers (default: all cores but one)")
+    sp.add_argument("--heliostats", type=int, default=None, help="what-if: number of heliostats instead of the case's")
+    sp = add("calibrate", "measure the time model of the algorithm depths on this computer")
+    sp.add_argument("--sizes", type=int, nargs="+", default=[400, 1200], help="field sizes to time (heliostats)")
     sp = sub.add_parser("rescore", help="recompute V(L) from exported scenario_values.csv files for another lambda_L")
     sp.add_argument("folder")
     sp.add_argument("--lambda-layout", type=float, required=True)
@@ -182,6 +196,27 @@ def main(argv: list[str] | None = None) -> int:
         wf.engine_service(case, sys.stdin, lambda s: (sys.stdout.write(s + "\n"), sys.stdout.flush()))
         return 0
     out = args.out
+    if getattr(args, "mode", None):
+        from .advisor import apply_mode
+
+        from .advisor import _field_size
+
+        task = {"aps": "aim", "layout-value": "compare", "optimize-layout": "search"}[args.command]
+        case = apply_mode(case, task, args.mode, n=_field_size(case, task))
+        _progress(f"depth: {args.mode} ({task})")
+    if args.command == "advise":
+        from .advisor import recommend
+
+        rec = recommend(case, args.task, 60.0 * args.budget_min, workers=args.workers, n=args.heliostats)
+        print(json.dumps(rec, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.command == "calibrate":
+        from .advisor import calibrate, calibration_path
+
+        cal = calibrate(case, sizes=args.sizes, progress=_progress)
+        print(json.dumps({"written": str(calibration_path()), "aim": cal.aim, "inner": cal.inner,
+                          "prescreen": cal.prescreen, "measured": cal.measured}, indent=2, ensure_ascii=False))
+        return 0
     if args.command == "layout":
         res = wf.task_layout(case, out)
     elif args.command in ("snapshot", "aps"):

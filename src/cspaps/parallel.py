@@ -36,7 +36,27 @@ def start_method() -> str:
     return "fork" if "fork" in methods else "spawn"
 
 
-def pool(workers: int):
-    if threading.current_thread() is not threading.main_thread():
+def _picklable(obj) -> bool:
+    import pickle
+
+    try:
+        pickle.dumps(obj)
+        return True
+    except Exception:  # noqa: BLE001 - PicklingError, AttributeError, TypeError ...
+        return False
+
+
+def pool(workers: int, probe=None):
+    """A pool of ``workers``.
+
+    Main thread: processes. Background thread (GUI jobs): threads by default, so that objects of
+    hot-reloaded modules never cross a pickle boundary; with ``probe`` (the function and a typical
+    argument of the work) processes are used when the probe pickles, so a long GUI job can use every
+    core. ``CSPAPS_POOL=thread`` / ``process`` forces one kind."""
+    forced = os.environ.get("CSPAPS_POOL", "").strip().lower()
+    if forced == "thread":
         return ThreadPool(workers)
+    if threading.current_thread() is not threading.main_thread():
+        if forced != "process" and (probe is None or not _picklable(probe)):
+            return ThreadPool(workers)
     return mp.get_context(start_method()).Pool(workers)

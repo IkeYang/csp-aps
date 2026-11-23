@@ -563,7 +563,7 @@ def optimize_layout(
             return True  # stops differential evolution
 
     nw = n_workers(spec.workers)
-    pl = pool(nw) if nw > 1 else None
+    pl = pool(nw, probe=obj) if nw > 1 else None
     stage = {"name": "global"}
 
     def mapper(f, xs):

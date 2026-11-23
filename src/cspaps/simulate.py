@@ -458,10 +458,10 @@ def annual(
     results: list = [None] * n_s
     if nw > 1 and n_s > 1:
         chunks = [items[k::nw] for k in range(nw)]
-        with pool(nw) as p:
+        tasks = [(case, fld.xyz, fld.ids, c, aiming, with_flux, shading_points, blockers, check_flux) for c in chunks]
+        with pool(nw, probe=(_annual_chunk, tasks[0])) as p:
             done = 0
-            for out in p.imap_unordered(_annual_chunk, [(case, fld.xyz, fld.ids, c, aiming, with_flux, shading_points,
-                                                         blockers, check_flux) for c in chunks]):
+            for out in p.imap_unordered(_annual_chunk, tasks):
                 for i, powers, row in out:
                     results[i] = (powers, row)
                 done += len(out)
