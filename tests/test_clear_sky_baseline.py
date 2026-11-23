@@ -37,8 +37,11 @@ def _ring(n, r, z=4.0):
 def test_default_design_baseline_is_clear_sky_days():
     d = small_case_dict()
     d.pop("scenarios")
+    d["layout_opt"].pop("control_variate")
     case = case_from_dict(d, base_dir=ROOT)
     assert case.scenarios.source == "clear_sky_days" and case.scenarios.n_days == 20
+    assert case.layout_opt.control_variate and case.layout_opt.swap_pricing == "dual"
+    assert case.layout_opt.search_method == "de"  # DE stays the default search (README 0.9.0 benchmark)
     assert case.scenarios.clear_sky_model == "ineichen"
 
 

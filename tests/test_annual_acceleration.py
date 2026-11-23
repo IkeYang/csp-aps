@@ -73,6 +73,7 @@ def test_hour_assignment_partitions_the_year_and_round_trips(tmp_path):
 
 def test_control_variate_factors_follow_the_cheap_model():
     case = _case(n_scenarios=4)
+    case.layout_opt.control_variate = True
     sset = build_scenarios(case)
     xyz = _ring(24, 70.0)
     v = evaluate_layout_value(case, xyz, sset, "A", workers=1, keep_flux=False)
