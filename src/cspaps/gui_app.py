@@ -10,6 +10,7 @@ thread with progress and a cancel button; every run is saved in its own folder.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import json
@@ -1304,6 +1305,10 @@ def _compare_workspace(case) -> None:
     c5, err = _case()
     with _card("cmp_run"):
         _section(4, "确认要算什么", "开始前核对规模与口径；计算中可以取消，已完成的工况会保留。")
+        depth = "custom"
+        if c5 is not None and not blockers:
+            depth = _depth_selector(c5, "compare", n_layouts=max(2, len(layouts)))
+            c5, _ = _case()
         if c5 is not None and not blockers:
             try:
                 tbl = _scenario_table(c5.to_yaml(), st.session_state["base_dir"])
@@ -1317,6 +1322,7 @@ def _compare_workspace(case) -> None:
             _run_summary([("镜数", " / ".join(f"{k} {len(v[0])} 面" for k, v in layouts.items())),
                           ("工况数", f"{n_s} 个"), ("合计代表小时（实际）", f"{hrs:,.0f} h"), ("数据来源", src),
                           ("考核区域", region), ("安全裕度", f"{c5.aps.safety_margin:.0%}"),
+                          ("计算深度", _depth_label(depth)),
                           ("偏好 λ", f"{c5.layout_opt.uniformity_weight:.2f}" +
                            ("" if c5.layout_opt.aps_weight is None else f"（运行 {c5.layout_opt.aps_weight:.2f}）"))])
         frozen = None
@@ -1493,9 +1499,15 @@ def page_aps(case) -> None:
             n_now = build_field(case).n
         except Exception:  # noqa: BLE001
             n_now = 0
+        depth = _depth_selector(case, "aim")
+        case, err = _case()  # a depth chosen just now changed the settings
+        if err:
+            st.error(err)
+            return
         _run_summary([("镜数", f"{n_now} 面"), ("时刻", stamp), ("日照", DNI_SOURCES[dni_src]),
                       ("考核区域", "整个吸热面" if not case.uniformity.panels and not case.uniformity.z_range else "部分区域"),
-                      ("安全裕度", f"{case.aps.safety_margin:.0%}"), ("算法", CHOICE_LABELS["aps.method"].get(method, method))])
+                      ("安全裕度", f"{case.aps.safety_margin:.0%}"), ("算法", CHOICE_LABELS["aps.method"].get(method, method)),
+                      ("计算深度", _depth_label(depth))])
         digest = _job_button("single", "▶  计算瞄准方案", wf.task_aim, stamp, method=method, blockers=aps_blockers,
                     dni_map=_save_upload(up_now) if up_now else None,
                     forecast_dni_map=_save_upload(up_fc) if up_fc else None,
@@ -1847,28 +1859,87 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
 
 # --------------------------------------------------------------------------- problem 2: layout
 
-PRESETS = {
-    "fast": ("快速 · 6 个工况正式排名", {"maxiter": 2, "popsize": 3, "n_sun_bins": 8, "polish_rounds": 1, "refine_top": 1,
-                                       "review_n_sun_bins": 4, "swap_rounds": 1, "review_check_hourly": False,
-                                       "formal_swap_rounds": 0, "dense_check_scenarios": 0},
-             {"n_scenarios": 6}),
-    "standard": ("标准 · 12 个工况正式排名", {"maxiter": 4, "popsize": 4, "n_sun_bins": 12, "polish_rounds": 2,
-                                          "refine_top": 2, "review_n_sun_bins": 6, "swap_rounds": 1,
-                                          "review_check_hourly": False, "formal_swap_rounds": 1, "dense_check_scenarios": 0},
-                 {"n_scenarios": 12}),
-    "fine": ("精细 · 20 个工况 + 40 工况复核", {"maxiter": 10, "popsize": 6, "n_sun_bins": 24, "polish_rounds": 4,
-                                            "refine_top": 3, "review_n_sun_bins": 12, "swap_rounds": 2,
-                                            "review_check_hourly": True, "formal_swap_rounds": 2, "dense_check_scenarios": 40},
-             {"n_scenarios": 20}),
-}
+@st.cache_data(show_spinner=False, max_entries=64)
+def _recommendation(case_yaml: str, base_dir: str, task: str, budget_min: float, n_layouts: int) -> dict:
+    from cspaps.advisor import recommend
+
+    c = case_from_dict(yaml.safe_load(case_yaml), base_dir=Path(base_dir))
+    return recommend(c, task, 60.0 * float(budget_min), n_layouts=n_layouts)
 
 
-def _apply_preset() -> None:
-    key = st.session_state.get("layout_preset")
-    if key in PRESETS:
-        st.session_state["case_dict"].setdefault("layout_opt", {}).update(PRESETS[key][1])
-        st.session_state["case_dict"].setdefault("scenarios", {}).update(PRESETS[key][2])
-        st.session_state["ver"] += 1
+def _depth_label(mode: str) -> str:
+    from cspaps.advisor import MODE_ICON, MODE_ZH
+
+    return "当前设置" if mode not in MODE_ZH else f"{MODE_ICON[mode]} {MODE_ZH[mode]}"
+
+
+def _apply_depth(task: str) -> None:
+    """Write the chosen depth's settings into the case (only when the user picks a depth)."""
+    from cspaps.advisor import MODES, mode_overrides
+
+    mode = st.session_state.get(f"depth_{task}")
+    if mode not in MODES:
+        return
+    data = st.session_state["case_dict"]
+    try:
+        c = case_from_dict(copy.deepcopy(data), base_dir=Path(st.session_state["base_dir"]))
+    except Exception:  # noqa: BLE001 - the case is invalid: the form shows why
+        return
+    from cspaps.advisor import _field_size
+
+    try:
+        n = _field_size(c, task)
+    except Exception:  # noqa: BLE001
+        n = None
+    for section, values in mode_overrides(c, task, mode, n=n).items():
+        data.setdefault(section, {}).update(copy.deepcopy(values))
+    st.session_state["ver"] += 1
+
+
+def _depth_selector(case, task: str, n_layouts: int = 2) -> str:
+    """Fast / standard / deep for this task: meaning, time estimate for this field and budget, recommendation."""
+    from cspaps.advisor import MODES, fmt_duration
+
+    c1, c2 = st.columns([1, 2.2])
+    budget = c1.number_input("这次最多等多久（分钟）", min_value=1, max_value=600, step=5,
+                             value=int(st.session_state.get("budget_min", 15)), key=f"budget_{task}",
+                             help="软件按镜数和这台计算机的实测速度，估计每一档要算多久，推荐放得下的最深一档。")
+    st.session_state["budget_min"] = int(budget)
+    try:
+        rec = _recommendation(case.to_yaml(), st.session_state["base_dir"], task, float(budget), n_layouts)
+    except Exception as exc:  # noqa: BLE001 - a display aid must not block the page
+        c2.caption(f"暂时无法估计计算时间：{exc}")
+        return "custom"
+    opts = {o["mode"]: o for o in rec["options"]}
+
+    def fmt(k):
+        if k == "custom":
+            return "当前设置（不改动）"
+        o = opts[k]
+        return f"{o['icon']} {o['label']} · 约 {fmt_duration(o['seconds'])}" + ("（推荐）" if o["recommended"] else "")
+
+    with c2:
+        choice = st.radio("计算深度", ["custom", *MODES], format_func=fmt, key=f"depth_{task}", horizontal=True,
+                          on_change=_apply_depth, args=(task,),
+                          help="快速 = 先看结果；标准 = 日常使用；深度思考 = 定方案前把每一步算细。选中后才会改动设置。")
+    shown = rec["recommended"] if choice == "custom" else choice
+    o = opts[shown]
+    head = ("推荐" if choice == "custom" else "已选") + f" {o['icon']} {o['label']}"
+    _callout("info", f"{head} · 预计 {fmt_duration(o['range'][0])} – {fmt_duration(o['range'][1])}"
+             + ("（超出校准规模，估计偏粗）" if o.get("extrapolated") else ""), o["text"])
+    st.caption(f"{rec['tier']['label']}（{rec['tier']['n_heliostats']:,} 面镜）：{rec['tier']['text']} {rec['reason']}")
+    with st.expander("三档分别算什么、改了哪些设置"):
+        rows = []
+        for m in MODES:
+            q = opts[m]
+            changed = "；".join(f"{k} = {v}" for sec in q["overrides"].values() for k, v in sec.items())
+            rows.append({"档位": f"{q['icon']} {q['label']}", "含义": q["text"],
+                         "预计时间": f"{fmt_duration(q['range'][0])} – {fmt_duration(q['range'][1])}",
+                         "改动的设置": changed})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption(f"时间估计依据：{rec['calibration']}，按 {rec['workers']} 个进程并行。"
+                   "在本机运行 `cspaps calibrate 算例.yaml` 可按这台计算机实测校准。" + rec["gpu"])
+    return choice
 
 
 def _site_inputs(case) -> None:
@@ -1970,8 +2041,7 @@ def _layout_search_inputs(case) -> str | None:
     with _card("layout_search"):
         _section(4, "搜索设置", "初筛按中心瞄准的全年理论热量减周向不均匀惩罚评价参数化布局；入围布局与初始布局"
                  "再在同一组工况上逐个求解 APS，按 V(L) 正式排名。")
-        st.radio("计算强度", list(PRESETS), format_func=lambda k: PRESETS[k][0], key="layout_preset",
-                 index=1, horizontal=False, on_change=_apply_preset)
+        _depth_selector(case, "search", n_layouts=int(case.layout_opt.refine_top) + 1)
         _fields("layout_opt", ["generator", "search_aiming", "refine_top", "upper_bound"])
         with st.expander("搜索范围、采样精度与计算资源"):
             common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight",
@@ -2001,7 +2071,8 @@ def _layout_search_inputs(case) -> str | None:
                       ("考核区域", "整个吸热面" if not case.uniformity.panels and not case.uniformity.z_range else "部分区域"),
                       ("安全裕度", f"{case.aps.safety_margin:.0%}"),
                       ("参加排名", f"搜索前 {lo.refine_top} 名" + (" + 初始镜场" if lo.baseline == "initial" else "")),
-                      ("偏好 λ", f"{lo.uniformity_weight:.2f}")])
+                      ("偏好 λ", f"{lo.uniformity_weight:.2f}"),
+                      ("计算深度", _depth_label(st.session_state.get("depth_search", "custom")))])
         digest = _job_button("opt", "▶  开始布局优化", wf.task_optimize_layout, progress=True,
                              cancellable=True, blockers=scen_blockers)
         _job_error("opt")

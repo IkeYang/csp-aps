@@ -522,11 +522,11 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
         n_s_run = n_s
     if nw > 1 and n_s_run > 1:
         order = [int(i) for i in np.argsort(-sset.samples.weight_h * sset.samples.dni)]  # big scenarios first
-        p = pool(nw)
+        tasks = [(case, xyz, ids, sset, [i], settings, keep_flux) for i in order]
+        p = pool(nw, probe=(_scenario_chunk, tasks[0]))
         try:
             done = 0
-            for out in p.imap_unordered(_scenario_chunk, [(case, xyz, ids, sset, [i], settings, keep_flux)
-                                                          for i in order]):
+            for out in p.imap_unordered(_scenario_chunk, tasks):
                 for i, rec in out:
                     results[i] = rec
                     done += 1
