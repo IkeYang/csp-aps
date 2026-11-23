@@ -47,7 +47,7 @@ def test_representative_days_cover_the_year_and_the_seasons(year, n):
     days = sun.design_days(year, n)
     assert len(days) == n and sum(w for _, w in days) == (366 if year % 4 == 0 else 365)
     assert max(w for _, w in days) - min(w for _, w in days) <= 1  # equal segments
-    doy = np.array([d.dayofyear for d, _ in days])
+    doy = np.array([d.day_of_year for d, _ in days])
     assert np.all(np.diff(doy) > 0)
     if n == 20:  # the solstices fall inside the extreme segments: declination within 1 deg of +-23.44
         dec = np.degrees(pvlib.solarposition.declination_spencer71(doy))

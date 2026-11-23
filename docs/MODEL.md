@@ -2,9 +2,31 @@
 
 本文说明 csp-aps 每个计算环节用的模型、公式和近似，以及代码位置。坐标系：x = 东，y = 北，z = 上（m），原点在塔底；方位角按罗盘计（北 = 0°，东 = 90°，顺时针）。
 
-## 0.9 年度计算加速：控制变量、复用、贝叶斯搜索、通量价格换位、并行
+## 0.9 晴空年度设计基线与年度计算加速
 
-年度价值 V(L) = Σ_s h_s (P_s − λ_L U_s)（0.5.4 节）的定义不变。0.9 改的是怎样更快、更准地算它，以及怎样用它找布局。五项都可单独开关，默认值下同一布局、同一工况集、同一内层设置的 P_s、U_s 仍逐位可复算。
+### 0.9.0 设计基线：晴空年度（`scenarios.source: clear_sky_days`，默认）
+
+布局评分只比较镜位本身的全年光学表现，工况集由站址的太阳几何和晴空大气决定（`scenarios.clear_sky_day_set`、`sun.clear_sky_design_days`）：
+
+```
+代表日：  全年 D 天按日期等分成 n 段（n = scenarios.n_days，默认 20），段 k = [⌊kD/n⌋, ⌊(k+1)D/n⌋)，
+          代表日 = 段的中间一天，w_k = 段的天数（Σ w_k = D）
+工况：    代表日 k 上每个时间步 t（区间中点，当地钟点，步长 annual.time_step_min，默认 60 min），
+          保留 h(t) ≥ annual.min_sun_elevation_deg 且 DNI(t) ≥ annual.min_dni_w_m2 的全部小时
+权重：    h_s = w_k · Δt
+DNI：     DNI_s = Ineichen–Perez(天顶角, 绝对大气质量 (站址气压), 林克浑浊度 T_L, 海拔, 当日地外 DNI)，
+          T_L = pvlib 站址月气候值按日插值（或 scenarios.linke_turbidity 给定的常数 / 12 个月值）；
+          全场每面镜读同一个 DNI_s
+得分：    V_clear = Σ_s h_s (P_s − λ_L U_s)（晴空年度综合得分），E_clear = Σ_s h_s P_s（晴空年度吸热量）
+```
+
+等分日期段让代表日随赤纬和日长均匀分布（20 段时，两个至日所在段的代表日赤纬与 ±23.44° 相差约 1° 以内，`test_representative_days_cover_the_year_and_the_seasons`）。DNI 与独立调用 pvlib `Location.get_clearsky` 的结果一致到 0.2%（`test_clear_sky_dni_is_the_ineichen_model_of_site_date_and_time`）。工况集不读空间 DNI 地图：`map_model` 改成任何值，指纹都不变。全年每个工作小时归到它所在日期段的代表日、同一钟点的工况（代表日该钟点低于门槛时归到最近的工作钟点），供控制变量使用（0.9.1）。布局搜索的初筛和贝叶斯低保真评价也用同一个晴空年（`scenarios.design_hourly`、`scenarios.low_fidelity_set`），更密的复核用 2n 个代表日（它们的中间日落在设计代表日之间）。
+
+气象年口径（`source: weather`，可叠加空间 DNI 地图）保留为敏感性分析，不作为设计基线：实测 DNI 已含云造成的辐照下降，人为地图会让镜位“躲云”或“追亮区”。
+
+### 年度计算加速
+
+年度价值 V(L) = Σ_s h_s (P_s − λ_L U_s)（0.5.4 节）的定义不变。下面改的是怎样更快、更准地算它，以及怎样用它找布局。五项都可单独开关，默认值下同一布局、同一工况集、同一内层设置的 P_s、U_s 仍逐位可复算。
 
 ### 0.9.1 控制变量修正（`layout_value.control_variate`，`layout_opt.control_variate`）
 
@@ -15,7 +37,7 @@ f_s = Σ_{t∈T_s} w_t C(t) / (h_s C(s))          （分工况的比率估计）
 V_cv = Σ_s h_s J_s f_s,   E_cv、Π_cv 同理
 ```
 
-假设代表状态在贵模型里的相对误差与在便宜模型里相同。成员上 C 线性时 f_s = 1；f_s 截在 [0.5, 2]。所有成员小时的 C 之和就是全年逐时的中心瞄准能量（`test_control_variate_factors_follow_the_cheap_model`）。代价：一次全年逐时中心瞄准，不解 APS。正式 V 不变，`layout_opt.rank_by: value_cv` 时按修正值排名，`value`（默认）时只报告。逐时 APS 参考值（`scripts/validate_annual_estimators.py`）给出两种估计的误差，见 0.9.6。
+假设代表状态在贵模型里的相对误差与在便宜模型里相同。成员上 C 线性时 f_s = 1；f_s 截在 [0.5, 2]。所有成员小时的 C 之和就是全年逐时的中心瞄准能量（`test_control_variate_factors_follow_the_cheap_model`）。代价：一次全年逐时中心瞄准，不解 APS。正式 V 不变，`layout_opt.rank_by: value_cv` 时按修正值排名，`value`（默认）时只报告。逐时 APS 参考值（`scripts/validate_annual_estimators.py`）给出两种估计的误差，见 README 0.9.0。
 
 ### 0.9.2 复用（`layout_opt.inner_reuse`，`scenarios.shared_directions`）
 
@@ -52,7 +74,7 @@ J*_s(L ∪ {j}) ≤ UB_s(L) + G_js            （j 不遮挡布局中的镜子�
 
 与穷举最优比对通过（`test_flux_prices_bound_the_value_of_an_added_heliostat`，功率与两种 λ 各 2 个镜位）。去掉镜子 i 的损失 D_is = J_s(方案) − J_s(方案去掉 i，其余瞄准不变)，在模型里精确计算（`certify.removal_losses`；去掉镜子不会违反通量限值，被它遮挡的邻镜不加回）。年度上 gain_j = Σ_s h_s G_js，loss_i = Σ_s h_s D_is；换位按 gain 从高到低、loss 从低到高配对，只取 gain − loss > 0 的对，预测增益是一阶估计，重新逐工况求解后 V 提高才接受，否则减半重试。由上式，单独加入 j 的增益不超过 gain_j + Σ_s h_s (UB_s − J_s)，这个差额随结果一起报告（`bound_gap_mwh`）。
 
-与原来的能量定价（APS 年吸热最少的镜子换出、中心瞄准年能量最高的空闲镜位换入）比，能量定价看不到吸热器拥挤：中心瞄准能量高的镜位往往把光斑加在已经顶到限值的网格上。实测见 0.9.6。
+与原来的能量定价（APS 年吸热最少的镜子换出、中心瞄准年能量最高的空闲镜位换入）比，能量定价看不到吸热器拥挤：中心瞄准能量高的镜位往往把光斑加在已经顶到限值的网格上。实测见 README 0.9.0。
 
 ### 0.9.5 并行与 GPU（`layout_value.evaluate_layout_values`，`backend.py`）
 

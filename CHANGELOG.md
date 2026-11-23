@@ -1,8 +1,16 @@
 # CSP-APS 更新日志
 
-## 0.9.0 · 年度计算加速：控制变量、复用、贝叶斯搜索、通量价格换位、多核与 GPU
+## 0.9.0 · 晴空年度设计基线；年度计算加速：控制变量、复用、贝叶斯搜索、通量价格换位、多核与 GPU
 
-V(L) 的定义不变；推导见 [模型说明 0.9 节](docs/MODEL.md)，实测见 README 0.9.0 节。
+推导见 [模型说明 0.9 节](docs/MODEL.md)，实测见 README 0.9.0 节。
+
+- **布局设计基线改为晴空年度**（`scenarios.source: clear_sky_days`，新默认）
+  - 20 个代表日（全年按日期等分，取每段中间一天，权重 = 该段天数），每个代表日从早到晚达到工作门槛的全部小时都是工况（`scenarios.n_days`、`annual.min_sun_elevation_deg`、新增 `annual.min_dni_w_m2`）。
+  - 每小时一个全场共享的晴空 DNI：Ineichen–Perez，按站址、日期、时刻、海拔和当地典型林克浑浊度（pvlib 月气候值，或 `scenarios.linke_turbidity`）计算（`scenarios.clear_sky_model`，可选 `meinel`）。
+  - 每套布局逐小时求解 APS，按代表天数加权；所有布局用相同的日期、时段和权重。
+  - 结果命名为“晴空年度吸热量”和“晴空年度综合得分”（`totals()["basis"]`、`value_label`、`energy_label`，界面与导出一致）。
+  - 布局搜索初筛、贝叶斯低保真评价、更密工况复核（2 倍代表日）都在同一晴空年上进行；空间 DNI 地图和云影交叉复核不进入设计评分。
+  - 演示算例和三个站址算例默认改为晴空代表日；气象年 + 空间 DNI 保留为敏感性分析（`source: weather`），`scripts/site_studies.py` 按原口径复现 0.5–0.6 的研究。
 
 - **控制变量修正年度值**（`layout_opt.control_variate`，默认开）
   - 工况集记录每个小时归到哪个代表工况（`ScenarioSet.assignment`，保存为 `hourly_members.csv`）。

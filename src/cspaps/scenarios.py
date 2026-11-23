@@ -226,7 +226,7 @@ def clear_sky_day_set(case, n_days: int | None = None) -> ScenarioSet:
     n_year = 365 + calendar.isleap(a.year)
     n = len(days)
     edges = np.floor(np.arange(n + 1) * n_year / n).astype(int)
-    doy = np.asarray(year.times.dayofyear, dtype=int) - 1
+    doy = np.asarray(year.times.day_of_year, dtype=int) - 1
     seg = np.clip(np.searchsorted(edges, doy, side="right") - 1, 0, n - 1)
     assign = np.full(len(year), -1, dtype=int)
     rep_slot = slot(design.times)
