@@ -33,6 +33,8 @@ Review (the advisor's "受限全年收益复排")
 
 from __future__ import annotations
 
+import math
+
 import time as _time
 from dataclasses import dataclass, field as dc_field, replace
 from typing import Callable
@@ -87,11 +89,11 @@ def make_samples(case: Case, method: str, n_bins: int, dni_bands: int = 1, hourl
                  seed: int = 0) -> sun.Samples:
     """Sun states for the search / review. With spatial DNI maps every state carries its map regime
     (``scenarios``): the hours of each regime are binned separately, so the maps' DNI energy is preserved."""
-    from .scenarios import attach_regimes, build_scenarios, is_spatial
+    from .scenarios import attach_regimes, build_scenarios, design_hourly, is_spatial
 
     if case.scenarios.source == "file":
         return build_scenarios(case).samples
-    hourly = hourly if hourly is not None else sun.hourly_samples(case)
+    hourly = hourly if hourly is not None else design_hourly(case)
     if is_spatial(case):
         hourly = hourly if hourly.spatial else attach_regimes(case, hourly)
         if method == "hourly":
@@ -510,6 +512,80 @@ class LayoutOptResult:
                                                      "bound does not exclude one"}
 
 
+SECTOR_PARAMS = ("sector_n", "sector_e", "sector_s", "sector_w")
+
+
+class _BayesDone(Exception):
+    """The Bayesian search replaced the population search."""
+
+
+def _selected_xyz(args):
+    case, kind, params, samples, n, shading_points, aiming = args
+    return evaluate_layout(case, kind, params, samples, n, shading_points, aiming).xyz
+
+
+def _bayes_search(case, kind, names, lo, hi, obj, samples, hourly, aiming, nw, records, say, stop) -> None:
+    """Bayesian optimisation (``bayes.optimise``) of the generator parameters on the low-fidelity formal V.
+
+    Every proposal: generator -> selection of N (as in the search) -> V(L) on ``bayes_scenarios`` scenarios
+    with fast inner settings (1 joint-pose trial, no rounding, reuse "full"). Proposals come in batches of q
+    and every (layout, scenario) of a batch runs in one pool. The records keep V as their objective, so the
+    best ones go on to the normal review and the full formal ranking."""
+    from dataclasses import replace as dc_replace
+
+    from .bayes import optimise
+    from .layout_value import evaluate_layout_values, inner_settings
+    from .parallel import pool
+    from .scenarios import low_fidelity_set
+
+    spec = case.layout_opt
+    lo_case = case.copy()
+    lo_case.layout_opt.control_variate = False
+    sset = low_fidelity_set(lo_case, int(spec.bayes_scenarios), hourly)
+    settings = dc_replace(inner_settings(case), joint_trials=1, certify_rounds=0, reuse="full")
+    n_req = spec.n_heliostats
+    d = len(names)
+    n_init = int(spec.bayes_initial or min(2 * d + 2, max(2, int(spec.bayes_evaluations) // 2)))
+    q = int(min(4, max(1, math.ceil(nw / max(len(sset), 1)))))
+    say(f"Bayesian search over {names}: {spec.bayes_evaluations} layouts, {len(sset)} scenarios each, "
+        f"batches of {q}, {nw} workers")
+    valid_values: list[float] = []
+    calls = [0]
+
+    def f_batch(unit):
+        calls[0] += 1
+        stage = "initial" if calls[0] == 1 else "bayes"  # the first batch is the Sobol initial design
+        xs = lo + np.asarray(unit) * (hi - lo)
+        args = [(case, kind, obj.params(x), samples, n_req, spec.shading_points, aiming) for x in xs]
+        if nw > 1 and len(args) > 1:
+            p = pool(min(nw, len(args)), probe=(_selected_xyz, args[0]))
+            try:
+                layouts = p.map(_selected_xyz, args)
+            finally:
+                p.close()
+                p.join()
+        else:
+            layouts = [_selected_xyz(a) for a in args]
+        ok = {f"bo_{len(records) + j + 1}": (xyz, None) for j, xyz in enumerate(layouts)
+              if len(xyz) and (not n_req or len(xyz) == n_req)}
+        vals = evaluate_layout_values(lo_case, ok, sset, settings=settings, workers=nw, keep_flux=False,
+                                      cancel=stop) if ok else {}
+        out = []
+        for j, x in enumerate(xs):
+            name = f"bo_{len(records) + 1}"
+            if name in vals and vals[name].totals()["complete"]:
+                v = float(vals[name].totals()["value_mwh"])
+                valid_values.append(v)
+            else:  # not N heliostats on the site (or cancelled): below every buildable layout
+                v = (min(valid_values) - 0.05 * abs(min(valid_values))) if valid_values else 0.0
+            records.append({"evaluation": len(records) + 1, "stage": stage, **obj.params(x), "energy_mwh": v,
+                            "objective_basis": f"formal V on {len(sset)} scenarios (fast inner settings)"})
+            out.append(v)
+        return out
+
+    optimise(f_batch, d, n_init, int(spec.bayes_evaluations), q=q, seed=int(spec.seed), stop=stop, say=say)
+
+
 def optimize_layout(
     case: Case,
     progress: Callable[[str], None] | None = None,
@@ -522,6 +598,9 @@ def optimize_layout(
     kind = spec.generator
     bounds = dict(DEFAULT_BOUNDS.get(kind, {}))
     bounds.update(spec.bounds or {})
+    if spec.sector_spacing and kind == "radial_staggered":
+        for key in SECTOR_PARAMS:  # thinning towards N / E / S / W (>= 1)
+            bounds.setdefault(key, [1.0, 1.8])
     for k in spec.fixed:
         bounds.pop(k, None)
     if not bounds:
@@ -532,11 +611,10 @@ def optimize_layout(
     from . import layout_uniformity as lu
 
     lam = float(spec.uniformity_weight)
-    from .scenarios import attach_regimes, build_scenarios
+    from .scenarios import design_hourly
 
     formal = spec.ranking == "aps_value" and spec.refine_top > 0  # refine_top = 0: fast search only, no review
-    hourly = (build_scenarios(case).samples if case.scenarios.source == "file"
-              else attach_regimes(case, sun.hourly_samples(case)))
+    hourly = design_hourly(case)  # clear-sky baseline: the clear-sky year; else the weather year (+ map regimes)
     search_aiming = spec.search_aiming
     if search_aiming == "auto":
         # formal ranking: the search is a fast centre-aim pre-screen; APS runs on the formal scenario set
@@ -563,7 +641,9 @@ def optimize_layout(
             return True  # stops differential evolution
 
     nw = n_workers(spec.workers)
-    pl = pool(nw, probe=obj) if nw > 1 else None
+    # the Bayesian search opens its own pools; an idle DE pool kept alive meanwhile would also make every
+    # nested pool start with forkserver (pool helper threads running)
+    pl = pool(nw, probe=obj) if nw > 1 and spec.search_method != "bayes" else None
     stage = {"name": "global"}
 
     def mapper(f, xs):
@@ -579,6 +659,9 @@ def optimize_layout(
     hi = np.array([bounds[k][1] for k in names], dtype=float)
     cancelled = False
     try:
+        if spec.search_method == "bayes":
+            _bayes_search(case, kind, names, lo, hi, obj, samples, hourly, search_aiming, nw, records, say, stop)
+            raise _BayesDone()
         if nw > 1:
             workers, func = mapper, obj
         else:
@@ -616,6 +699,8 @@ def optimize_layout(
     except Cancelled:
         cancelled = True
         say("cancelled: reviewing the best layouts found so far")
+    except _BayesDone:
+        cancelled = stop()
     finally:
         if pl is not None:
             pl.close()
@@ -921,13 +1006,14 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
 
     Layouts: the shortlisted search layouts (``evals``, N heliostats) and, with ``layout_opt.baseline =
     initial``, the case's initial field. Every layout is solved on the same scenario set with the same
-    inner settings. The leading search layout is then polished by swaps (lowest APS-energy heliostats
-    out, best-priced unused candidates in) that are kept only if V increases; optionally the winner and
+    inner settings. The leading search layout is then polished by swaps that are kept only if V increases
+    (``swap_pricing``: "energy" = lowest APS-energy heliostats out, best centre-aim unused candidates in;
+    "dual" = candidates by their flux-priced reduced cost, mirrors by their removal loss, ``dual_prices``); optionally the winner and
     the initial field are re-evaluated on a denser scenario set (sampling error of the representative set).
     """
     from .field import Field
-    from .layout_value import (baseline_layout, compare_values, displacement, evaluate_layout_value,
-                               inner_settings, refine_competing_plans)
+    from .layout_value import (baseline_layout, compare_values, displacement, dual_prices, evaluate_layout_value,
+                               evaluate_layout_values, inner_settings, price_swaps, refine_competing_plans)
     from .scenarios import build_scenarios, validation_scenarios
 
     spec = case.layout_opt
@@ -939,6 +1025,7 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
     values: dict = {}
     owners: dict = {}
     seen = set()
+    batch, batch_tags = {}, {}
     for k, ev in enumerate(evals, start=1):
         if stop() or not ev.n or ev.n != n_req:
             continue
@@ -949,53 +1036,72 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
             continue
         seen.add(key)
         name = f"search_{k}"
-        say(f"formal ranking: APS on {len(sset)} scenarios for {name}")
-        values[name] = evaluate_layout_value(case, ev.xyz, sset, name, settings=settings, progress=say, cancel=stop,
-                                             tags={"kind": "search", "search_rank": k})
+        batch[name], batch_tags[name] = (ev.xyz, None), {"kind": "search", "search_rank": k}
         owners[name] = ev
     base_note = None
     if spec.baseline == "initial" and not stop():
         b = baseline_layout(case, n_req)
         if b is not None and validate_layout(case, b[0], n_req, design_spacing(case), b[1])["status"] == "ok":
             base_note = b[2]
-            say(f"formal ranking: APS on {len(sset)} scenarios for the initial field")
-            values["initial"] = evaluate_layout_value(case, b[0], sset, "initial", ids=b[1], settings=settings,
-                                                      progress=say, cancel=stop,
-                                                      tags={"kind": "initial", "note": base_note})
+            batch["initial"], batch_tags["initial"] = (b[0], b[1]), {"kind": "initial", "note": base_note}
             owners["initial"] = None
         else:
             base_note = "initial field not comparable (fewer heliostats than N or not buildable)"
+    if batch and not stop():
+        say(f"formal ranking: APS on {len(sset)} scenarios for {len(batch)} layouts ({', '.join(batch)})")
+        values.update(evaluate_layout_values(case, batch, sset, settings=settings, progress=say, cancel=stop,
+                                             tags=batch_tags))
     swaps = []
     search_names = [k for k in values if k != "initial"]
     if search_names and spec.formal_swap_rounds > 0:
         lead = max(search_names, key=lambda k: values[k].totals()["value_mwh"])
         ev, cur = owners[lead], values[lead]
         m = max(1, int(round(spec.swap_fraction * n_req)))
+        dual = spec.swap_pricing == "dual"
         for r in range(spec.formal_swap_rounds):
-            if stop() or ev.candidates_xyz is None:
+            if stop() or ev.candidates_xyz is None or m < 1:
                 break
             key = {tuple(np.round(p, 6)) for p in cur.xyz}
             in_layout = np.array([tuple(np.round(p, 6)) in key for p in ev.candidates_xyz])
             unused = np.flatnonzero(~in_layout)
             if unused.size == 0:
                 break
-            price = annual(case, Field(ev.candidates_xyz), samples=samples, aiming="center", with_flux=False,
-                           shading_points=spec.shading_points, workers=1, blockers=in_layout).heliostat_energy_mwh
-            add = unused[np.argsort(-price[unused])[:m]]
-            drop = np.argsort(cur.mirror_energy_mwh(), kind="stable")[:len(add)]
+            predicted, bound_gap = None, None
+            if dual:
+                say(f"formal swap round {r + 1}: flux prices of {unused.size} free positions on {len(sset)} scenarios")
+                prices = dual_prices(case, cur, ev.candidates_xyz[unused], sset, settings, progress=say)
+                drop, add_u, predicted = price_swaps(prices, m)
+                add, bound_gap = unused[add_u], prices["gap_mwh"]
+                if add.size == 0:
+                    swaps.append({"round": r + 1, "pricing": "dual", "swapped": 0, "gain_value_mwh": 0.0, "accepted": False,
+                                  "note": "no free position prices above the removal loss of a mirror",
+                                  "bound_gap_mwh": bound_gap, "best_gain_mwh": float(prices["gain_mwh"].max())})
+                    break
+            else:
+                price = annual(case, Field(ev.candidates_xyz), samples=samples, aiming="center", with_flux=False,
+                               shading_points=spec.shading_points, workers=1, blockers=in_layout).heliostat_energy_mwh
+                add = unused[np.argsort(-price[unused])[:m]]
+                drop = np.argsort(cur.mirror_energy_mwh(), kind="stable")[:len(add)]
             new_xyz = np.vstack([np.delete(cur.xyz, drop, axis=0), ev.candidates_xyz[add]])
             if validate_layout(case, new_xyz, n_req, design_spacing(case))["status"] != "ok":
                 continue
             name = f"{lead}+swap{r + 1}"
             say(f"formal swap round {r + 1}: {len(add)} heliostats, APS on {len(sset)} scenarios")
             new = evaluate_layout_value(case, new_xyz, sset, name, settings=settings, progress=say, cancel=stop,
-                                        tags={"kind": "search_swap", "search_rank": cur.tags.get("search_rank")})
+                                        tags={"kind": "search_swap", "search_rank": cur.tags.get("search_rank"),
+                                              "swap_pricing": spec.swap_pricing})
             gain = new.totals()["value_mwh"] - cur.totals()["value_mwh"]
-            swaps.append({"round": r + 1, "layout": name, "swapped": int(len(add)), "gain_value_mwh": float(gain),
-                          "gain_energy_mwh": new.totals()["energy_mwh"] - cur.totals()["energy_mwh"],
-                          "accepted": bool(gain > 0)})
+            row = {"round": r + 1, "layout": name, "pricing": spec.swap_pricing, "swapped": int(len(add)),
+                   "gain_value_mwh": float(gain),
+                   "gain_energy_mwh": new.totals()["energy_mwh"] - cur.totals()["energy_mwh"],
+                   "accepted": bool(gain > 0)}
+            if predicted is not None:
+                row.update(predicted_gain_mwh=float(predicted), bound_gap_mwh=float(bound_gap))
+            swaps.append(row)
             if gain > 0:
                 values[name], owners[name], cur = new, ev, new
+            elif dual and len(add) > 1:
+                m = len(add) // 2  # prices are first-order: retry with the best-priced half
             else:
                 break
     if not values:
@@ -1025,13 +1131,15 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
         params = dict(parent.params) if parent is not None else {}
         owners[name] = LayoutEval(params, n_req, xyz, candidate.totals()["value_mwh"], search_aiming="formal_aps_value")
     refine_competing_plans(case, values, sset, say, stop)
-    ranking = compare_values(list(values.values()), reference="initial" if "initial" in values else None)
+    ranking = compare_values(list(values.values()), reference="initial" if "initial" in values else None,
+                             rank_by=spec.rank_by)
     winner = str(ranking.loc[0, "name"]) if bool(ranking.loc[0, "rankable"]) else None
     out = {"scenario_set": sset, "settings": settings, "values": values, "owners": owners, "winner": winner,
            "ranking": ranking, "swaps": swaps, "baseline_note": base_note}
     if winner is not None and "initial" in values and winner != "initial":
         out["displacement"] = displacement(values["initial"].xyz, values[winner].xyz)
-    if (spec.cross_check_maps and case.scenarios.map_model == "clouds" and winner is not None
+    if (spec.cross_check_maps and case.scenarios.map_model == "clouds" and case.scenarios.source == "weather"
+            and winner is not None
             and "initial" in values and winner != "initial" and not stop()):
         other = case.copy()
         other.scenarios.seed += 1000

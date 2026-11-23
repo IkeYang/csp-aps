@@ -231,6 +231,7 @@ class AnnualSpec:
     day_of_month: int = 15  # representative_days: one day per month
     time_step_min: float = 60.0
     min_sun_elevation_deg: float = 5.0
+    min_dni_w_m2: float = 0.0  # working threshold on DNI (W/m2) together with the minimum sun elevation
     aiming: str = "center"  # "center" (fast) or an APS method name
     # representative DNI of a merged state: "time_mean" (weight = the actual hours) or "energy_weighted"
     # (sum G^2 w / sum G w, weight = irradiance-equivalent hours, the 0.4 / 0.5.0 convention)
@@ -279,6 +280,10 @@ class LayoutOpt:
     formal_position_trials: int = 4  # feasible XY proposals evaluated with full per-scenario APS
     ranking_refine_states: int = 2  # highest uncertainty states per competing layout; 0 disables
     formal_swap_rounds: int = 1  # swap rounds on the winner, accepted only if V(L) increases
+    # how the formal swaps pick heliostats: "dual" (flux prices of the per-scenario APS bound: free positions by
+    # their reduced cost, mirrors by their removal loss; costs about one layout evaluation per round) | "energy"
+    # (lowest APS-energy mirrors out, best centre-aim free positions in; blind to receiver congestion)
+    swap_pricing: str = "dual"
     inner_joint_trials: int = 2  # joint-pose neighbourhood trials per scenario solve
     inner_certify_rounds: int = 0  # relaxation roundings + dual bound per scenario (0 = off; fixed iterations)
     inner_certify_iters: int = 60  # dual / Frank-Wolfe iterations of that bound (iteration budget, reproducible)
@@ -286,6 +291,21 @@ class LayoutOpt:
     # clouds maps: re-score winner and baseline on independent cloud maps (seed + 1000); transient shadows must
     # not decide where mirrors go
     cross_check_maps: bool = True
+    # control variate: correct every scenario with the centre-aim energy of its member hours (cheap, needs the
+    # weather year behind the scenario set); "value_cv" ranks by that estimate instead of the formal V
+    control_variate: bool = True
+    rank_by: str = "value"  # "value" (formal V on the scenario set) | "value_cv" (control-variate estimate)
+    # reuse inside one layout's scenarios: "responses" (spot responses per sun direction built once; plans identical
+    # to independent solves) | "full" (+ plans reused across DNI levels the limits never shaped, warm starts along
+    # the sun path; faster) | "off"
+    inner_reuse: str = "responses"
+    # search: "de" = differential evolution on the centre-aim pre-screen | "bayes" = Bayesian optimisation of the
+    # generator parameters directly on the formal V of ``bayes_scenarios`` scenarios (fast inner settings)
+    search_method: str = "de"
+    bayes_evaluations: int = 30  # layouts evaluated by the Bayesian search (initial design included)
+    bayes_initial: int = 0  # Sobol initial design (0 = 2 x dimensions + 2)
+    bayes_scenarios: int = 8  # scenarios of the low-fidelity V
+    sector_spacing: bool = False  # also search thinning factors towards N / E / S / W (radial_staggered)
 
 
 @dataclass
@@ -298,11 +318,24 @@ class ScenarioSpec:
     station DNI in space without changing the site's annual DNI energy.
     """
 
-    source: str = "weather"  # "weather": representative states of the weather year | "file": scenario table CSV
+    # "clear_sky_days" (design baseline): every working hour of ``n_days`` representative days, one clear-sky DNI
+    #     per hour shared by the whole field (site, date, time, typical clear-sky atmosphere); the layout score is
+    #     the "clear-sky annual" value -- spatial maps, clouds and measured weather do not enter it
+    # "weather": representative states of the weather year (+ spatial DNI maps) | "file": scenario table CSV
+    source: str = "clear_sky_days"
+    n_days: int = 20  # clear_sky_days: representative days (equal date segments, weight = days in the segment)
+    clear_sky_model: str = "ineichen"  # clear_sky_days: "ineichen" (date, altitude, Linke turbidity) | "meinel"
+    # clear_sky_days, Ineichen: None = the site's monthly Linke-turbidity climatology (pvlib), a number = all year,
+    # 12 numbers = one per month (local measurements)
+    linke_turbidity: Any = None
     file: str | None = None  # scenario table: scenario_id,elevation_deg,azimuth_deg,hours,dni_w_m2,map_id[,time]
     validation_file: str | None = None  # separate scenario table, using the case's map library
     n_scenarios: int = 20  # representative scenarios generated from the weather year
     dni_bands: int = 1  # split each representative sun position into DNI bands
+    # one set of sun directions for every map and DNI band (directions clustered over the whole year, the hours of
+    # each direction then split by map and band): the spot responses of a direction serve all its scenarios, and
+    # with layout_opt.inner_reuse = full a plan the flux limits never shaped serves its lower DNI bands
+    shared_directions: bool = False
     map_model: str = "uniform"  # uniform | half_swap | gradient | clouds | file
     map_file: str | None = None  # map library CSV: map_id,x,y,value (regular grid or scattered points)
     map_unit: str = "factor"  # file maps: "factor" (x scenario DNI) | "w_m2" (absolute DNI)
@@ -473,6 +506,16 @@ def _validate(case: Case) -> None:
     lo = case.layout_opt
     if lo.ranking not in ("aps_value", "legacy"):
         raise ValueError("layout_opt.ranking must be aps_value|legacy")
+    if lo.rank_by not in ("value", "value_cv"):
+        raise ValueError("layout_opt.rank_by must be value|value_cv")
+    if lo.swap_pricing not in ("energy", "dual"):
+        raise ValueError("layout_opt.swap_pricing must be energy|dual")
+    if lo.inner_reuse not in ("responses", "full", "off"):
+        raise ValueError("layout_opt.inner_reuse must be responses|full|off")
+    if lo.search_method not in ("de", "bayes"):
+        raise ValueError("layout_opt.search_method must be de|bayes")
+    if lo.bayes_evaluations < 2 or lo.bayes_scenarios < 1 or lo.bayes_initial < 0:
+        raise ValueError("layout_opt: bayes_evaluations >= 2, bayes_scenarios >= 1, bayes_initial >= 0")
     if lo.baseline not in ("initial", "none"):
         raise ValueError("layout_opt.baseline must be initial|none")
     if lo.aps_weight is not None and not 0 <= lo.aps_weight < math.inf:
@@ -484,8 +527,20 @@ def _validate(case: Case) -> None:
     if any(not isinstance(v, int) or v < 0 for v in budgets):
         raise ValueError("layout_opt formal-ranking budgets must be nonnegative")
     sc = case.scenarios
-    if sc.source not in ("weather", "file"):
-        raise ValueError("scenarios.source must be weather|file")
+    if sc.source not in ("clear_sky_days", "weather", "file"):
+        raise ValueError("scenarios.source must be clear_sky_days|weather|file")
+    if not isinstance(sc.n_days, int) or not 1 <= sc.n_days <= 366:
+        raise ValueError("scenarios.n_days must be an integer in 1..366")
+    if sc.clear_sky_model not in ("ineichen", "meinel"):
+        raise ValueError("scenarios.clear_sky_model must be ineichen|meinel")
+    tl = sc.linke_turbidity
+    if tl is not None:
+        vals = [tl] if not isinstance(tl, (list, tuple)) else list(tl)
+        if (isinstance(tl, (list, tuple)) and len(vals) != 12) or not all(
+                isinstance(v, (int, float)) and 1.0 <= float(v) <= 10.0 for v in vals):
+            raise ValueError("scenarios.linke_turbidity must be null, a number in [1, 10] or 12 monthly numbers")
+    if case.annual.min_dni_w_m2 < 0:
+        raise ValueError("annual.min_dni_w_m2 must be >= 0")
     if sc.source == "file" and not sc.file:
         raise ValueError("scenarios.source is 'file' but scenarios.file is not set")
     if sc.map_model not in ("uniform", "half_swap", "gradient", "clouds", "file"):

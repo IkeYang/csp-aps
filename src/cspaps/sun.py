@@ -184,7 +184,7 @@ class Samples:
 
 
 def _filter(case: Case, s: Samples) -> Samples:
-    keep = (s.elevation >= case.annual.min_sun_elevation_deg) & (s.dni > 0)
+    keep = _working(case, s)
     return Samples(s.elevation[keep], s.azimuth[keep], s.dni[keep], s.weight_h[keep],
                    s.times[keep] if s.times is not None else None, s.label)
 
@@ -230,6 +230,105 @@ def representative_day_samples(case: Case) -> Samples:
     else:
         dni_v = dni(el, case.sun, case.site)
     return _filter(case, Samples(el, az, dni_v, np.asarray(weights), idx, "representative_days"))
+
+
+CLEAR_SKY_MODELS = ("ineichen", "meinel")
+
+
+def clear_sky_dni(times: pd.DatetimeIndex, elevation_deg, site: Site, model: str = "ineichen",
+                  linke_turbidity=None) -> np.ndarray:
+    """Clear-sky DNI (W/m2) for the site at these times (one value per time, the same for every mirror).
+
+    "ineichen": Ineichen-Perez (pvlib) with the extraterrestrial DNI of the date, the site altitude
+    (pressure-corrected air mass) and the Linke turbidity of the site: ``linke_turbidity`` None = pvlib's
+    monthly climatology of the site interpolated to the day (the local typical clear-sky atmosphere), a
+    number = that value all year, 12 numbers = one per month. "meinel": Meinel with Laue's altitude
+    correction (elevation only)."""
+    el = np.asarray(elevation_deg, dtype=float)
+    if model == "meinel":
+        return dni_meinel(el, site.elevation_m)
+    if model != "ineichen":
+        raise ValueError(f"unknown clear-sky model '{model}' (use {', '.join(CLEAR_SKY_MODELS)})")
+    from pvlib import atmosphere, clearsky, irradiance
+
+    zen = 90.0 - el
+    with np.errstate(invalid="ignore", divide="ignore"):
+        am_rel = atmosphere.get_relative_airmass(np.where(el > 0, zen, 89.9), model="kastenyoung1989")
+    am_abs = atmosphere.get_absolute_airmass(am_rel, atmosphere.alt2pres(site.elevation_m))
+    if linke_turbidity is None:
+        tl = clearsky.lookup_linke_turbidity(times, site.latitude, site.longitude).to_numpy(float)
+    elif np.ndim(linke_turbidity) == 0:
+        tl = np.full(len(times), float(linke_turbidity))
+    else:
+        tl = np.asarray(linke_turbidity, dtype=float)[np.asarray(times.month) - 1]
+    cs = clearsky.ineichen(np.where(el > 0, zen, 89.9), np.asarray(am_abs, float), tl,
+                           altitude=site.elevation_m, dni_extra=np.asarray(irradiance.get_extra_radiation(times), float))
+    return np.where(el > 0, np.nan_to_num(np.asarray(cs["dni"], float)), 0.0)
+
+
+def design_days(year: int, n_days: int) -> list[tuple[pd.Timestamp, int]]:
+    """``n_days`` representative days of the year: the year cut into n equal date segments, the middle day
+    of each with the number of days it stands for (they add up to the days of the year). Equal segments
+    follow the solar declination and the day length through every season."""
+    n_year = 365 + calendar.isleap(year)
+    n = max(1, min(int(n_days), n_year))
+    edges = np.floor(np.arange(n + 1) * n_year / n).astype(int)
+    start = pd.Timestamp(year=year, month=1, day=1)
+    return [(start + pd.Timedelta(days=int((a + b - 1) // 2)), int(b - a)) for a, b in zip(edges[:-1], edges[1:])]
+
+
+def _day_times(day: pd.Timestamp, step_min: float, timezone: str) -> pd.DatetimeIndex:
+    step = pd.Timedelta(minutes=step_min)
+    n = int(round(24 * 60 / step_min))
+    return to_times(day + (np.arange(n) + 0.5) * step, timezone)
+
+
+def _clear(case: Case, times: pd.DatetimeIndex, weights, label: str) -> Samples:
+    sc = case.scenarios
+    el, az = solar_position(times, case.site)
+    d = clear_sky_dni(times, el, case.site, sc.clear_sky_model, sc.linke_turbidity)
+    return Samples(el, az, d, np.asarray(weights, dtype=float), times, label)
+
+
+def clear_sky_design_days(case: Case, n_days: int | None = None) -> tuple[Samples, np.ndarray, list]:
+    """Every working hour of the representative clear-sky days (``design_days``).
+
+    Each state is one time step of a representative day (interval midpoint, site-local clock), with the
+    clear-sky DNI of that date and time shared by the whole field; it is kept when the sun is at least
+    ``annual.min_sun_elevation_deg`` high and the DNI reaches ``annual.min_dni_w_m2`` (the same working
+    threshold for every hour, low winter mornings included). Weight = days represented x step (h).
+    Returns (samples, day index of each state, [(date, days represented)])."""
+    a = case.annual
+    days = design_days(a.year, int(n_days or case.scenarios.n_days))
+    times, weights, day_idx = [], [], []
+    for k, (day, n_rep) in enumerate(days):
+        t = _day_times(day, a.time_step_min, case.site.timezone)
+        times.append(t)
+        weights.append(np.full(len(t), n_rep * a.time_step_min / 60.0))
+        day_idx.append(np.full(len(t), k))
+    idx = times[0].append(list(times[1:])) if len(times) > 1 else times[0]
+    s = _clear(case, idx, np.concatenate(weights), "clear_sky_days")
+    keep = _working(case, s)
+    out = Samples(s.elevation[keep], s.azimuth[keep], s.dni[keep], s.weight_h[keep], s.times[keep], s.label)
+    return out, np.concatenate(day_idx)[keep], days
+
+
+def clear_sky_year(case: Case) -> Samples:
+    """Every working time step of the year on the clear-sky model of the design baseline (search, control
+    variate), weight = the step (h)."""
+    a = case.annual
+    step = pd.Timedelta(minutes=a.time_step_min)
+    start = pd.Timestamp(year=a.year, month=1, day=1)
+    n = int(round(pd.Timedelta(days=365 + calendar.isleap(a.year)) / step))
+    times = to_times(start + (np.arange(n) + 0.5) * step, case.site.timezone)
+    s = _clear(case, times, np.full(n, a.time_step_min / 60.0), "clear_sky_hourly")
+    keep = _working(case, s)
+    return Samples(s.elevation[keep], s.azimuth[keep], s.dni[keep], s.weight_h[keep], s.times[keep], s.label)
+
+
+def _working(case: Case, s: Samples) -> np.ndarray:
+    a = case.annual
+    return (s.elevation >= a.min_sun_elevation_deg) & (s.dni > 0) & (s.dni >= a.min_dni_w_m2)
 
 
 REPRESENTATIVE_DNI = ("time_mean", "energy_weighted")
@@ -322,6 +421,11 @@ def _aggregate(samples: Samples, label: np.ndarray, scale: np.ndarray, dni_bands
     out = Samples(el, az, dni_rep, energy[keep] / dni_rep, None, name)
     out.members = np.bincount(label, minlength=n_lab)[keep]
     out.hours = hours
+    # representative state of every input sample (-1: a label without DNI energy), for estimators that
+    # correct each state with its members (control variates)
+    new_index = np.full(n_lab, -1, dtype=int)
+    new_index[np.flatnonzero(keep)] = np.arange(int(keep.sum()))
+    out.assignment = new_index[label]
     return out
 
 

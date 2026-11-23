@@ -157,9 +157,18 @@ def plot_history(history, path: str | Path | None = None):
     e = h["energy_mwh"].to_numpy()
     idx = np.arange(1, e.size + 1)
     if "stage" in h:
-        local = (h["stage"] == "local").to_numpy()
-        ax.plot(idx[~local], e[~local] / 1e3, ".", alpha=0.6, label="global search (differential evolution)")
-        ax.plot(idx[local], e[local] / 1e3, ".", color="tab:green", alpha=0.8, label="local refinement")
+        stage = h["stage"].astype(str).to_numpy()
+        styles = {"global": ("tab:blue", "global search (differential evolution)"),
+                  "local": ("tab:green", "local refinement"),
+                  "initial": ("tab:purple", "initial design (Sobol)"),
+                  "bayes": ("tab:orange", "Bayesian proposals (expected improvement)")}
+        for key, (color, label) in styles.items():
+            sel = stage == key
+            if sel.any():
+                ax.plot(idx[sel], e[sel] / 1e3, ".", color=color, alpha=0.7, label=label)
+        other = ~np.isin(stage, list(styles))
+        if other.any():
+            ax.plot(idx[other], e[other] / 1e3, ".", color="tab:gray", alpha=0.6, label="other")
     else:
         ax.plot(idx, e / 1e3, ".", alpha=0.6, label="evaluated layout")
     ax.plot(idx, np.maximum.accumulate(e) / 1e3, "-", color="tab:red", label="best so far")
@@ -167,7 +176,8 @@ def plot_history(history, path: str | Path | None = None):
         best = e.max() / 1e3
         ax.set_ylim(max(0.0, best * 0.7), best * 1.01)
     ax.set_xlabel("Evaluation")
-    ax.set_ylabel("Annual energy on receiver (GWh)")
+    formal = "objective_basis" in h and h["objective_basis"].astype(str).str.contains("formal V").any()
+    ax.set_ylabel("Annual value V, low fidelity (GWh)" if formal else "Annual energy on receiver (GWh)")
     ax.grid(alpha=0.3)
     ax.legend()
     return _finish(fig, path)

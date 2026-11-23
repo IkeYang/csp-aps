@@ -169,8 +169,12 @@ def build_response(
     shading_points: int | None = None,
     chunk: int = 48,
     store_occlusion_samples: bool = False,
+    blockers: np.ndarray | None = None,
 ) -> ResponseSet:
-    """Geometry, shading, intercept and sparse unit-DNI flux responses of all candidates."""
+    """Geometry, shading, intercept and sparse unit-DNI flux responses of all candidates.
+
+    ``blockers`` (bool, N) limits the mirrors that shade / block others (candidate positions priced "as if
+    added" to a layout: every mirror sees the layout's mirrors only)."""
     t0 = _time.perf_counter()
     spec = spec or case.aps
     rec, hel = case.receiver, case.heliostat
@@ -194,7 +198,8 @@ def build_response(
         non_tower_occluded = np.empty((n, k, n_pts ** 2), dtype=bool) if store_occlusion_samples else None
         for j in range(k):
             shadow = shading.shading_blocking(fld.xyz, normals[:, j], s, t[:, j], hel, rec, fld.pairs,
-                                              n_points=n_pts, tower_shadow=case.shading.tower_shadow)
+                                              n_points=n_pts, tower_shadow=case.shading.tower_shadow,
+                                              blockers=blockers)
             sb_k[:, j] = shadow["combined"]
             tower_dark[:, j] = shadow["tower_fraction"] >= 1.0
             if non_tower_occluded is not None:
@@ -213,6 +218,10 @@ def build_response(
     cells: list[np.ndarray] = []
     resp: list[np.ndarray] = []
     peaks = np.zeros(n)
+    from .backend import backend_name, min_elements
+
+    if backend_name() == "cupy":  # GPU: blocks big enough to pay for the transfers (results do not depend on it)
+        chunk = max(chunk, -(-4 * min_elements() // max(k * grid.points.shape[0], 1)))
     for start in range(0, n, chunk):
         stop = min(n, start + chunk)
         f = optics.footprints(
@@ -245,6 +254,10 @@ class AimProblem:
     reach: np.ndarray | None = None  # (N, K) bool: candidate reachable within the slew budget
     _fp: list | None = dc_field(default=None, repr=False)
     _fp_version: int = -1
+    # how often a flux limit excluded a candidate aim (greedy and uniformity moves). Zero together with a
+    # first-round fine-grid pass means the limits never shaped the plan: for the same direction and a DNI
+    # scaled by any factor <= 1 the solver takes the same decisions (``layout_value`` reuses such plans).
+    flux_limited: int = 0
 
     # -- pass-throughs used by the solvers
     @property
@@ -533,7 +546,7 @@ def solve_greedy(
     tol = spec.tie_tolerance
     avail = prob.available
     order = np.argsort(-prob.sigma[:, prob.center_k], kind="stable")  # image-size priority
-    stats = {"moves": 0}
+    stats = {"moves": 0, "flux_limited": 0}
 
     def choose(i: int) -> int:
         if not avail[i]:
@@ -547,6 +560,8 @@ def solve_greedy(
         touch = F > 1e-3 * F.max(axis=1, keepdims=True)
         ratio = np.where(touch, new / lim, 0.0).max(axis=1)
         feasible = ratio <= 1.0
+        if not feasible.all():
+            stats["flux_limited"] += 1
         if reach is not None:
             feasible &= reach[i]
         score = score_all[i]
@@ -614,6 +629,8 @@ def solve_greedy(
         passes_done += 1
         if stats["moves"] == before:
             break
+    owner = getattr(prob, "_prob", prob)  # a subfield view counts on its parent problem
+    owner.flux_limited = int(getattr(owner, "flux_limited", 0)) + stats["flux_limited"]
     return choice, {"passes": passes_done, "repairs": repairs, "timed_out": timed_out["v"]}
 
 
@@ -841,6 +858,10 @@ def solve(
         if not np.array_equal(retained, choice):
             choice = retained
             check = prob.verify(choice) if spec.verify else None
+    info["flux_limited"] = int(prob.flux_limited)
+    info["limits_active"] = bool(prob.flux_limited or info.get("verification_rounds") or info.get("repair_rounds")
+                                 or info.get("uniformity_repair_rounds") or info.get("final_repair_rounds")
+                                 or info.get("hotspot_points_added") or check is None or not check.ok)
     return finalize(prob, method, choice, info, check, spec, t0)
 
 

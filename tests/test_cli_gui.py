@@ -178,7 +178,7 @@ def test_gui_cloud_compare_and_formal_value(monkeypatch, tmp_path):
     monkeypatch.setenv("CSPAPS_GUI_SYNC", "1")
     d = small_case_dict()
     d["uniformity"] = {"enabled": True, "mode": "weighted", "weight": 0.3}
-    d["scenarios"] = {"n_scenarios": 2, "map_model": "half_swap"}
+    d["scenarios"] = {"source": "weather", "n_scenarios": 2, "map_model": "half_swap"}
     d["field"]["generator"]["r_max"] = 80
     d["layout_opt"].update({"n_heliostats": 60, "refine_top": 1, "review_check_hourly": False, "swap_rounds": 0,
                             "formal_swap_rounds": 0})

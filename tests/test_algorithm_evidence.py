@@ -153,7 +153,7 @@ def test_inner_benchmark_measures_every_method_against_one_bound(small_case):
 
 
 def test_outer_benchmark_scores_both_searches_on_held_out_scenarios(small_case):
-    r = outer_benchmark(small_case, seeds=(1,), budget_s=6, max_evals=6)
+    r = outer_benchmark(small_case, methods=("de", "multistart_free"), seeds=(1,), budget_s=6, max_evals=6)
     runs = r["runs"]
     assert list(runs["method"]) == ["de", "multistart_free"]
     assert (runs["site_status"] == "ok").all() and (runs["pairs_too_close"] == 0).all()

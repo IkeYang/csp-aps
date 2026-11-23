@@ -164,7 +164,8 @@ def test_aksai_selection_has_no_detached_heliostats():
     from .conftest import ROOT
 
     case = load_case(ROOT / "cases" / "aksai_demo.yaml")
-    case.scenarios.map_model = "uniform"  # the audit case: station DNI uniform over the site
+    case.scenarios.source = "weather"  # the audit case: the station's weather year,
+    case.scenarios.map_model = "uniform"  # DNI uniform over the site
     lo = case.layout_opt
     smp = make_samples(case, lo.search_sampling, lo.n_sun_bins, 1, seed=lo.seed)
     params = {"spacing_factor": 1.1, "radial_spacing": 0.8689, "radial_growth": 0.1831, "azimuthal_spacing": 1.0005}

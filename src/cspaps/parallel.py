@@ -9,7 +9,9 @@ a pickle boundary. Main-thread scripts use processes:
   forking can deadlock): ``forkserver`` (or ``spawn``), which re-imports the
   main module -- Streamlit's entry point is guarded;
 * other platforms: ``spawn``. Scripts that use parallel runs on Windows/macOS
-  need the usual ``if __name__ == "__main__":`` guard.
+  need the usual ``if __name__ == "__main__":`` guard;
+* GPU backend switched on (``CSPAPS_GPU=1``): ``forkserver`` on Linux too, because CUDA cannot be used in
+  a child forked after the parent initialised it. Scripts then need the ``__main__`` guard as well.
 """
 
 from __future__ import annotations
@@ -27,7 +29,11 @@ def n_workers(setting: int) -> int:
 
 
 def start_method() -> str:
+    from .backend import enabled as gpu_enabled
+
     methods = mp.get_all_start_methods()
+    if gpu_enabled() and "forkserver" in methods:
+        return "forkserver"  # every worker opens its own CUDA context
     if "fork" in methods and threading.active_count() == 1:
         return "fork"
     main_file = getattr(sys.modules.get("__main__"), "__file__", None)

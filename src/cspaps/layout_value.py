@@ -33,6 +33,7 @@ Status of a scenario and what it adds to V:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -84,6 +85,12 @@ class InnerSettings:
     region_panels: tuple[int, ...] | None = None
     region_z: tuple[float, float] | None = None
     min_load_mw: float = 0.0
+    # "responses": the spot responses of one sun direction are built once and copied for every scenario of it
+    #              (plans bit-identical to independent solves);
+    # "full":      also plans reused across DNI levels when the limits never acted, and warm starts along the
+    #              sun path (deterministic for the set, faster; independent cold solves may differ by ties);
+    # "off":       every scenario built and solved from scratch
+    reuse: str = "responses"
 
     def record(self) -> dict:
         d = {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.__dict__.items()}
@@ -135,7 +142,7 @@ def inner_settings(case: Case, lam_aps: float | None = None) -> InnerSettings:
         azimuth_offsets_deg=tuple(float(v) for v in aps.azimuth_offsets_deg), n_height_levels=int(aps.n_height_levels),
         height_span=float(aps.height_span), safety_margin=float(aps.safety_margin), allow_defocus=bool(aps.allow_defocus),
         region_panels=tuple(u.panels) if u.panels else None, region_z=tuple(u.z_range) if u.z_range else None,
-        min_load_mw=float(u.min_load_mw))
+        min_load_mw=float(u.min_load_mw), reuse=str(lo.inner_reuse))
 
 
 def inner_case(case: Case, settings: InnerSettings) -> Case:
@@ -214,9 +221,18 @@ def _circ_spread(case, snap) -> float:
     return float(mask.sum() * np.sqrt(var) * snap.p_absorbed / q.sum())
 
 
+def inner_response(case: Case, fld: Field, elevation: float, azimuth: float, settings: InnerSettings,
+                   grid: ReceiverGrid):
+    """The spot responses of one sun direction (DNI-independent), as ``solve_instant`` builds them."""
+    from .aps import build_response
+
+    c = inner_case(case, settings)
+    return build_response(c, fld, elevation, azimuth, grid, c.aps)
+
+
 def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni, settings: InnerSettings | None = None,
                   grid: ReceiverGrid | None = None, keep_flux: bool = True, warm=None,
-                  dni_constraint=None) -> PlanResult:
+                  dni_constraint=None, response=None) -> PlanResult:
     """Task 1 for one instant with the formal settings (deterministic: same inputs -> same plan).
 
     ``dni_constraint`` (per heliostat, >= dni) is the DNI the flux limits are checked with, e.g. the
@@ -240,10 +256,15 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
         return PlanResult("no_sun", 0.0, 0.0, 0.0, 0.0, None, None, 0.0, 0.0, 0.0, 0.0, "no_sun", True, 0.0, 0.0,
                           "ok", n, 0, dni_v, aim_az, aim_z, np.ones(n, bool), zeros.copy(),
                           np.zeros(grid.shape) if keep_flux else None, _time.perf_counter() - t0)
-    prob = build_problem(c, fld, elevation, azimuth, dni_v, dni_constraint, grid=grid)
+    if response is not None:  # a copy: the solve adds hotspot points to its response set
+        from .aps import make_problem
+
+        prob = make_problem(copy.deepcopy(response), dni_v, dni_constraint, margin=c.aps.safety_margin)
+    else:
+        prob = build_problem(c, fld, elevation, azimuth, dni_v, dni_constraint, grid=grid)
     res = solve(prob, settings.method, c.aps, init=warm)
     solver_info = {k: res.info[k] for k in ("subfield_serial_s", "subfield_parallel_s", "milp_status",
-                                             "final_repair_rounds") if k in res.info}
+                                             "final_repair_rounds", "flux_limited", "limits_active") if k in res.info}
     initial = res.choice.copy()
     dual = None
     if settings.certify_rounds > 0 and (prob.k + 1) ** min(prob.n, 20) > c.aps.coupled_exact_limit:
@@ -268,6 +289,9 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     upper = cert.get("upper_bound_mw")
     info = {"bound_status": cert["status"], "evaluated_joint_poses": cert.get("evaluated_joint_poses"),
             "raw_power_w": float(thermal["power_w"]), "raw_spread_w": float(thermal["spread_w"]), **solver_info}
+    # the flux limits never shaped this plan: same direction, DNI scaled by a factor <= 1 -> same decisions
+    info["limits_active"] = bool(solver_info.get("limits_active", True) or cert.get("flux_rejections")
+                                 or settings.certify_rounds > 0 or chk is None or chk.status != "ok")
     if chk is not None:
         info.update(hotspot_panel=int(chk.hotspot_panel), hotspot_azimuth_deg=float(chk.hotspot_azimuth_deg),
                     hotspot_z_m=float(chk.hotspot_z), peak_to_limit=float(chk.peak_ratio))
@@ -288,6 +312,21 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
         np.asarray(res.choice, int))
 
 
+# names of the annual numbers by the basis of the scenario set (README 0.9.0): on the clear-sky design baseline V and
+# E are the "clear-sky annual score" and "clear-sky annual absorbed heat"
+VALUE_LABELS = {
+    "clear_sky_design": {"value": "晴空年度综合得分", "energy": "晴空年度吸热量", "penalty": "晴空年度均匀性扣分",
+                         "value_en": "clear-sky annual score", "energy_en": "clear-sky annual absorbed heat",
+                         "basis": "晴空年度：代表日逐时晴空 DNI，全场同一 DNI"},
+    None: {"value": "年度价值", "energy": "全年吸收热量", "penalty": "均匀性扣分",
+           "value_en": "annual value", "energy_en": "annual absorbed heat", "basis": "气象年代表工况"},
+}
+
+
+def value_labels(basis: str | None) -> dict:
+    return VALUE_LABELS.get(basis, VALUE_LABELS[None])
+
+
 @dataclass
 class ScenarioRecord:
     scenario_id: str
@@ -299,6 +338,11 @@ class ScenarioRecord:
     plan: PlanResult
     actual_hours: float | None = None  # real time the scenario stands for (h); hours is the weight of V
     map_digest: str | None = None  # content hash of the DNI map (identifies the exact map used)
+    # control variate (``control_variate``): cheap-model energy at the representative state (h_s C(s)) and summed
+    # over the member hours of the scenario; their ratio corrects the scenario's contribution to the annual value
+    cheap_rep_mwh: float | None = None
+    cheap_members_mwh: float | None = None
+    cv_factor: float | None = None
 
     def row(self, lam_aps: float, lam_l: float) -> dict:
         p = self.plan
@@ -324,6 +368,8 @@ class ScenarioRecord:
             "peak_to_limit": p.info.get("peak_to_limit"), "hotspot_panel": p.info.get("hotspot_panel"),
             "hotspot_azimuth_deg": p.info.get("hotspot_azimuth_deg"), "hotspot_z_m": p.info.get("hotspot_z_m"),
             "dni_map_digest": self.map_digest, "actual_hours": self.actual_hours,
+            "cheap_rep_mwh": self.cheap_rep_mwh, "cheap_members_mwh": self.cheap_members_mwh,
+            "cv_factor": self.cv_factor,
             "solve_time_s": round(p.solve_time_s, 3),
             "additional_joint_trials": p.info.get("additional_joint_trials", 0),
         }
@@ -341,10 +387,16 @@ def annual_value(table: pd.DataFrame, lam_l: float) -> dict:
     pen = float(h @ u)
     solved = ~(table["status"] == "not_solved").to_numpy()
     complete = bool(solved.all())
-    return {"value_mwh": e - lam_l * pen if complete else float("nan"), "energy_mwh": e, "penalty_mwh": pen,
-            "complete": complete, "value_partial_mwh": e - lam_l * pen,
-            "n_scenarios": int(len(table)), "n_solved": int(solved.sum()),
-            "coverage": float(solved.mean()), "hours_coverage": float(h[solved].sum() / h.sum()) if h.sum() > 0 else 1.0}
+    out = {"value_mwh": e - lam_l * pen if complete else float("nan"), "energy_mwh": e, "penalty_mwh": pen,
+           "complete": complete, "value_partial_mwh": e - lam_l * pen,
+           "n_scenarios": int(len(table)), "n_solved": int(solved.sum()),
+           "coverage": float(solved.mean()), "hours_coverage": float(h[solved].sum() / h.sum()) if h.sum() > 0 else 1.0}
+    if "cv_factor" in table and table["cv_factor"].notna().all():
+        f = table["cv_factor"].to_numpy(float)
+        e_cv, pen_cv = float(h @ (p * f)), float(h @ (u * f))
+        out.update(value_cv_mwh=e_cv - lam_l * pen_cv if complete else float("nan"), energy_cv_mwh=e_cv,
+                   penalty_cv_mwh=pen_cv)
+    return out
 
 
 @dataclass
@@ -405,6 +457,10 @@ class LayoutValue:
                                    and not status.get("no_feasible_found") else None),
             "max_inner_gap": float(t["inner_gap"].dropna().max()) if len(t) and t["inner_gap"].notna().any() else None,
             "circ_penalty_mwh": e_circ, "cv_2d_power_weighted": cv_w,
+            "value_cv_mwh": v.get("value_cv_mwh"), "energy_cv_mwh": v.get("energy_cv_mwh"),
+            "penalty_cv_mwh": v.get("penalty_cv_mwh"),
+            "cv_correction_pct": (100.0 * (v["value_cv_mwh"] / v["value_mwh"] - 1.0)
+                                  if v.get("value_cv_mwh") is not None and v["complete"] and v["value_mwh"] else None),
             "scenario_fingerprint": self.scenario_fingerprint, "settings_digest": self.settings.digest(),
             "runtime_s": round(self.runtime_s, 2), **self.tags,
         }
@@ -477,16 +533,262 @@ def recompute_from_csv(path, lam_l: float | None = None) -> dict:
     return {**annual_value(t, lam), "lambda_layout": lam}
 
 
+def control_variate(case: Case, value: "LayoutValue", sset, workers: int | None = None) -> bool:
+    """Attach the control-variate factors of every scenario to ``value`` (False when the set has no hours).
+
+    Cheap model C: centre aiming without flux maps (``simulate.annual``, every mirror reads its own DNI from
+    the hour's map). For scenario s with member hours t (weights w_t):
+
+        f_s = sum_t w_t C(t) / (h_s C(s))          C(s) = the cheap model at the representative state
+
+    and the annual value is estimated as V_cv = sum_s h_s J_s f_s (likewise E and Pi). The representative
+    state's error in the expensive model is assumed proportional to its error in the cheap model (separate
+    ratio estimator per scenario); f_s = 1 when the cheap model is linear over the members. The formal V is
+    unchanged; ``layout_opt.rank_by`` decides which one ranks."""
+    from .simulate import annual
+
+    if sset.hourly is None or sset.assignment is None or len(value.records) != len(sset):
+        return False
+    a = np.asarray(sset.assignment)
+    keep = np.flatnonzero(a >= 0)
+    if not keep.size:
+        return False
+    fld = Field(value.xyz, value.ids)
+    nw = workers if workers is not None else case.layout_opt.workers
+    hours = sset.hourly.subset(keep)
+    res_h = annual(case, fld, samples=hours, aiming="center", with_flux=False, workers=nw)
+    members = np.bincount(a[keep], weights=res_h.timeseries["p_absorbed_mw"].to_numpy(float) * hours.weight_h,
+                          minlength=len(sset))
+    res_r = annual(case, fld, samples=sset.samples, aiming="center", with_flux=False, workers=nw)
+    rep = res_r.timeseries["p_absorbed_mw"].to_numpy(float) * sset.samples.weight_h
+    for i, r in enumerate(value.records):
+        f = float(members[i] / rep[i]) if rep[i] > 1e-9 else 1.0
+        r.cheap_rep_mwh, r.cheap_members_mwh = float(rep[i]), float(members[i])
+        r.cv_factor = float(np.clip(f, 0.5, 2.0))
+    value.tags["control_variate"] = {"model": "centre aim, no flux map", "hours": int(keep.size),
+                                     "hourly_fingerprint": sset.hourly_fingerprint()}
+    return True
+
+
+def _price_chunk(args):
+    case, xyz, ids, cand, sset, chain, choices, settings, lam_l, max_iter = args
+    from .aps import build_response, make_problem
+    from .certify import aps_upper_bound, removal_losses
+
+    c = inner_case(case, settings)
+    grid = build_grid(c.receiver, settings.grid_shape[1], settings.grid_shape[0])
+    n, m = len(xyz), len(cand)
+    both = Field(np.vstack([xyz, cand]))
+    layout = np.r_[np.ones(n, bool), np.zeros(m, bool)]
+    s = sset.samples
+    out, key_rs, rs = [], None, None
+    for i in chain:
+        el, az = float(s.elevation[i]), float(s.azimuth[i])
+        key = _direction(sset, i)
+        if key != key_rs:  # DNI-independent: one response set per sun direction
+            rs, key_rs = build_response(c, both, el, az, grid, c.aps, blockers=layout), key
+        dni = sset.dni_at(i, both.xyz[:, :2])
+        prob = make_problem(rs, dni, margin=c.aps.safety_margin)
+        choice = np.r_[np.asarray(choices[i], int), np.full(m, -1)]
+        b = aps_upper_bound(prob, choice, "weighted", lam_l, None, settings.min_load_mw * 1e6, max_iter=max_iter,
+                            time_limit_s=1e9, price_mask=~layout)
+        loss = removal_losses(prob, choice, lam_l)
+        found = b["objective_found_mw"]
+        out.append((i, b["priced_gain_w"][n:], loss[:n], b["upper_bound_mw"] * 1e6,
+                    None if found is None else found * 1e6))
+    return out
+
+
+def dual_prices(case: Case, value: "LayoutValue", cand_xyz: np.ndarray, sset, settings: InnerSettings | None = None,
+                lam_layout: float | None = None, workers: int | None = None, max_iter: int = 150,
+                progress: Callable[[str], None] | None = None) -> dict:
+    """Flux-price (Lagrangian dual) estimate of adding each candidate position / removing each mirror (improvement 4).
+
+    For every counted scenario s the upper bound of task 1 (``certify.aps_upper_bound``, objective
+    P - lambda_L U in the candidate model, the layout's plan as the incumbent) yields multipliers: nu per flux
+    constraint point (the "congestion price" of that receiver cell) and the linearised uniformity weights.
+    A candidate position j -- shaded and blocked by the layout's mirrors, aimed at any of its candidate aim
+    points -- is priced by its reduced cost G_js = max(0, max_k [c_jk - DNI_j R_jk . (w_o + nu / lim)]): its own
+    power minus the price of the flux it would add. Annual gain_j = sum_s h_s G_js. Weak duality gives, per
+    scenario, J_s(L + j) <= UB_s + G_js (j not shading / blocking the layout), so
+    gain_j + gap bounds what adding j alone can add (gap = sum_s h_s (UB_s - J_s(plan))).
+    loss_i = sum_s h_s (J_s(plan) - J_s(plan without i)): what removing mirror i costs with the other aims kept
+    (exact in the model, no credit for neighbours it shaded). Returns MWh arrays; a swap i -> j is promising
+    when gain_j - loss_i > 0 (it is accepted only on the re-solved V).
+    """
+    from .parallel import n_workers, pool
+
+    t0 = _time.perf_counter()
+    settings = settings or value.settings
+    lam_l = float(value.lam_layout if lam_layout is None else lam_layout)
+    cand = np.asarray(cand_xyz, dtype=float).reshape(-1, 3)
+    n, m = value.n, len(cand)
+    gain, loss = np.zeros(m), np.zeros(n)
+    gap, n_used = 0.0, 0
+    if m == 0 or len(value.records) != len(sset):
+        return {"gain_mwh": gain, "loss_mwh": loss, "gap_mwh": 0.0, "scenarios": 0, "time_s": 0.0}
+    use = [i for i, r in enumerate(value.records)
+           if r.plan.counts and r.plan.choice is not None and r.elevation_deg > 0]
+    choices = {i: value.records[i].plan.choice for i in use}
+    groups: dict = {}
+    for i in use:
+        groups.setdefault(_direction(sset, i), []).append(i)
+    chains = sorted(groups.values(), key=len, reverse=True)
+    nw = min(n_workers(case.layout_opt.workers if workers is None else workers), max(len(chains), 1))
+    tasks = [(case, value.xyz, value.ids, cand, sset, ch, {i: choices[i] for i in ch}, settings, lam_l, max_iter)
+             for ch in chains]
+    results = []
+    if nw > 1 and len(tasks) > 1:
+        p = pool(nw, probe=(_price_chunk, tasks[0]))
+        try:
+            for k, part in enumerate(p.imap_unordered(_price_chunk, tasks), start=1):
+                results += part
+                if progress:
+                    progress(f"flux prices: {k}/{len(tasks)} sun directions")
+        finally:
+            p.close()
+            p.join()
+    else:
+        for task in tasks:
+            results += _price_chunk(task)
+    for i, g, d, ub, found in results:
+        h = value.records[i].hours
+        gain += h * g / 1e6
+        loss += h * d / 1e6
+        if found is not None:
+            gap += h * max(ub - found, 0.0) / 1e6
+        n_used += 1
+    return {"gain_mwh": gain, "loss_mwh": loss, "gap_mwh": float(gap), "scenarios": n_used,
+            "lambda_layout": lam_l, "time_s": _time.perf_counter() - t0}
+
+
+def price_swaps(prices: dict, m: int) -> tuple[np.ndarray, np.ndarray, float]:
+    """Up to ``m`` (drop, add) pairs by predicted gain: best-priced candidates against the cheapest mirrors to
+    lose, kept while gain_j - loss_i > 0. Returns (drop indices, add indices, predicted change MWh)."""
+    order_add = np.argsort(-prices["gain_mwh"], kind="stable")
+    order_drop = np.argsort(prices["loss_mwh"], kind="stable")
+    k = 0
+    while (k < min(m, len(order_add), len(order_drop))
+           and prices["gain_mwh"][order_add[k]] - prices["loss_mwh"][order_drop[k]] > 0):
+        k += 1
+    pred = float(prices["gain_mwh"][order_add[:k]].sum() - prices["loss_mwh"][order_drop[:k]].sum())
+    return order_drop[:k], order_add[:k], pred
+
+
 # --------------------------------------------------------------------------- whole layout
 
-def _scenario_chunk(args):
-    case, xyz, ids, sset, idx, settings, keep_flux = args
-    fld = Field(xyz, ids)
-    grid = build_grid(case.receiver, settings.grid_shape[1], settings.grid_shape[0])
+def _direction(sset, i: int) -> tuple[float, float]:
+    s = sset.samples
+    return round(float(s.elevation[i]), 9), round(float(s.azimuth[i]), 9)
+
+
+FULL_REUSE_CHAINS = 8  # warm-start chains of reuse "full": fixed, so plans never depend on the number of cores
+
+
+def scenario_chains(sset, settings: InnerSettings) -> list[list[int]]:
+    """How the scenarios are solved: lists solved in order by one worker each.
+
+    Scenarios of one sun direction stay together (their spot responses are built once); inside a direction
+    the same map comes together, highest DNI first (a plan the limits never shaped is reused for the lower
+    DNI levels). With ``reuse = "full"`` the directions are ordered along the sun path and cut into
+    ``FULL_REUSE_CHAINS`` contiguous chains of about equal weight, each warm-starting from its previous
+    scenario. The chains depend on the scenario set only, so the plans are the same on any computer."""
+    s = sset.samples
+    groups: dict = {}
+    for i in range(len(sset)):
+        groups.setdefault(_direction(sset, i), []).append(i)
+    for key in groups:
+        groups[key].sort(key=lambda i: (int(s.map_index[i]) if s.map_index is not None else 0, -float(s.dni[i])))
+    weight = {k: float(sum(s.weight_h[i] * s.dni[i] for i in v)) for k, v in groups.items()}
+    if settings.reuse != "full":
+        return [groups[k] for k in sorted(groups, key=lambda k: -weight[k])]  # big first
+    keys = sorted(groups, key=lambda k: (round(k[0] / 10.0), k[1]))  # bands of 10 deg elevation, then azimuth
+    n_chains = max(1, min(FULL_REUSE_CHAINS, len(keys)))
+    total = sum(weight.values()) or 1.0
+    chains, cur, acc = [], [], 0.0
+    for k in keys:
+        cur += groups[k]
+        acc += weight[k]
+        if acc >= total * (len(chains) + 1) / n_chains and len(chains) < n_chains - 1:
+            chains.append(cur)
+            cur = []
+    if cur:
+        chains.append(cur)
+    return chains
+
+
+def _rescaled_plan(case: Case, fld: Field, el: float, az: float, dni: np.ndarray, src: PlanResult, factor: float,
+                   settings: InnerSettings, grid, keep_flux: bool, source_id: str) -> PlanResult:
+    """``src`` (solved where the limits never acted) at a DNI scaled by ``factor`` <= 1: same aims."""
+    from .simulate import evaluate
+
+    t0 = _time.perf_counter()
+    c = inner_case(case, settings)
+    aim = (src.aim_azimuth, src.aim_z)
+    snap = evaluate(c, fld, el, az, dni, aim=aim, active=src.active, grid=grid)
+    thermal = snap.thermal_objective(c.uniformity)
+    chk = snap.verify(c.receiver)
+    ok = src.status == "feasible"
+    p_abs = float(thermal["power_w"]) if ok else 0.0
+    u = float(thermal["spread_w"]) if ok else 0.0
+    alpha = snap.alpha_eff if snap.alpha_eff is not None else np.full(fld.n, c.receiver.absorptivity)
+    info = dict(src.info)
+    info.update(reused_from=source_id, dni_factor=float(factor), raw_power_w=float(thermal["power_w"]),
+                raw_spread_w=float(thermal["spread_w"]), hotspot_panel=int(chk.hotspot_panel),
+                hotspot_azimuth_deg=float(chk.hotspot_azimuth_deg), hotspot_z_m=float(chk.hotspot_z),
+                peak_to_limit=float(chk.peak_ratio))
+    for k in ("dual_bound_mw",):
+        if info.get(k) is not None:
+            info[k] = info[k] * factor
+    return replace(src, p_abs_w=p_abs, u_w=u, p_int_w=float(snap.p_receiver) if ok else 0.0,
+                   p_h_w=float(thermal["power_h_w"]) if ok else 0.0, cv_2d=thermal["cv_2d"] if ok else None,
+                   circ_u_w=_circ_spread(c, snap) if ok else 0.0, objective_w=p_abs - settings.lam_aps * u,
+                   upper_bound_w=src.upper_bound_w * factor if src.upper_bound_w is not None else None,
+                   peak_flux_kw_m2=float(chk.peak_flux_kw_m2),
+                   peak_ratio=float(chk.peak_ratio / max(chk.allowed_ratio, 1e-12)), flux_status=chk.status,
+                   dni=np.asarray(dni, float).copy(), mirror_power_w=np.asarray(snap.power["intercept"] * alpha, float),
+                   flux=snap.flux if keep_flux else None, solve_time_s=_time.perf_counter() - t0, info=info)
+
+
+def solve_chain(case: Case, fld: Field, sset, chain: list[int], settings: InnerSettings, grid=None,
+                keep_flux: bool = True) -> list[tuple[int, "ScenarioRecord"]]:
+    """Solve the scenarios of ``chain`` in order, reusing what ``settings.reuse`` allows (see InnerSettings)."""
+    grid = grid or build_grid(case.receiver, settings.grid_shape[1], settings.grid_shape[0])
+    s = sset.samples
     out = []
-    for i in idx:
-        out.append((i, solve_scenario(case, fld, sset, i, settings, grid, keep_flux)))
+    key_rs, rs = None, None
+    first: dict = {}  # (direction, map) -> (scenario index, plan) of its highest DNI
+    prev = None
+    for i in chain:
+        el, az = float(s.elevation[i]), float(s.azimuth[i])
+        key = _direction(sset, i)
+        if settings.reuse in ("responses", "full") and key != key_rs and el > 0:
+            rs, key_rs = inner_response(case, fld, el, az, settings, grid), key
+        dni = sset.dni_at(i, fld.xyz[:, :2])
+        plan = None
+        g = (key, sset.map_id(i))
+        if settings.reuse == "full" and g in first:
+            j, src = first[g]
+            pos = src.dni > 0
+            ratio = dni[pos] / src.dni[pos] if pos.any() else np.zeros(0)
+            if (ratio.size and np.allclose(ratio, ratio[0], rtol=1e-9, atol=0.0) and ratio[0] <= 1.0 + 1e-12
+                    and np.all(dni[~pos] == 0) and src.status == "feasible" and not src.info.get("limits_active", True)):
+                plan = _rescaled_plan(case, fld, el, az, dni, src, float(ratio[0]), settings, grid, keep_flux,
+                                      sset.ids[j])
+        if plan is None:
+            warm = prev.choice if settings.reuse == "full" and prev is not None and prev.choice is not None else None
+            plan = solve_instant(case, fld, el, az, dni, settings, grid, keep_flux, warm=warm,
+                                 response=rs if settings.reuse in ("responses", "full") and el > 0 else None)
+        first.setdefault(g, (i, plan))
+        prev = plan
+        out.append((i, ScenarioRecord(sset.ids[i], sset.map_id(i), float(s.weight_h[i]), el, az, float(s.dni[i]),
+                                      plan, float(s.actual_hours[i]), s.map_of(i).digest())))
     return out
+
+
+def _scenario_chunk(args):
+    case, xyz, ids, sset, chain, settings, keep_flux = args
+    return solve_chain(case, Field(xyz, ids), sset, chain, settings, None, keep_flux)
 
 
 def solve_scenario(case: Case, fld: Field, sset, i: int, settings: InnerSettings | None = None,
@@ -520,10 +822,10 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
         n_s_run = 0
     else:
         n_s_run = n_s
-    if nw > 1 and n_s_run > 1:
-        order = [int(i) for i in np.argsort(-sset.samples.weight_h * sset.samples.dni)]  # big scenarios first
-        tasks = [(case, xyz, ids, sset, [i], settings, keep_flux) for i in order]
-        p = pool(nw, probe=(_scenario_chunk, tasks[0]))
+    chains = scenario_chains(sset, settings)
+    if nw > 1 and n_s_run > 1 and len(chains) > 1:
+        tasks = [(case, xyz, ids, sset, chain, settings, keep_flux) for chain in chains]
+        p = pool(min(nw, len(tasks)), probe=(_scenario_chunk, tasks[0]))
         try:
             done = 0
             for out in p.imap_unordered(_scenario_chunk, tasks):
@@ -541,14 +843,22 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
     elif n_s_run:
         fld = Field(xyz, ids)
         grid = build_grid(case.receiver, settings.grid_shape[1], settings.grid_shape[0])
-        for i in range(n_s):
+        done = 0
+        for chain in chains:
             if stop():
                 break
-            results[i] = solve_scenario(case, fld, sset, i, settings, grid, keep_flux)
+            for i, rec in solve_chain(case, fld, sset, chain, settings, grid, keep_flux):
+                results[i] = rec
+                done += 1
             if progress:
-                progress(f"APS scenarios {name}: {i + 1}/{n_s}")
+                progress(f"APS scenarios {name}: {done}/{n_s}")
+    return _finish_value(case, name, xyz, ids, results, sset, settings, lam_l, t0, tags, stop, progress, workers)
+
+
+def _finish_value(case, name, xyz, ids, results, sset, settings, lam_l, t0, tags, stop, progress, workers):
+    """LayoutValue from the solved records (unsolved ones reported as such) + its control variate."""
     s = sset.samples
-    for i in range(n_s):
+    for i in range(len(sset)):
         if results[i] is None:  # cancelled
             n = len(xyz)
             z = np.zeros(n)
@@ -557,12 +867,80 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
             results[i] = ScenarioRecord(sset.ids[i], sset.map_id(i), float(s.weight_h[i]), float(s.elevation[i]),
                                         float(s.azimuth[i]), float(s.dni[i]), plan, float(s.actual_hours[i]),
                                         sset.samples.map_of(i).digest())
-    return LayoutValue(name, xyz, ids, results, settings.lam_aps, lam_l, sset.fingerprint(), settings,
-                       _time.perf_counter() - t0, dict(tags or {}))
+    from .backend import backend_name
+
+    basis = sset.meta.get("basis")
+    labels = value_labels(basis)
+    out = LayoutValue(name, xyz, ids, results, settings.lam_aps, lam_l, sset.fingerprint(), settings,
+                      _time.perf_counter() - t0, {**(tags or {}), "backend": backend_name(), "basis": basis,
+                                                  "value_label": labels["value"], "energy_label": labels["energy"]})
+    if case.layout_opt.control_variate and not stop() and all(r.plan.status != "not_solved" for r in results):
+        if progress:
+            progress(f"control variate {name}: centre-aim energy of the member hours")
+        t1 = _time.perf_counter()
+        if control_variate(case, out, sset, workers):
+            out.runtime_s += _time.perf_counter() - t1
+    return out
 
 
-def compare_values(values: list[LayoutValue], lam_l: float | None = None, reference: str | None = None) -> pd.DataFrame:
-    """Ranking by V with the decomposition of every difference into heat and uniformity."""
+def _layout_chunk(args):
+    case, xyz, ids, sset, chain, settings, keep_flux, name = args
+    return name, solve_chain(case, Field(xyz, ids), sset, chain, settings, None, keep_flux)
+
+
+def evaluate_layout_values(case: Case, layouts: dict, sset, settings: InnerSettings | None = None,
+                           lam_layout: float | None = None, workers: int | None = None, keep_flux: bool = True,
+                           progress: Callable[[str], None] | None = None, cancel: Callable[[], bool] | None = None,
+                           tags: dict | None = None) -> dict[str, LayoutValue]:
+    """Several layouts on one scenario set with one pool: every (layout, scenario chain) is one task, so all
+    cores stay busy even when there are fewer scenarios than cores. ``layouts``: name -> (xyz, ids or None);
+    ``tags``: name -> dict. Each value equals ``evaluate_layout_value`` of that layout."""
+    from .parallel import n_workers, pool
+
+    settings = settings or inner_settings(case)
+    lam_l = float(case.layout_opt.uniformity_weight if lam_layout is None else lam_layout)
+    nw = n_workers(case.layout_opt.workers if workers is None else workers)
+    stop = cancel or (lambda: False)
+    names = list(layouts)
+    tags = tags or {}
+    norm = {}
+    for n in names:
+        xyz, ids = layouts[n]
+        xyz = np.asarray(xyz, dtype=float).reshape(-1, 3)
+        norm[n] = (xyz, np.arange(1, len(xyz) + 1) if ids is None else np.asarray(ids))
+    if nw <= 1 or len(names) <= 1:
+        return {n: evaluate_layout_value(case, norm[n][0], sset, n, ids=norm[n][1], settings=settings, lam_layout=lam_l,
+                                         workers=nw, keep_flux=keep_flux, progress=progress, cancel=cancel,
+                                         tags=tags.get(n)) for n in names}
+    t0 = _time.perf_counter()
+    chains = scenario_chains(sset, settings)
+    tasks = [(case, norm[n][0], norm[n][1], sset, chain, settings, keep_flux, n) for n in names for chain in chains]
+    results = {n: [None] * len(sset) for n in names}
+    if not stop():
+        p = pool(min(nw, len(tasks)), probe=(_layout_chunk, tasks[0]))
+        try:
+            done = {n: 0 for n in names}
+            for name, out in p.imap_unordered(_layout_chunk, tasks):
+                for i, rec in out:
+                    results[name][i] = rec
+                    done[name] += 1
+                if progress:
+                    progress(f"APS scenarios {name}: {done[name]}/{len(sset)} "
+                             f"(all layouts {sum(done.values())}/{len(sset) * len(names)})")
+                if stop():
+                    p.terminate()
+                    break
+        finally:
+            p.close()
+            p.join()
+    return {n: _finish_value(case, n, norm[n][0], norm[n][1], results[n], sset, settings, lam_l, t0, tags.get(n),
+                             stop, progress, nw) for n in names}
+
+
+def compare_values(values: list[LayoutValue], lam_l: float | None = None, reference: str | None = None,
+                   rank_by: str = "value") -> pd.DataFrame:
+    """Ranking by V (or by its control-variate estimate, ``rank_by="value_cv"``) with the decomposition of
+    every difference into heat and uniformity."""
     if not values:
         return pd.DataFrame()
     fps = {v.scenario_fingerprint for v in values}
@@ -577,7 +955,11 @@ def compare_values(values: list[LayoutValue], lam_l: float | None = None, refere
     rows = [v.totals(lam) for v in values]
     df = pd.DataFrame(rows)
     df["rankable"] = df["complete"]
-    df = df.sort_values(["rankable", "value_mwh"], ascending=[False, False], kind="stable").reset_index(drop=True)
+    key = "value_mwh"
+    if rank_by == "value_cv" and "value_cv_mwh" in df and df["value_cv_mwh"].notna().all():
+        key = "value_cv_mwh"
+    df["ranked_by"] = key
+    df = df.sort_values(["rankable", key], ascending=[False, False], kind="stable").reset_index(drop=True)
     df["rank"] = np.where(df["rankable"], np.arange(1, len(df) + 1), np.nan)
     ref_name = reference if reference in set(df["name"]) else df.loc[0, "name"]
     ref = df.loc[df["name"] == ref_name].iloc[0]

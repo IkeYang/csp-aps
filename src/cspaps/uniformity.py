@@ -124,6 +124,8 @@ def _local_search(prob, state: _State, mu: float, passes: int, absorb_power: np.
             new_con = base_con[None, :] + Kc
             touch = Kc > 1e-3 * np.maximum(Kc.max(axis=1, keepdims=True), 1e-30)
             feasible = np.all((new_con <= limit[idx][None, :] * (1 + 1e-9)) | ~touch, axis=1)
+            if not feasible[:-1].all():
+                prob.flux_limited = int(getattr(prob, "flux_limited", 0)) + 1
             feasible[-1] = prob.case.aps.allow_defocus or old < 0
             if prob.reach is not None:
                 feasible[:-1] &= prob.reach[i]
