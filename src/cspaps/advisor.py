@@ -49,8 +49,8 @@ MODE_TEXT = {
     },
     "search": {
         "fast": "快速布局：初筛只跑 2 代差分进化，前 1 名与初始镜场在 6 个工况上正式排名，不做换位。几分钟看到一个可行布局。",
-        "standard": "标准布局：初筛 4 代，前 2 名在 12 个工况上正式排名，按年度价值换位 1 轮。",
-        "deep": "深度思考布局：初筛 16 代、更大种群，前 5 名在 20 个工况上逐工况 APS 正式排名，换位 3 轮、镜位微调 8 次，"
+        "standard": "标准布局：初筛 4 代，前 2 名在 12 个工况上正式排名，按通量价格换位 1 轮（重新求解后 V 提高才接受）。",
+        "deep": "深度思考布局：初筛 16 代、更大种群，前 5 名在 20 个工况上逐工况 APS 正式排名，通量价格换位 3 轮、镜位微调 8 次，"
                 "再用 40 个工况和独立云图复核。搜索范围更大、入围布局算得更细，结论最稳，用于定稿。",
     },
 }
@@ -230,22 +230,31 @@ def estimate_seconds(case: Case, task: str, mode: str, cal: Calibration | None =
     if task == "aim":
         parts["solve"] = cal.t_aim(mode, n)
     else:
-        n_s = int(c.scenarios.n_scenarios) if c.scenarios.source != "file" else _file_scenarios(c)
+        n_s = _scenario_count(c)
         # deep without rounding (large fields) costs about the standard solve per scenario
         t_s = cal.t_inner("standard" if mode == "deep" and n > LARGE_N else mode, n)
         lo = c.layout_opt
         dense = int(lo.dense_check_scenarios or 0)
+        if dense and c.scenarios.source == "clear_sky_days":  # the check uses twice as many days
+            dense = 2 * n_s
         if task == "compare":
             parts["formal"] = n_layouts * n_s * t_s / min(eff, n_s)
             parts["refine"] = n_layouts * int(lo.ranking_refine_states or 0) * t_s
             parts["dense"] = n_layouts * dense * t_s / min(eff, max(dense, 1)) if dense else 0.0
         else:
-            dim = 3
-            evals = max(1, lo.popsize) * dim * (max(0, lo.maxiter) + 1) + 2 * dim * lo.polish_rounds
-            parts["prescreen"] = evals * cal.t_prescreen(int(1.4 * n), lo.n_sun_bins) / eff
+            dim = 3 + (4 if lo.sector_spacing else 0)
+            if lo.search_method == "bayes":  # every proposal: N selected on the pre-screen, then low-fidelity V
+                per = (cal.t_prescreen(int(1.4 * n), lo.n_sun_bins)
+                       + int(lo.bayes_scenarios) * cal.t_inner("fast", n))
+                parts["prescreen"] = int(lo.bayes_evaluations) * per / eff
+            else:
+                evals = max(1, lo.popsize) * dim * (max(0, lo.maxiter) + 1) + 2 * dim * lo.polish_rounds
+                parts["prescreen"] = evals * cal.t_prescreen(int(1.4 * n), lo.n_sun_bins) / eff
             ranked = int(lo.refine_top) + (1 if lo.baseline == "initial" else 0)
             parts["formal"] = ranked * n_s * t_s / min(eff, n_s)
-            extra = int(lo.formal_swap_rounds) + int(lo.formal_position_trials or 0)
+            # a dual-priced swap round prices the free positions (about one layout) before the re-solve
+            swap_cost = 2 if lo.swap_pricing == "dual" else 1
+            extra = swap_cost * int(lo.formal_swap_rounds) + int(lo.formal_position_trials or 0)
             parts["swaps_and_moves"] = extra * n_s * t_s / min(eff, n_s)
             parts["refine"] = ranked * int(lo.ranking_refine_states or 0) * t_s
             parts["dense"] = 2 * dense * t_s / min(eff, max(dense, 1)) if dense else 0.0
@@ -257,6 +266,21 @@ def estimate_seconds(case: Case, task: str, mode: str, cal: Calibration | None =
             "n_heliostats": n, "workers": workers, "extrapolated": extrapolated}
 
 
+def _scenario_count(case: Case) -> int:
+    """Scenarios one layout is solved on: clear-sky design days x working hours, a weather set, or a table."""
+    sc = case.scenarios
+    if sc.source == "clear_sky_days":
+        try:
+            from .sun import clear_sky_design_days
+
+            return max(1, len(clear_sky_design_days(case)[0]))
+        except Exception:  # noqa: BLE001 - estimate: about 11 working hours a day
+            return 11 * int(sc.n_days)
+    if sc.source == "file":
+        return _file_scenarios(case)
+    return int(sc.n_scenarios) * int(sc.dni_bands)
+
+
 def _file_scenarios(case: Case) -> int:
     try:
         from .tables import read_user_csv
@@ -264,6 +288,16 @@ def _file_scenarios(case: Case) -> int:
         return max(1, len(read_user_csv(case.resolve(case.scenarios.file))))
     except Exception:  # noqa: BLE001
         return int(case.scenarios.n_scenarios)
+
+
+def _gpu_note() -> str:
+    from .backend import backend_name, devices, enabled
+
+    if backend_name() == "cupy":
+        return f"光斑与通量计算使用 GPU（CuPy，设备 {devices()}），时间估计按 CPU 校准，实际会更短。"
+    if enabled():
+        return "已设置 CSPAPS_GPU=1，但没有找到 CuPy 或 GPU，按 CPU 计算。"
+    return "当前按 CPU 多进程计算；安装 CuPy 并设置 CSPAPS_GPU=1 后，光斑与通量计算可在 GPU 上进行。"
 
 
 def fmt_duration(s: float) -> str:
@@ -304,7 +338,7 @@ def recommend(case: Case, task: str, budget_s: float = 900.0, cal: Calibration |
                   "建议加大预算，或先用较少工况 / 较少镜子试算。")
     return {"task": task, "task_label": TASK_ZH[task], "tier": tier, "budget_s": float(budget_s),
             "options": options, "recommended": rec, "reason": reason, "calibration": cal.source,
-            "workers": int(workers or recommended_workers()), "gpu": "当前版本只用 CPU（多进程）；GPU 加速在路线图中。"}
+            "workers": int(workers or recommended_workers()), "gpu": _gpu_note()}
 
 
 # --------------------------------------------------------------------------- calibration on this computer

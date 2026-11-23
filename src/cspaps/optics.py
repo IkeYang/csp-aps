@@ -212,7 +212,15 @@ def footprints_at(
     sigma: np.ndarray,
     power: np.ndarray,
 ) -> np.ndarray:
-    """Flux (W/m2) of each beam at arbitrary surface points (P, 3) with outward normals, (R, P)."""
+    """Flux (W/m2) of each beam at arbitrary surface points (P, 3) with outward normals, (R, P).
+
+    Large blocks run on the GPU when ``CSPAPS_GPU=1`` and CuPy is available (``backend``)."""
+    from .backend import enabled, footprints_gpu
+
+    if enabled():
+        gpu = footprints_gpu(points, normals, aim_xyz, t, sigma, power)
+        if gpu is not None:
+            return gpu
     e_u, e_v = image_plane_basis(t)
     # Projections as matrix products (BLAS) instead of forming (R, P, 3) offsets.
     pts = points

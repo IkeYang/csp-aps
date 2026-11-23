@@ -170,6 +170,13 @@ layout_opt:
 # check on independent maps (layout_opt.cross_check_maps) reports it. Design the layout with
 # scenarios.map_model: uniform (or persistent maps) and use these cloud maps to test operation and uniformity.
 scenarios:
+  # 设计基线：晴空年度。20 个代表日（按日期等分全年，取每段中间一天，权重 = 该段天数），每个代表日从早到晚
+  # 达到工作门槛（annual.min_sun_elevation_deg、annual.min_dni_w_m2）的每个小时都是一个工况；每小时一个全场共享的
+  # 晴空 DNI（Ineichen–Perez：站址、日期、时刻、当地典型林克浑浊度）。布局评分 = 晴空年度综合得分。
+  source: clear_sky_days
+  n_days: 20
+  clear_sky_model: ineichen
+  # 以下空间 DNI 设置只在敏感性分析时使用（source: weather），不进入设计评分
   n_scenarios: 20
   map_model: clouds
   cloud_maps: 10

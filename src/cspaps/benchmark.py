@@ -40,8 +40,8 @@ from .field import Field, site_mask
 INNER_METHODS = ("greedy", "milp", "subfield", "greedy_rounding")
 INNER_ZH = {"greedy": "贪心 APS（现行）", "milp": "固定响应整数规划", "subfield": "子场分解（可并行）",
             "greedy_rounding": "贪心 + 松弛取整"}
-OUTER_METHODS = ("de", "multistart_free")
-OUTER_ZH = {"de": "差分进化（现行）", "multistart_free": "多起点自由镜位"}
+OUTER_METHODS = ("de", "multistart_free", "bayes")
+OUTER_ZH = {"de": "差分进化（现行）", "multistart_free": "多起点自由镜位", "bayes": "贝叶斯优化（正式 V）"}
 
 
 # --------------------------------------------------------------------------- inner
@@ -276,20 +276,23 @@ def _multistart_free(case: Case, budget_s: float, seed: int, samples, pmap, log=
             "n_starts": len(starts), "time_s": _time.perf_counter() - t0}
 
 
-def _de(case: Case, budget_s: float, seed: int) -> dict:
+def _de(case: Case, budget_s: float, seed: int, method: str = "de") -> dict:
     from .layout_opt import optimize_layout
 
     c = case.copy()
     lo = c.layout_opt
     lo.seed = int(seed)
+    lo.search_method = method
     lo.maxiter = 10_000  # the wall-time budget stops the search (then the best layout is reviewed)
+    lo.bayes_evaluations = 10_000
     lo.refine_top, lo.formal_swap_rounds, lo.dense_check_scenarios = 0, 0, 0
     lo.review_check_hourly, lo.upper_bound = False, False
     t0 = _time.perf_counter()
     # stop the population search at 80 % of the budget: the selection polish / position review of the best
     # layout belongs to the method and runs after it
     res = optimize_layout(c, cancel=lambda: _time.perf_counter() - t0 > 0.8 * budget_s)
-    return {"xyz": res.best.xyz, "surrogate_mwh": float(res.best.energy_mwh), "start": "sobol population",
+    return {"xyz": res.best.xyz, "surrogate_mwh": float(res.best.energy_mwh),
+            "start": "sobol population" if method == "de" else "sobol design + Gaussian process",
             "evaluations": int(len(res.history)), "n_starts": 1, "time_s": _time.perf_counter() - t0}
 
 
@@ -297,18 +300,16 @@ def outer_benchmark(case: Case, methods=OUTER_METHODS, seeds=(1, 2), budget_s: f
                     held_out_seed_offset: int = 1000, held_out_extra: int = 5, max_evals: int | None = None,
                     progress=None) -> dict:
     """Both layout searches under the same wall-time budget, scored by V(L) on training and held-out sets."""
-    from . import sun
     from .certify import potential_map
     from .layout_opt import make_samples, validate_layout
     from .layout_value import evaluate_layout_value, inner_settings
-    from .scenarios import attach_regimes, build_scenarios, validation_scenarios
+    from .scenarios import build_scenarios, design_hourly, validation_scenarios
 
     say = progress or (lambda m: None)
     spec = case.layout_opt
     if not spec.n_heliostats:
         raise ValueError("layout_opt.n_heliostats must be set for the layout benchmark")
-    hourly = (build_scenarios(case).samples if case.scenarios.source == "file"
-              else attach_regimes(case, sun.hourly_samples(case)))
+    hourly = design_hourly(case)
     samples = make_samples(case, spec.search_sampling, spec.n_sun_bins, 1, hourly, spec.seed)
     pmap = potential_map(case, samples)
     train = build_scenarios(case, hourly=hourly)
@@ -320,8 +321,8 @@ def outer_benchmark(case: Case, methods=OUTER_METHODS, seeds=(1, 2), budget_s: f
     for m in methods:
         for sd in seeds:
             say(f"layout benchmark: {m}, seed {sd}")
-            if m == "de":
-                r = _de(case, budget_s, sd)
+            if m in ("de", "bayes"):
+                r = _de(case, budget_s, sd, m)
             elif m == "multistart_free":
                 r = _multistart_free(case, budget_s, sd, samples, pmap, max_evals=max_evals)
             else:

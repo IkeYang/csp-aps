@@ -97,8 +97,17 @@ def radial_staggered(
     radial_spacing: float = 0.866,
     radial_growth: float = 0.0,
     azimuthal_spacing: float = 1.0,
+    sector_n: float = 1.0,
+    sector_e: float = 1.0,
+    sector_s: float = 1.0,
+    sector_w: float = 1.0,
 ) -> np.ndarray:
     """Radially staggered layout (DELSOL / Collado style), returns (N, 2) xy.
+
+    ``sector_n/e/s/w`` >= 1 thin the field towards north / east / south / west: the azimuthal pitch is
+    multiplied by m(phi), interpolated between the four values (weights cos^2 of the angle to each, within
+    90 deg), by keeping about every m-th position of each ring. Only positions are removed, so the
+    collision-free spacing is kept.
 
     DM = heliostat diagonal * spacing_factor is the collision-free diameter.
     Within an azimuthal zone every ring has the same number of heliostats and
@@ -136,7 +145,29 @@ def radial_staggered(
         r += dr
     if not xs:
         return np.empty((0, 2))
+    sectors = (sector_n, sector_e, sector_s, sector_w)
+    if any(abs(m - 1.0) > 1e-12 for m in sectors):
+        if min(sectors) < 1.0:
+            raise ValueError("sector spacing factors must be >= 1 (they only thin the field)")
+        keep_x, keep_y = [], []
+        for x, y in zip(xs, ys):
+            phi = np.arctan2(x - tower_xy[0], y - tower_xy[1])  # compass azimuth, rad
+            m = sector_thinning(phi, sectors)
+            acc = np.cumsum(1.0 / m)  # keep a position each time the running density passes an integer
+            keep = np.floor(acc - 1e-9) > np.floor(np.concatenate([[0.0], acc[:-1]]) - 1e-9)
+            keep_x.append(x[keep])
+            keep_y.append(y[keep])
+        xs, ys = keep_x, keep_y
     return np.column_stack([np.concatenate(xs), np.concatenate(ys)])
+
+
+def sector_thinning(phi, factors) -> np.ndarray:
+    """m(phi) between the factors of north, east, south, west (phi compass azimuth in rad)."""
+    phi = np.asarray(phi, dtype=float)
+    centres = np.radians([0.0, 90.0, 180.0, 270.0])
+    d = (phi[..., None] - centres + np.pi) % (2 * np.pi) - np.pi
+    w = np.where(np.abs(d) < np.pi / 2, np.cos(d) ** 2, 0.0)
+    return (w * np.asarray(factors, float)).sum(axis=-1) / np.maximum(w.sum(axis=-1), 1e-12)
 
 
 def remove_collisions(xy: np.ndarray, min_dist: float) -> np.ndarray:

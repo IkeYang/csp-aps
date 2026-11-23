@@ -39,6 +39,7 @@ from cspaps.gui_plots import (
     value_decomposition_chart,
 )
 from cspaps.layout_opt import validate_layout
+from cspaps.layout_value import value_labels
 from cspaps.tables import export_name, read_user_csv
 from cspaps.optics import footprints_at
 from cspaps.resources import demo_case_path
@@ -143,9 +144,19 @@ LABELS = {
     "layout_opt.inner_joint_trials": "每个工况的联合姿态搜索次数", "layout_opt.inner_certify_rounds": "每个工况的松弛取整次数（0 = 关）",
     "layout_opt.inner_certify_iters": "每个工况的对偶上界迭代数", "layout_opt.dense_check_scenarios": "更密工况复核的工况数（0 = 关）",
     "layout_opt.cross_check_maps": "云影地图：用独立云图复核胜出布局",
+    "layout_opt.control_variate": "控制变量修正（用全年逐时中心瞄准能量修正代表工况）",
+    "layout_opt.rank_by": "排名依据",
+    "layout_opt.swap_pricing": "正式换位的选镜依据",
+    "layout_opt.inner_reuse": "工况间复用计算",
+    "layout_opt.search_method": "布局搜索方法", "layout_opt.bayes_evaluations": "贝叶斯搜索评估的布局数",
+    "layout_opt.bayes_initial": "贝叶斯初始布局数（0 = 自动）", "layout_opt.bayes_scenarios": "贝叶斯搜索每个布局的工况数",
+    "layout_opt.sector_spacing": "搜索北/东/南/西分扇区镜距",
     "annual.representative_dni": "代表工况的 DNI 与小时数口径",
     "scenarios.source": "工况来源", "scenarios.file": "工况表 CSV", "scenarios.n_scenarios": "代表工况数",
-    "scenarios.dni_bands": "每个太阳位置的 DNI 分档数", "scenarios.map_model": "空间 DNI 地图模型",
+    "scenarios.n_days": "晴空代表日数", "scenarios.clear_sky_model": "晴空 DNI 模型",
+    "scenarios.linke_turbidity": "林克浑浊度（空 = 站址气候值；一个数或 12 个月值）",
+    "annual.min_dni_w_m2": "工作门槛：最低 DNI (W/m²)",
+    "scenarios.dni_bands": "每个太阳位置的 DNI 分档数", "scenarios.shared_directions": "各地图与 DNI 分档共用太阳方向（可复用光斑响应）", "scenarios.map_model": "空间 DNI 地图模型",
     "scenarios.map_file": "DNI 地图库 CSV（map_id,x,y,value）", "scenarios.map_unit": "地图单位",
     "scenarios.map_normalize": "地图归一化", "scenarios.map_assignment": "地图分配到逐时数据的规则",
     "scenarios.map_sequence": "使用的地图及顺序（YAML 列表，空 = 全部）", "scenarios.map_include_uniform": "加入全场均匀 DNI 作兼容工况",
@@ -173,10 +184,15 @@ CHOICES = {
     "realtime.scenario": ["clouds", "moving_edge", "sudden_clear"],
     "mcrt.tracking_mode": ["per_ray", "per_heliostat"],
     "layout_opt.ranking": ["aps_value", "legacy"], "layout_opt.baseline": ["initial", "none"],
-    "scenarios.source": ["weather", "file"], "scenarios.map_model": ["uniform", "half_swap", "gradient", "clouds", "file"],
+    "scenarios.source": ["clear_sky_days", "weather", "file"], "scenarios.clear_sky_model": ["ineichen", "meinel"],
+    "scenarios.map_model": ["uniform", "half_swap", "gradient", "clouds", "file"],
     "scenarios.map_unit": ["factor", "w_m2"], "scenarios.map_normalize": ["site_mean", "none"],
     "scenarios.map_assignment": ["by_day", "single"],
     "annual.representative_dni": ["time_mean", "energy_weighted"],
+    "layout_opt.rank_by": ["value", "value_cv"],
+    "layout_opt.swap_pricing": ["energy", "dual"],
+    "layout_opt.inner_reuse": ["responses", "full", "off"],
+    "layout_opt.search_method": ["de", "bayes"],
 }
 CHOICE_LABELS = {
     "layout_opt.uniformity_metric": {"circumferential": "管屏之间（周向）", "surface": "整个考核区（二维热流）"},
@@ -204,12 +220,20 @@ CHOICE_LABELS = {
     "mcrt.tracking_mode": {"per_ray": "每条光线随机误差", "per_heliostat": "每面镜固定偏差"},
     "layout_opt.ranking": {"aps_value": "逐工况 APS 年度价值 V(L)（推荐）", "legacy": "0.4 版复核口径"},
     "layout_opt.baseline": {"initial": "把初始镜场一起排名", "none": "不对照"},
-    "scenarios.source": {"weather": "由站址气象年生成", "file": "导入工况表"},
+    "scenarios.source": {"clear_sky_days": "晴空代表日（设计基线）", "weather": "由站址气象年生成（敏感性分析）",
+                         "file": "导入工况表"},
+    "scenarios.clear_sky_model": {"ineichen": "Ineichen–Perez（日期、海拔、当地典型浑浊度）", "meinel": "Meinel（只随高度角）"},
     "scenarios.map_model": {"uniform": "全场均匀（兼容）", "half_swap": "左右半场亮暗 + 互换", "gradient": "线性梯度 + 反向",
                             "clouds": "随机云影", "file": "导入地图库"},
     "scenarios.map_unit": {"factor": "倍数（乘工况 DNI）", "w_m2": "绝对 DNI (W/m²)"},
     "scenarios.map_normalize": {"site_mean": "场地平均 = 1（只重新分配）", "none": "不归一化"},
     "scenarios.map_assignment": {"by_day": "逐日轮换", "single": "只用第一张"},
+    "layout_opt.rank_by": {"value": "代表工况上的正式 V", "value_cv": "控制变量修正后的全年估计"},
+    "layout_opt.swap_pricing": {"energy": "按能量（低产镜换出，中心瞄准高产镜位换入）",
+                                "dual": "按通量价格（上界乘子给空闲镜位定价，考虑吸热器拥挤）"},
+    "layout_opt.inner_reuse": {"responses": "同方向共用光斑响应（结果不变）", "full": "再复用方案与热启动（更快）",
+                               "off": "每个工况从头计算"},
+    "layout_opt.search_method": {"de": "差分进化（中心瞄准初筛）", "bayes": "贝叶斯优化（直接按少量工况的正式 V）"},
     "annual.representative_dni": {"time_mean": "实际小时 + 时间平均 DNI（推荐）", "energy_weighted": "辐照等效小时 + 能量加权 DNI（0.5.0 口径）"},
 }
 HELP = {
@@ -266,6 +290,25 @@ HELP = {
     "scenarios.map_contrast": "半场或梯度模型的相对亮暗差，0.3 表示亮侧 1.3 倍、暗侧 0.7 倍（归一化前）。",
     "scenarios.map_normalize": "场地平均 = 1 时地图只在空间上重新分配气象站 DNI，场地全年 DNI 总量不变。",
     "scenarios.map_assignment": "逐日轮换：第 k 天用第 k mod M 张地图，再在每张地图的小时中聚类代表工况。",
+    "scenarios.n_days": "全年按日期等分成这么多段，每段取中间一天，权重 = 该段天数。20 天覆盖各季节的赤纬和日长；每个代表日保留全部工作小时。",
+    "scenarios.clear_sky_model": "Ineichen–Perez：按日期的地外辐照、站址海拔和当地典型林克浑浊度（pvlib 月气候值，按日插值）计算晴空 DNI。",
+    "annual.min_dni_w_m2": "与最低太阳高度角一起构成统一的工作门槛；冬季早晨太阳低，但达到门槛的小时同样参与评价。",
+    "scenarios.shared_directions": "全年统一聚出一组太阳方向，各地图、各 DNI 分档共用。同一方向的光斑响应只算一次，"
+                                   "配合“再复用方案与热启动”时，限值没起作用的方案可直接用于更低的 DNI 档。更快，工况数大致不变。",
+    "layout_opt.control_variate": "代价低、精度收益大：对每个代表工况，用它所代表的全部逐时小时的中心瞄准能量（不解 APS）"
+                                  "修正代表状态的取样误差。正式 V 不变，另报修正后的全年估计 V_cv。需要气象年逐时数据。",
+    "layout_opt.rank_by": "正式 V（默认，可逐位复算的需求口径）或控制变量修正后的全年估计（更接近逐时真值，排名接近时更可信）。",
+    "layout_opt.inner_reuse": "同方向共用光斑响应：结果与逐个计算逐位相同，默认。再复用方案与热启动：更快，"
+                              "与独立冷启动可能因并列取舍有极小差别。每个工况从头计算：最慢，用于核对。",
+    "layout_opt.swap_pricing": "通量价格（推荐）：用每个工况 APS 上界的乘子给吸热器各网格定“拥挤价格”，空闲镜位按"
+                               "“自身功率 − 价格 × 它加上的热流”定价，看得见哪里已经顶到限值；每轮多花约一个布局的计算量。"
+                               "能量：只按中心瞄准年能量选镜位，快但看不到拥挤。两种都只在重新求解后 V 提高才接受。",
+    "layout_opt.search_method": "差分进化：快，按中心瞄准的理论能量初筛大量布局。贝叶斯优化：深度思考用，"
+                                "直接按少量工况的正式 V 评价每个布局，评价的布局少但每个都算得更真，适合参数少、单次很贵的情形。",
+    "layout_opt.bayes_evaluations": "贝叶斯搜索总共评价的布局数（含初始设计）。每个布局在“贝叶斯搜索每个布局的工况数”个工况上解 APS。",
+    "layout_opt.bayes_scenarios": "低保真评价用的工况数。越少越快；最终入围布局仍在全部代表工况上正式排名。",
+    "layout_opt.sector_spacing": "额外搜索北、东、南、西四个方向的稀疏系数（≥ 1，只删镜位、不改最小镜距），"
+                                 "让镜场在不同方向疏密不同。搜索维数多 4 个，适合贝叶斯优化或更多代的差分进化。",
 }
 STATE_ZH = {"ready": "仿真计划通过复核", "fallback": "使用保守回退方案", "infeasible": "无可行运行方案",
             "pending": "待计算", "awaiting_confirmation": "待人工确认", "confirmed": "已记录人工确认", "n/a": "—",
@@ -1125,6 +1168,18 @@ def _layout_from_choice(case, tag: str, choice: str):
     return str(path), (xyz, ids if ids is not None else np.arange(1, len(xyz) + 1)), None
 
 
+def _scenario_source_text(case) -> str:
+    """Where the annual scenarios come from, in one line (run summaries)."""
+    sc = case.scenarios
+    if sc.source == "clear_sky_days":
+        return (f"晴空代表日 {sc.n_days} 天 × 逐时（{'Ineichen–Perez' if sc.clear_sky_model == 'ineichen' else 'Meinel'} "
+                f"晴空 DNI，全场同一 DNI）· 结果为晴空年度吸热量与晴空年度综合得分")
+    if sc.source == "file":
+        return f"工况清单 {Path(sc.file).name}"
+    weather = Path(case.weather.file).name if case.weather.source == "file" else "晴空模型"
+    return f"站址气象 {weather} · 地图模型 {sc.map_model}（敏感性分析）"
+
+
 def _scenario_source_inputs(case, key: str) -> list[str]:
     """Annual scenarios: generated from the station weather, or a scenario list + map library imported in a batch."""
     from cspaps.dni_maps import load_map_file, model_maps
@@ -1133,9 +1188,13 @@ def _scenario_source_inputs(case, key: str) -> list[str]:
     data = st.session_state["case_dict"]
     sc = data.setdefault("scenarios", {})
     blockers = []
-    src = st.radio("工况从哪里来", ["weather", "file"], index=0 if case.scenarios.source == "weather" else 1,
+    options = ["clear_sky_days", "weather", "file"]
+    src = st.radio("工况从哪里来", options,
+                   index=options.index(case.scenarios.source) if case.scenarios.source in options else 0,
                    horizontal=True, key=f"scen_src_{key}",
-                   format_func={"weather": "由站址全年气象自动生成", "file": "导入工况清单与 DNI 地图"}.get)
+                   format_func={"clear_sky_days": "晴空代表日（设计基线，推荐）",
+                                "weather": "站址气象年 + 空间 DNI（敏感性分析）",
+                                "file": "导入工况清单与 DNI 地图"}.get)
     if key == "opt":
         check_file = st.file_uploader("独立复核工况 CSV（可选，共用地图库）", type=["csv"], key="validation_scenarios")
         if check_file is not None:
@@ -1174,8 +1233,20 @@ def _scenario_source_inputs(case, key: str) -> list[str]:
         if problems:
             st.caption("其他已匹配的工况仍可在下方预览；改正后重新导入对应文件即可，已导入的另一份文件会保留。")
             blockers.append("工况清单或地图库有错误")
+    elif src == "clear_sky_days":
+        sc["source"] = "clear_sky_days"
+        _fields("scenarios", ["n_days", "clear_sky_model"], n_cols=2)
+        _fields("annual", ["time_step_min", "min_sun_elevation_deg", "min_dni_w_m2"], n_cols=3)
+        _callout("info", "晴空年度：只比较镜位本身的全年光学表现",
+                 "全年取若干代表日（按日期等分，覆盖各季节的太阳赤纬和日长），保留每个代表日从早到晚达到工作门槛的全部小时。"
+                 "每小时一个全场共享的晴空 DNI（按站址、日期、时刻和当地典型晴空大气计算），每面镜的余弦、塔影、镜间阴影遮挡和截获仍按"
+                 "各自位置计算。每套布局逐小时求解 APS，按代表日对应的天数加权累计。所有候选布局用完全相同的日期、时段和权重。"
+                 "人为的东西亮暗、移动云影、实测云量和极端天气都不进入布局评分；结果记为“晴空年度吸热量”和“晴空年度综合得分”。")
     else:
         sc["source"] = "weather"
+        _callout("warn", "敏感性分析口径",
+                 "气象年口径会把实测云量（DNI 下降）和人为设定的空间 DNI 地图带进布局评分，适合研究“镜位对 DNI 分布有多敏感”，"
+                 "不建议作为布局设计基线。设计基线请选“晴空代表日”。")
         _fields("scenarios", ["n_scenarios", "map_model"], n_cols=2)
         model = (sc.get("map_model") or case.scenarios.map_model)
         if model in ("half_swap", "gradient"):
@@ -1317,8 +1388,7 @@ def _compare_workspace(case) -> None:
                 n_s, hrs = 0, 0.0
             region = ("整个吸热面" if not c5.uniformity.panels and not c5.uniformity.z_range else
                       f"管屏 {c5.uniformity.panels or '全部'}，高度 {c5.uniformity.z_range or '全高'}")
-            src = (f"工况清单 {Path(c5.scenarios.file).name}" if c5.scenarios.source == "file" else
-                   f"站址气象 {Path(c5.weather.file).name if c5.weather.source == 'file' else '晴空模型'}")
+            src = _scenario_source_text(c5)
             _run_summary([("镜数", " / ".join(f"{k} {len(v[0])} 面" for k, v in layouts.items())),
                           ("工况数", f"{n_s} 个"), ("合计代表小时（实际）", f"{hrs:,.0f} h"), ("数据来源", src),
                           ("考核区域", region), ("安全裕度", f"{c5.aps.safety_margin:.0%}"),
@@ -2033,9 +2103,9 @@ def _layout_search_inputs(case) -> str | None:
                 st.caption(f"工况预览不可用：{exc}")
         with st.expander("工况与地图的高级设置"):
             _fields("scenarios", ["map_include_uniform", "map_assignment", "map_sequence", "map_cell_m",
-                                  "dni_bands"], n_cols=2)
+                                  "dni_bands", "shared_directions"], n_cols=2)
             _fields("annual", ["representative_dni"], n_cols=1)
-            _fields("layout_opt", ["formal_swap_rounds", "formal_position_trials", "ranking_refine_states",
+            _fields("layout_opt", ["formal_swap_rounds", "swap_pricing", "formal_position_trials", "ranking_refine_states",
                                    "dense_check_scenarios", "inner_joint_trials", "inner_certify_rounds",
                                    "inner_certify_iters", "cross_check_maps"], n_cols=2)
     with _card("layout_search"):
@@ -2045,7 +2115,7 @@ def _layout_search_inputs(case) -> str | None:
         _fields("layout_opt", ["generator", "search_aiming", "refine_top", "upper_bound"])
         with st.expander("搜索范围、采样精度与计算资源"):
             common = {"n_heliostats", "generator", "search_aiming", "refine_top", "upper_bound", "uniformity_weight",
-                      "uniformity_metric", "ranking", "baseline", "aps_weight", "formal_swap_rounds",
+                      "uniformity_metric", "ranking", "baseline", "aps_weight", "formal_swap_rounds", "swap_pricing",
                       "dense_check_scenarios", "formal_position_trials", "ranking_refine_states", "inner_joint_trials",
                       "inner_certify_rounds", "inner_certify_iters", "cross_check_maps"}
             _fields("layout_opt", [f.name for f in dataclasses.fields(_SECTIONS["layout_opt"]) if f.name not in common])
@@ -2066,8 +2136,7 @@ def _layout_search_inputs(case) -> str | None:
         lo = case.layout_opt
         _run_summary([("镜数", f"{lo.n_heliostats} 面"), ("正式排名工况", f"{n_s} 个"),
                       ("合计代表小时（实际）", f"{hrs:,.0f} h"),
-                      ("数据来源", f"工况清单 {Path(case.scenarios.file).name}" if case.scenarios.source == "file"
-                       else f"站址气象 + 地图模型 {case.scenarios.map_model}"),
+                      ("数据来源", _scenario_source_text(case)),
                       ("考核区域", "整个吸热面" if not case.uniformity.panels and not case.uniformity.z_range else "部分区域"),
                       ("安全裕度", f"{case.aps.safety_margin:.0%}"),
                       ("参加排名", f"搜索前 {lo.refine_top} 名" + (" + 初始镜场" if lo.baseline == "initial" else "")),
@@ -2083,8 +2152,7 @@ def _layout_search_results(completed, res: dict, digest: str | None) -> None:
     if res.get("input_digest") != digest:
         _callout("warn", "参数已修改，需要重新计算",
                  f"下面的图表、指标和导出文件对应上一次的参数：镜数 {completed.layout_opt.n_heliostats}，"
-                 f"λ = {completed.layout_opt.uniformity_weight:g}，正式工况 {completed.scenarios.n_scenarios} 个，"
-                 f"地图模型 {completed.scenarios.map_model}。")
+                 f"λ = {completed.layout_opt.uniformity_weight:g}，{_scenario_source_text(completed)}。")
     f = res["result"].formal
     if f and f.get("values"):
         s_ = res["summary"]
@@ -2359,7 +2427,8 @@ def _planning_compare(case) -> None:
             ft = formal_vals[fname].totals()
             n_ok = ft["status_counts"].get("feasible", 0)
             n_all = sum(ft["status_counts"].values())
-            st.success(f"已进入正式排名（{wf.layout_label(fname)}）：年度价值 V = {ft['value_mwh']:,.0f} MWhₜₕ，"
+            st.success(f"已进入正式排名（{wf.layout_label(fname)}）：{value_labels(ft.get('basis'))['value']} V = "
+                       f"{ft['value_mwh']:,.0f} MWhₜₕ，"
                        f"{n_ok}/{n_all} 个工况可行运行。详见上方“正式排名”。")
         elif formal_vals:
             st.info("该布局只参加了中心瞄准初筛，没有进入正式排名。")
@@ -2474,9 +2543,10 @@ def _value_kpis(values: dict, ranking: pd.DataFrame, bound: dict | None, sset) -
     win = values[first["name"]]
     tot = win.totals()
     lam = tot["lambda_layout"]
+    vl = value_labels(tot.get("basis"))
     items = [
-        ("年度价值 V（第 1 名）", _format_number(tot["value_mwh"], 0), "MWhₜₕ", wf.layout_label(first["name"]), "good"),
-        ("全年吸收热量 E", _format_number(tot["energy_mwh"], 0), "MWhₜₕ", "Σ h_s·P_s，各工况自己的 APS 方案"),
+        (f"{vl['value']} V（第 1 名）", _format_number(tot["value_mwh"], 0), "MWhₜₕ", wf.layout_label(first["name"]), "good"),
+        (f"{vl['energy']} E", _format_number(tot["energy_mwh"], 0), "MWhₜₕ", "Σ h_s·P_s，各工况自己的 APS 方案"),
         ("均匀性扣分 λ_L·Π", _format_number(lam * tot["penalty_mwh"], 0), "MWhₜₕ",
          f"Π = Σ h_s·U_s = {tot['penalty_mwh']:,.0f} · λ_L = {lam:g}"),
         ("内层求解差距（年度加权）", f"≤ {_pct(tot['inner_gap_annual'], 2)}" if tot["inner_gap_annual"] is not None else "—", "",
@@ -2485,7 +2555,13 @@ def _value_kpis(values: dict, ranking: pd.DataFrame, bound: dict | None, sset) -
     if bound and bound.get("gap_value_conservative") is not None:
         items.append(("外层上界差距（保守）", f"≤ {_pct(bound['gap_value_conservative'], 1)}", "",
                       f"任意布局能量上界 {bound['upper_bound_mwh']:,.0f} MWhₜₕ"))
-    items.append(("工况集", f"{len(sset)}", "个", f"地图 {', '.join(sorted(sset.subset_maps()))} · 指纹 {sset.fingerprint()[:8]}", "navy"))
+    if sset.meta.get("basis") == "clear_sky_design":
+        n_days = len(sset.meta.get("days", []))
+        items.append(("工况集（晴空代表日）", f"{len(sset)}", "个小时",
+                      f"{n_days} 个代表日 · 晴空 DNI {sset.meta.get('clear_sky_model')} · 全场同一 DNI · 指纹 "
+                      f"{sset.fingerprint()[:8]}", "navy"))
+    else:
+        items.append(("工况集", f"{len(sset)}", "个", f"地图 {', '.join(sorted(sset.subset_maps()))} · 指纹 {sset.fingerprint()[:8]}", "navy"))
     st_ = win.settings
     items.append(("瞄准策略（每个工况）", "APS", "",
                   f"{'贪心' if st_.method == 'greedy' else '精确法'} + 联合姿态搜索 {st_.joint_trials} 次"
@@ -2527,8 +2603,9 @@ def _decision_callout(values: dict, ranking: pd.DataFrame) -> None:
         return
     dv, de, du = first["delta_value_mwh"], first["delta_energy_mwh"], first["delta_uniformity_mwh"]
     source = "更多吸热" if abs(de) >= abs(du) else "更均匀受热"
+    vl = value_labels(first.get("basis") if hasattr(first, "get") else None)
     _callout("ok", f"{lab(first['name'])} 得分最高，优势主要来自{source}",
-             f"相对 {lab(ref)}：年度价值 {dv:+,.1f} MWhₜₕ = 吸热量 {de:+,.1f} + 均匀性 {du:+,.1f}（−λ_L·ΔΠ）。"
+             f"相对 {lab(ref)}：{vl['value']} {dv:+,.1f} MWhₜₕ = {vl['energy']} {de:+,.1f} + 均匀性 {du:+,.1f}（−λ_L·ΔΠ）。"
              "每一项都来自各布局在同一组工况上自己的 APS 方案，可在“逐工况明细”中逐项核对。")
 
 
@@ -2536,16 +2613,21 @@ def _ranking_table(ranking: pd.DataFrame) -> pd.DataFrame:
     def statuses(d):
         return " · ".join(f"{VALUE_STATUS_ZH.get(k, k)} {v}" for k, v in d.items())
 
-    return pd.DataFrame({
+    vl = value_labels(ranking["basis"].iloc[0] if "basis" in ranking and len(ranking) else None)
+    out = pd.DataFrame({
         "排名": ranking["rank"].map(lambda v: "—" if pd.isna(v) else int(v)),
         "布局": ranking["name"].map(wf.layout_label), "镜数": ranking["n_heliostats"],
-        "年度价值 V (MWhₜₕ)": ranking["value_mwh"].round(1), "吸收热量 E (MWhₜₕ)": ranking["energy_mwh"].round(1),
+        f"{vl['value']} V (MWhₜₕ)": ranking["value_mwh"].round(1), f"{vl['energy']} E (MWhₜₕ)": ranking["energy_mwh"].round(1),
         "均匀性扣分 λ_L·Π (MWhₜₕ)": ranking["weighted_penalty_mwh"].round(1),
         "ΔV": ranking["delta_value_mwh"].round(1), "ΔE（吸热）": ranking["delta_energy_mwh"].round(1),
         "−λ_LΔΠ（均匀）": ranking["delta_uniformity_mwh"].round(1),
         "内层差距": ranking["inner_gap_annual"].map(lambda g: _pct(g, 2)),
         "工况状态": ranking["status_counts"].map(statuses),
         "周向扣分对照 Π_circ (MWhₜₕ)": ranking["circ_penalty_mwh"].round(1)})
+    if "value_cv_mwh" in ranking and ranking["value_cv_mwh"].notna().any():
+        # control variate: the hourly centre-aim energy of each scenario's member hours corrects its sampling error
+        out.insert(4, "全年估计 V_cv (MWhₜₕ)", ranking["value_cv_mwh"].round(1))
+    return out
 
 
 NEXT_STEP = {
@@ -2704,10 +2786,20 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
         st.caption("V(L) = Σ_s h_s (P_s − λ_L·U_s)。内层用 λ_APS 选瞄准方案，外层只按 λ_L 对这组方案的 P_s、U_s 重新计分，"
                    "每个工况的惩罚只扣一次；改变 λ_L 时各直线斜率为 −Π，交点处排名互换。周向扣分仅作对照，不参与排名。")
         if swaps:
-            st.dataframe(pd.DataFrame([{"轮次": w["round"], "布局": wf.layout_label(w["layout"]), "换位镜数": w["swapped"],
-                                        "ΔV (MWhₜₕ)": round(w["gain_value_mwh"], 2), "ΔE (MWhₜₕ)": round(w["gain_energy_mwh"], 2),
+            def _r2(v):
+                return None if v is None else round(float(v), 2)
+
+            st.dataframe(pd.DataFrame([{"轮次": w["round"], "布局": wf.layout_label(w["layout"]) if w.get("layout") else "—",
+                                        "选镜依据": "通量价格" if w.get("pricing") == "dual" else "能量",
+                                        "换位镜数": w["swapped"], "预测 ΔV (MWhₜₕ)": _r2(w.get("predicted_gain_mwh")),
+                                        "ΔV (MWhₜₕ)": _r2(w.get("gain_value_mwh")), "ΔE (MWhₜₕ)": _r2(w.get("gain_energy_mwh")),
                                         "接受": "是" if w["accepted"] else "否"} for w in swaps]), hide_index=True)
-            st.caption("换位：移出 APS 年吸热最少的镜子、换入定价最高的空闲候选镜位；只有在同一工况集上 V 提高才接受。")
+            if any(w.get("pricing") == "dual" for w in swaps):
+                st.caption("换位（通量价格）：每个工况的 APS 上界给出吸热器各网格的“拥挤价格”；空闲镜位的价值 = 自身功率 − "
+                           "价格 × 它会加上的热流，镜子的代价 = 去掉它损失的 P − λU。按“价值 − 代价”配对换位，"
+                           "预测值是一阶估计，只有在同一工况集上重新求解后 V 提高才接受。")
+            else:
+                st.caption("换位：移出 APS 年吸热最少的镜子、换入定价最高的空闲候选镜位；只有在同一工况集上 V 提高才接受。")
     names = list(values)
     with tabs[1]:
         c1, c2, c3 = st.columns(3)
@@ -2801,7 +2893,8 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
 
                 d = displacement(values["initial"].xyz, values[pick].xyz)
                 ti, tp = values["initial"].totals(), values[pick].totals()
-                _kpis([("年度价值 ΔV", f"{tp['value_mwh'] - ti['value_mwh']:+,.1f}", "MWhₜₕ", f"{labels[pick]} − 初始布局"),
+                _kpis([(f"{value_labels(tp.get('basis'))['value']} ΔV", f"{tp['value_mwh'] - ti['value_mwh']:+,.1f}", "MWhₜₕ",
+                        f"{labels[pick]} − 初始布局"),
                        ("吸热量 ΔE", f"{tp['energy_mwh'] - ti['energy_mwh']:+,.1f}", "MWhₜₕ"),
                        ("均匀性 −λ_LΔΠ", f"{-ti['lambda_layout'] * (tp['penalty_mwh'] - ti['penalty_mwh']):+,.1f}", "MWhₜₕ"),
                        ("移动的镜子", f"{d.get('n_moved', '—')}", "面",

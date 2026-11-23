@@ -96,6 +96,7 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
     best = None
     best_value = -np.inf
     fallback = None
+    flux_rejections = [0]
     separate_forecast = not np.array_equal(prob.dni_con, prob.dni_obj)
 
     reference = prob.tracking_reference() if tracking_reference is None else tracking_reference
@@ -123,6 +124,7 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
         forecast = (evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_con, **args)
                     if separate_forecast else snap)
         check = forecast.verify(case.receiver, max_cells=spec.verify_max_cells)
+        flux_rejections[0] += int(not check.ok)
         entry = (ch.copy(), snap, value, check)
         if fallback is None:
             fallback = entry
@@ -220,6 +222,7 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
                 model="mixed mirror poses, sampled shading, area-weighted absorbed flux and verified peak",
                 history=[{"iteration": 1, "upper_bound_mw": upper / 1e6}])
     cert["lambda"] = uni.weight if mode == "weighted" else None
+    cert["flux_rejections"] = int(flux_rejections[0])  # joint poses refused by the fine-grid flux check
     # From any pivot all receiver targets lie in the angular cone subtended by
     # its enclosing sphere. Cosine is maximal at the cone's edge nearest the sun.
     v = np.asarray(case.receiver.center) - field.xyz

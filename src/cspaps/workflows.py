@@ -1034,7 +1034,8 @@ def task_scenarios(case: Case, base: str | Path, n: int | None = None) -> dict:
 
     t0 = _time.perf_counter()
     out = out_dir(base, case, "scenarios")
-    sset = build_scenarios(case, n)
+    # n: scenarios of a weather set, or representative days of the clear-sky baseline
+    sset = build_scenarios(case, n, n_days=n if case.scenarios.source == "clear_sky_days" else None)
     files = save_scenario_set(sset, out / "scenario_set", case)
     summary = {"status": "done", **{k: v for k, v in sset.record().items() if k != "map_records"},
                "scenarios": sset.table().to_dict(orient="records"),
@@ -1106,7 +1107,7 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
 
     ``layouts`` maps a name to 'initial', a layout CSV or an (N, 3) array (default: the initial field).
     """
-    from .layout_value import (STATUS_RULES, compare_values, displacement, evaluate_layout_value, inner_settings,
+    from .layout_value import (STATUS_RULES, compare_values, displacement, evaluate_layout_values, inner_settings,
                                refine_competing_plans)
 
     t0 = _time.perf_counter()
@@ -1144,6 +1145,7 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
             excluded[name] = [str(exc)]
     counts = {len(xyz) for xyz, _, _ in inputs.values()}
     required = case.layout_opt.n_heliostats
+    batch = {}
     for name, (xyz, ids, note) in inputs.items():
         check = validate_layout(case, xyz, required, design_spacing(case), ids)
         if check["status"] != "ok":
@@ -1153,10 +1155,13 @@ def task_layout_value(case: Case, base: str | Path, layouts: dict | None = None,
             excluded[name] = ["比较需要等镜数，请指定目标镜数"]
             continue
         notes[name] = note
-        values[name] = evaluate_layout_value(case, xyz, sset, name, ids=ids, settings=settings, lam_layout=lam,
-                                             progress=progress, cancel=cancel, tags={"note": note})
+        batch[name] = (xyz, ids)
+    # all layouts x scenarios in one pool (every core busy even with few scenarios)
+    values.update(evaluate_layout_values(case, batch, sset, settings=settings, lam_layout=lam, progress=progress,
+                                         cancel=cancel, tags={n: {"note": notes[n]} for n in batch}))
     refine_competing_plans(case, values, sset, progress, cancel)
-    ranking = compare_values(list(values.values()), lam, reference="initial" if "initial" in values else None)
+    ranking = compare_values(list(values.values()), lam, reference="initial" if "initial" in values else None,
+                             rank_by=case.layout_opt.rank_by)
     files.update(export_values(values, out / "values", ranking))
     status = "constraint_violation" if excluded else "done"
     if any(not v.totals()["complete"] for v in values.values()):

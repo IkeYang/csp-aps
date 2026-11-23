@@ -10,7 +10,7 @@ from cspaps import sun
 from cspaps.aps import build_problem, solve
 from cspaps.certify import (
     aps_upper_bound, improve_and_certify, layout_upper_bound, lone_heliostat_energy, objective_value,
-    packing_capacity, potential_map,
+    packing_capacity, potential_map, removal_losses,
 )
 from cspaps.field import Field, build_field, generate
 from cspaps.layout_opt import evaluate_layout
@@ -43,13 +43,14 @@ def _tiny_problem(case, n=6, levels=3, offsets=(0.0,), tight=0.45, single_factor
     return prob
 
 
-def _enumerate(prob, mode, lam=0.0, eps=None):
-    """Exact optimum of the candidate model by brute force over all (K + 1)^N plans."""
+def _enumerate(prob, mode, lam=0.0, eps=None, off=None):
+    """Exact optimum of the candidate model by brute force over all (K + 1)^N plans (``off``: kept defocused)."""
     h = region_of_grid(prob.case, prob.grid)
     alpha = prob.rs.alpha[: prob.rs.n_grid][h]
     area = prob.rs.grid.cell_area
     best = -math.inf
-    for combo in itertools.product(range(-1, prob.k), repeat=prob.n):
+    off = np.zeros(prob.n, dtype=bool) if off is None else off
+    for combo in itertools.product(*[range(-1, 0) if o else range(-1, prob.k) for o in off]):
         ch = np.array(combo)
         if np.any(prob.flux(ch) > prob.limit * (1 + 1e-9)):
             continue
@@ -65,6 +66,34 @@ def _enumerate(prob, mode, lam=0.0, eps=None):
             val = p - lam * s
         best = max(best, val)
     return best
+
+
+@pytest.mark.parametrize("mode,lam", [("power", 0.0), ("weighted", 0.3), ("weighted", 1.0)])
+def test_flux_prices_bound_the_value_of_an_added_heliostat(small_case, mode, lam):
+    """Dual prices (improvement 4): with heliostat j priced (not in the layout), the bound is for the others and
+    bound + G_j dominates the brute-force optimum with j added; removal losses are exact in the model."""
+    prob = _tiny_problem(small_case)
+    h = region_of_grid(prob.case, prob.grid)
+    for j in (0, prob.n - 1):
+        priced = np.zeros(prob.n, dtype=bool)
+        priced[j] = True
+        heur = solve(prob, "greedy", small_case.aps).choice.copy()
+        heur[priced] = -1  # switching a mirror off keeps the plan feasible
+        b = aps_upper_bound(prob, heur, mode, lam, h_mask=h, max_iter=400, time_limit_s=30, price_mask=priced)
+        g = b["priced_gain_w"]
+        assert g[j] >= 0 and np.all(g[~priced] == 0)
+        assert b["upper_bound_mw"] * 1e6 >= _enumerate(prob, mode, lam, off=priced) * (1 - 1e-9) - 1e-6
+        assert b["upper_bound_mw"] * 1e6 + g[j] >= _enumerate(prob, mode, lam) * (1 - 1e-9) - 1e-6
+    with pytest.raises(ValueError):
+        aps_upper_bound(prob, np.zeros(prob.n, dtype=int), mode, lam, h_mask=h, price_mask=np.ones(prob.n, bool))
+    heur = solve(prob, "greedy", small_case.aps).choice
+    loss = removal_losses(prob, heur, lam, h)
+    j0 = objective_value(prob, heur, mode, lam, h)["objective_w"]
+    assert np.all(loss[heur < 0] == 0)
+    for i in np.flatnonzero(heur >= 0):
+        ch = heur.copy()
+        ch[i] = -1
+        assert loss[i] == pytest.approx(j0 - objective_value(prob, ch, mode, lam, h)["objective_w"], rel=1e-9, abs=1e-6)
 
 
 @pytest.mark.parametrize("mode,lam", [("power", 0.0), ("weighted", 0.1), ("weighted", 0.3), ("weighted", 1.0)])

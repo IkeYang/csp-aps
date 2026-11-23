@@ -180,6 +180,7 @@ def aps_upper_bound(
     max_iter: int = 300,
     time_limit_s: float = 30.0,
     tol: float = 2e-4,
+    price_mask: np.ndarray | None = None,
 ) -> dict:
     """Upper bound on the optimum of problem 1 and the optimality gap of ``choice``.
 
@@ -188,6 +189,14 @@ def aps_upper_bound(
     for the candidate set and the flux constraint points of ``prob`` (grid
     cells and verified hotspots), i.e. valid for every plan that the
     candidate model allows.
+
+    ``price_mask`` (bool, N) marks heliostats that are *not* part of the layout being bounded (candidate
+    positions, off in ``choice``): the bound is for the other heliostats only, and the multipliers of the
+    best iteration price each masked heliostat. Its reduced cost
+    ``G_j = max(0, max_k [c_jk + (mu eps + rho) h_jk - DNI_j R_jk . (w_o + nu / lim)])`` (``priced_gain_w``)
+    bounds what adding it alone can add: optimum(layout + j) <= upper_bound + G_j (weak duality; the
+    Lagrangian is concave and x_j = 0 at the linearisation point). It assumes j does not change the other
+    heliostats' responses (no shading / blocking of the layout by j).
     """
     from .uniformity import region_of_grid
 
@@ -203,7 +212,16 @@ def aps_upper_bound(
     eps_v = float(eps) if mode == "cv_limit" else 0.0
     use_mu = mode == "cv_limit"
     use_rho = mode in ("cv_limit", "weighted") and min_load_w > 0
-    p_ref = max(float(np.maximum(model.c.reshape(n, k), 0.0).max(axis=1, initial=0.0).sum()), 1.0)
+    priced = np.zeros(n, dtype=bool) if price_mask is None else np.asarray(price_mask, dtype=bool)
+    if priced.shape != (n,):
+        raise ValueError("price_mask must have one entry per heliostat")
+    if np.any(np.asarray(choice)[priced] >= 0):
+        raise ValueError("priced heliostats must be off in the plan")
+    ub_loop = model.ub.copy()
+    ub_loop[np.repeat(priced, k)] = 0.0
+    c_layout = np.where(np.repeat(priced, k), 0.0, model.c)
+    p_ref = max(float(np.maximum(c_layout.reshape(n, k), 0.0).max(axis=1, initial=0.0).sum()), 1.0)
+    g_best = None
 
     # value of the given plan
     x0 = _vertex(model, np.asarray(choice))
@@ -249,7 +267,7 @@ def aps_upper_bound(
         else:
             both = model.R.T @ np.column_stack([w_o, w_c])
             g = lin - model.dobj * both[:, 0] - model.dcon * both[:, 1]
-        G = np.where(model.ub > 0, g, -np.inf).reshape(n, k)
+        G = np.where(ub_loop > 0, g, -np.inf).reshape(n, k)
         kb = np.argmax(G, axis=1)
         gb = G[np.arange(n), kb]
         take = np.flatnonzero(gb > 0)
@@ -257,6 +275,8 @@ def aps_upper_bound(
         ub_t = lval + float(gb[take].sum()) - float(g @ x)
         if ub_t < best:
             best, best_t = ub_t, it
+            if priced.any():
+                g_best = g.copy()
         if it == 1 or it % 10 == 0:
             hist.append((it, best))
         if found is not None and best - found <= tol * max(abs(best), 1.0):
@@ -314,7 +334,7 @@ def aps_upper_bound(
         gap, status = None, "certified_infeasible"
     else:
         gap, status = None, "bound_only"
-    return {
+    out = {
         "mode": mode, "lambda": lam if mode == "weighted" else None, "epsilon": eps if mode == "cv_limit" else None,
         "min_load_mw": min_load_w / 1e6 if mode == "cv_limit" else None,
         "plan_feasible_in_model": bool(plan_feasible),
@@ -330,6 +350,44 @@ def aps_upper_bound(
         "model": "candidate aim points of the APS, flux limits at the solver grid and verified hotspots",
         "_relaxed": relaxed,
     }
+    if priced.any():
+        gain = np.zeros(n)
+        if g_best is not None:
+            gp = np.where(model.ub > 0, g_best, -np.inf).reshape(n, k)
+            gain[priced] = np.maximum(gp[priced].max(axis=1), 0.0)
+        out["priced_gain_w"] = gain
+    return out
+
+
+def removal_losses(prob, choice: np.ndarray, lam: float = 0.0, h_mask: np.ndarray | None = None) -> np.ndarray:
+    """Objective lost (W) in the bound's model when one heliostat of the plan is switched off alone.
+
+    The objective is P - lam * S (``objective_value``, "weighted" / "power"); switching a mirror off never
+    violates a flux limit, so the reduced plan stays feasible. Exact per heliostat (0 when defocused);
+    neighbours that the mirror shaded or blocked are not credited (the model's responses are fixed).
+    """
+    from .uniformity import region_of_grid
+
+    h_mask = region_of_grid(prob.case, prob.grid) if h_mask is None else np.asarray(h_mask, dtype=bool)
+    model = _build_model(prob, h_mask)
+    choice = np.asarray(choice)
+    x = _vertex(model, choice)
+    _, fo = _fluxes(model, x)
+    d0, nd0 = _spread(model, fo)
+    j0 = float(model.c @ x) - lam * model.sc * nd0
+    loss = np.zeros(model.n)
+    lam = float(lam)
+    for i in np.flatnonzero(choice >= 0):
+        col = int(i * model.k + choice[i])
+        p = float(model.c[col])
+        if lam > 0 and model.h_idx.size:
+            colv = model.R[:, col].toarray().ravel() * model.dobj[col]
+            dq = model.alpha_h * colv[model.h_idx]
+            nd = float(np.linalg.norm(d0 - (dq - dq.mean())))
+            loss[i] = j0 - (float(model.c @ x) - p - lam * model.sc * nd)
+        else:
+            loss[i] = p
+    return loss
 
 
 def certify_result(prob, res, case=None, max_iter: int = 300, time_limit_s: float = 30.0) -> dict:

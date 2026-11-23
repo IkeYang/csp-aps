@@ -7,6 +7,6 @@ Coordinate convention (used everywhere):
 
 from .config import Case, load_case, case_from_dict
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = ["Case", "load_case", "case_from_dict", "__version__"]

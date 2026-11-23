@@ -27,6 +27,7 @@ only compared on the same set.
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 from dataclasses import dataclass, field as dc_field
@@ -45,6 +46,23 @@ class ScenarioSet:
     maps: dict[str, DNIMap]
     meta: dict = dc_field(default_factory=dict)
     example_times: list | None = None  # an hour of the weather year represented by each scenario
+    # the weather year behind the set (with the map of every hour) and the scenario of every hour (-1: none);
+    # used by the control-variate estimate of the annual value (``layout_value.control_variate``)
+    hourly: sun.Samples | None = dc_field(default=None, repr=False)
+    assignment: np.ndarray | None = dc_field(default=None, repr=False)
+
+    def hourly_fingerprint(self) -> str | None:
+        """Hash of the hours behind the set (None when the set was imported as a table)."""
+        if self.hourly is None or self.assignment is None:
+            return None
+        h = hashlib.sha256()
+        hs = self.hourly
+        for part in (hs.elevation, hs.azimuth, hs.dni, hs.weight_h):
+            h.update(np.round(np.asarray(part, float), 6).astype("<f8").tobytes())
+        h.update(np.asarray(self.assignment, "<i8").tobytes())
+        if hs.map_index is not None:
+            h.update(np.asarray(hs.map_index, "<i8").tobytes())
+        return h.hexdigest()[:16]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -115,6 +133,18 @@ class ScenarioSet:
         files["scenario_set_json"] = folder / "scenario_set.json"
         files["scenario_set_json"].write_text(json.dumps(self.record(), indent=2, ensure_ascii=False, default=str),
                                               encoding="utf-8")
+        if self.hourly is not None and self.assignment is not None:
+            # the member hours of every scenario (for the control-variate estimate after reloading)
+            hs, a = self.hourly, np.asarray(self.assignment)
+            keep = np.flatnonzero(a >= 0)
+            files["hourly_csv"] = folder / "hourly_members.csv"
+            pd.DataFrame({
+                "time": [str(t) for t in hs.times[keep]] if hs.times is not None else "",
+                "elevation_deg": hs.elevation[keep], "azimuth_deg": hs.azimuth[keep], "dni_w_m2": hs.dni[keep],
+                "hours": hs.weight_h[keep],
+                "map_id": [hs.maps[m].map_id for m in hs.map_index[keep]] if hs.maps is not None else "uniform",
+                "scenario_id": [self.ids[j] for j in a[keep]],
+            }).to_csv(files["hourly_csv"], index=False, float_format="%.17g", lineterminator="\n")
         return files
 
 
@@ -165,10 +195,117 @@ def regime_of_hours(case, hourly: sun.Samples, n_regimes: int) -> np.ndarray:
     return (days + start) % n_regimes
 
 
+CLEAR_SKY_BASIS = "clear_sky_design"
+
+
+def is_clear_sky(case) -> bool:
+    return case.scenarios.source == "clear_sky_days"
+
+
+def clear_sky_day_set(case, n_days: int | None = None) -> ScenarioSet:
+    """The clear-sky design baseline: every working hour of the representative days is a scenario.
+
+    One clear-sky DNI per hour for the whole field (``sun.clear_sky_design_days``), the uniform map, weight =
+    days represented x step. Every layout is scored on exactly these dates, hours and weights. The hours of
+    the whole clear-sky year are assigned to the scenario of their day segment at the same clock time (the
+    nearest working time of the representative day when that one is below the threshold), for the control
+    variate."""
+    a, spec = case.annual, case.scenarios
+    design, day_idx, days = sun.clear_sky_design_days(case, n_days)
+    if not len(design):
+        raise ValueError("no working hour on the representative days (sun elevation / DNI threshold)")
+    step = float(a.time_step_min)
+    slot = lambda t: np.asarray((t.hour * 60 + t.minute) // step, dtype=int)  # noqa: E731 - clock slot of the day
+    uni = uniform_map()
+    ids = [f"D{int(k) + 1:02d}-{t.strftime('%H%M')}" for k, t in zip(day_idx, design.times)]
+    samples = sun.Samples(design.elevation, design.azimuth, design.dni, design.weight_h, design.times, "scenarios",
+                          np.zeros(len(design), dtype=int), [uni], np.zeros(len(design), dtype=int), ids,
+                          design.weight_h.copy())
+    # the clear-sky year behind the days: segment of every hour -> its representative day's scenario
+    year = sun.clear_sky_year(case)
+    n_year = 365 + calendar.isleap(a.year)
+    n = len(days)
+    edges = np.floor(np.arange(n + 1) * n_year / n).astype(int)
+    doy = np.asarray(year.times.dayofyear, dtype=int) - 1
+    seg = np.clip(np.searchsorted(edges, doy, side="right") - 1, 0, n - 1)
+    assign = np.full(len(year), -1, dtype=int)
+    rep_slot = slot(design.times)
+    year_slot = slot(year.times)
+    for k in range(n):
+        mine = np.flatnonzero(day_idx == k)
+        hrs = np.flatnonzero(seg == k)
+        if not mine.size or not hrs.size:
+            continue
+        order = np.argsort(rep_slot[mine], kind="stable")
+        sl, sc_idx = rep_slot[mine][order], mine[order]
+        pos = np.clip(np.searchsorted(sl, year_slot[hrs]), 0, len(sl) - 1)
+        left = np.clip(pos - 1, 0, len(sl) - 1)
+        near = np.where(np.abs(sl[left] - year_slot[hrs]) < np.abs(sl[pos] - year_slot[hrs]), left, pos)
+        assign[hrs] = sc_idx[near]
+    samples.members = np.bincount(assign[assign >= 0], minlength=len(samples))
+    year.maps, year.map_index = [uni], np.zeros(len(year), dtype=int)
+    _quantise(samples)
+    tl = spec.linke_turbidity
+    meta = {"source": "clear sky: representative days of the year",
+            "basis": CLEAR_SKY_BASIS,
+            "basis_zh": "晴空年度（代表日逐时）",
+            "generation": (f"{n} representative days (equal date segments, middle day, weight = days in the "
+                           f"segment), every {step:g}-min step with sun >= {a.min_sun_elevation_deg:g} deg and "
+                           f"DNI >= {a.min_dni_w_m2:g} W/m2"),
+            "clear_sky_model": spec.clear_sky_model,
+            "linke_turbidity": ("site climatology (pvlib, monthly, interpolated to the day)" if tl is None
+                                else tl),
+            "days": [{"day": k + 1, "date": str(d.date()), "days_represented": int(w),
+                      "working_steps": int(np.sum(day_idx == k))} for k, (d, w) in enumerate(days)],
+            "time_step_min": step, "representative_dni": "one clear-sky DNI per hour, whole field",
+            "hours_basis": "days represented x step",
+            "actual_hours_total": round(float(np.sum(samples.weight_h)), 3),
+            "map_model": "uniform", "regimes": ["uniform"],
+            "hourly_dni_kwh_m2": round(year.dni_hours, 3), "n_hours": len(year),
+            "min_sun_elevation_deg": a.min_sun_elevation_deg, "min_dni_w_m2": a.min_dni_w_m2,
+            "year": a.year}
+    return ScenarioSet(samples, {"uniform": uni}, meta, list(design.times), year, assign)
+
+
+def design_hourly(case) -> sun.Samples:
+    """The hours a layout search works with: the clear-sky year for the clear-sky baseline, else the weather
+    year (with the map regime of every hour)."""
+    if is_clear_sky(case):
+        return sun.clear_sky_year(case)
+    if case.scenarios.source == "file":
+        return build_scenarios(case).samples
+    return attach_regimes(case, sun.hourly_samples(case))
+
+
+def low_fidelity_set(case, n_states: int, hourly: sun.Samples | None = None) -> ScenarioSet:
+    """A small set of states for quick layout scores (Bayesian search): the formal set's states merged by
+    the DNI-energy-weighted k-means of ``sun.sun_bins`` (clear-sky baseline), or a weather set with
+    ``n_states`` scenarios."""
+    if not is_clear_sky(case):
+        lo = case.copy()
+        lo.scenarios.n_scenarios = int(n_states)
+        return build_scenarios(lo, hourly=None if case.scenarios.source == "file" else hourly)
+    full = clear_sky_day_set(case)
+    s = full.samples
+    plain = sun.Samples(s.elevation, s.azimuth, s.dni, s.weight_h, s.times, "clear_sky_days")
+    bins = sun.sun_bins(plain, int(n_states), seed=case.scenarios.seed, weighting=case.annual.representative_dni)
+    uni = full.maps["uniform"]
+    samples = sun.Samples(bins.elevation, bins.azimuth, bins.dni, bins.weight_h, None, "scenarios", bins.members,
+                          [uni], np.zeros(len(bins), dtype=int), [f"L{k + 1:02d}" for k in range(len(bins))],
+                          bins.actual_hours)
+    _quantise(samples)
+    meta = {**full.meta, "generation": f"{len(bins)} states merged from the clear-sky design days (low fidelity)",
+            "low_fidelity": True}
+    return ScenarioSet(samples, {"uniform": uni}, meta, None)
+
+
 def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | None = None,
-                    dni_bands: int | None = None) -> ScenarioSet:
-    """The case's scenario set (from the weather year, or the scenario table of ``scenarios.file``)."""
+                    dni_bands: int | None = None, n_days: int | None = None) -> ScenarioSet:
+    """The case's scenario set: the clear-sky design days (``scenarios.source: clear_sky_days``; ``n_days``
+    overrides the number of days), the weather year, or the scenario table of ``scenarios.file``."""
     spec = case.scenarios
+    if is_clear_sky(case):
+        return clear_sky_day_set(case, n_days)
     maps = model_maps(case)
     if spec.source == "file":
         return load_table(case, case.resolve(spec.file), maps)
@@ -182,11 +319,23 @@ def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | 
     energy = np.array([float((hourly.dni * hourly.weight_h)[reg == r].sum()) for r in range(len(regimes))])
     k_r = _allocate(energy, n_scenarios)
     parts, map_index, examples = [], [], []
+    assign = np.full(len(hourly), -1, dtype=int)
+    offset = 0
+    shared = bool(spec.shared_directions) and (len(regimes) > 1 or bands > 1)
+    if shared:
+        parts, map_index, examples, assign = _shared_direction_states(case, hourly, reg, len(regimes), n_scenarios,
+                                                                      bands)
+        k_r = []  # the per-map clustering below is skipped
     for r, k in enumerate(k_r):
         if k <= 0:
             continue
-        sub = hourly.subset(np.flatnonzero(reg == r))
+        idx_r = np.flatnonzero(reg == r)
+        sub = hourly.subset(idx_r)
         bins = sun.sun_bins(sub, int(k), seed=spec.seed, dni_bands=bands, weighting=case.annual.representative_dni)
+        a = getattr(bins, "assignment", None)
+        if a is not None:
+            assign[idx_r] = np.where(a >= 0, a + offset, -1)
+        offset += len(bins)
         parts.append(bins)
         map_index += [r] * len(bins)
         # an hour of this regime with the closest sun direction (illustration only)
@@ -205,11 +354,18 @@ def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | 
     order = np.lexsort((samples.azimuth, samples.map_index))
     samples = samples.subset(order)
     examples = [examples[j] for j in order]
+    new_pos = np.empty(len(order), dtype=int)
+    new_pos[order] = np.arange(len(order))
+    assign = np.where(assign >= 0, new_pos[np.maximum(assign, 0)], -1)
+    hourly_maps = hourly.subset(np.arange(len(hourly)))
+    hourly_maps.maps, hourly_maps.map_index = map_list, reg.astype(int)
     samples.ids = [f"S{k + 1:02d}" for k in range(len(samples))]
     _quantise(samples)
     meta = {"source": "weather year: " + (str(case.weather.file) if case.weather.source == "file"
                                           else f"clear sky ({case.sun.dni_model})"),
-            "generation": f"DNI-energy-weighted k-means per map regime, {bands} DNI band(s)",
+            "generation": (f"DNI-energy-weighted k-means of the sun directions over all maps, hours split by map, "
+                           f"{bands} DNI band(s)" if shared else
+                           f"DNI-energy-weighted k-means per map regime, {bands} DNI band(s)"),
             "representative_dni": case.annual.representative_dni,
             "hours_basis": ("actual hours of the merged records, time-average DNI"
                             if case.annual.representative_dni == "time_mean"
@@ -219,7 +375,43 @@ def build_scenarios(case, n_scenarios: int | None = None, hourly: sun.Samples | 
             "states_per_regime": {m: int(k) for m, k in zip(regimes, k_r)},
             "hourly_dni_kwh_m2": round(hourly.dni_hours, 3), "n_hours": len(hourly),
             "min_sun_elevation_deg": case.annual.min_sun_elevation_deg}
-    return ScenarioSet(samples, maps, meta, examples)
+    return ScenarioSet(samples, maps, meta, examples, hourly_maps, assign)
+
+
+def _shared_direction_states(case, hourly: sun.Samples, reg: np.ndarray, n_regimes: int, n_scenarios: int,
+                             bands: int):
+    """Scenarios that share their sun directions across maps and DNI bands.
+
+    The directions are clustered once over the whole year (about n_scenarios / n_maps of them, so the set
+    keeps about n_scenarios scenarios); every (direction, map) with hours becomes a scenario with the
+    direction of the cluster, the hours of that map in it and their representative DNI (``sun._aggregate``
+    within the group, so the DNI energy of every map is kept)."""
+    k_dir = max(min(4, n_scenarios), int(round(n_scenarios / max(n_regimes, 1))))  # at least 4 directions
+    dirs = sun.sun_bins(hourly, k_dir, seed=case.scenarios.seed, dni_bands=1,
+                        weighting=case.annual.representative_dni)
+    a_dir = np.asarray(dirs.assignment)
+    parts, map_index, examples = [], [], []
+    assign = np.full(len(hourly), -1, dtype=int)
+    offset = 0
+    for d in range(len(dirs)):
+        for r in range(n_regimes):
+            idx = np.flatnonzero((a_dir == d) & (reg == r))
+            if not idx.size:
+                continue
+            sub = hourly.subset(idx)
+            agg = sun._aggregate(sub, np.zeros(idx.size, dtype=int), np.ones(3), bands, "scenarios",
+                                 case.annual.representative_dni)
+            if not len(agg):
+                continue
+            agg.elevation = np.full(len(agg), float(dirs.elevation[d]))  # the shared direction of the cluster
+            agg.azimuth = np.full(len(agg), float(dirs.azimuth[d]))
+            a = np.asarray(agg.assignment)
+            assign[idx] = np.where(a >= 0, a + offset, -1)
+            offset += len(agg)
+            parts.append(agg)
+            map_index += [r] * len(agg)
+            examples += [sub.times[int(np.argmax(sub.dni))] if sub.times is not None else None] * len(agg)
+    return parts, map_index, examples, assign
 
 
 def _quantise(samples: sun.Samples) -> None:
@@ -312,6 +504,9 @@ def validation_scenarios(case, train, n_scenarios, hourly, seed_offset=0):
         source = "separate_table"
     elif other.scenarios.source == "file":
         validation, source = train, "same_table"
+    elif is_clear_sky(other):  # twice as many days: their middle days fall between the design days
+        validation = clear_sky_day_set(other, 2 * int(other.scenarios.n_days))
+        source = "clear_sky_denser_days"
     else:
         validation = build_scenarios(other, n_scenarios, hourly)
         source = "same_weather_year"
@@ -354,12 +549,26 @@ def load_folder(folder) -> ScenarioSet:
                                                                           "map_assignment", "regimes")}, examples)
     if meta.get("fingerprint") and meta["fingerprint"] != out.fingerprint():
         raise ValueError(f"{folder}: scenario set fingerprint mismatch (files edited after saving?)")
+    hp = folder / "hourly_members.csv"
+    if hp.exists():
+        h = pd.read_csv(hp)
+        known = [m for m in dict.fromkeys(h["map_id"].astype(str)) if m in maps]
+        h = h[h["map_id"].astype(str).isin(known)]
+        hourly = sun.Samples(h["elevation_deg"].to_numpy(float), h["azimuth_deg"].to_numpy(float),
+                             h["dni_w_m2"].to_numpy(float), h["hours"].to_numpy(float), None, "hourly",
+                             None, [maps[m] for m in known],
+                             np.array([known.index(m) for m in h["map_id"].astype(str)], dtype=int))
+        out.hourly = hourly
+        out.assignment = np.array([out.index(s) for s in h["scenario_id"].astype(str)], dtype=int)
     return out
 
 
 def is_spatial(case) -> bool:
-    """True when the case's DNI is not uniform over the site (any map model but a pure uniform one)."""
+    """True when the case's DNI is not uniform over the site (any map model but a pure uniform one; never for
+    the clear-sky design baseline)."""
     spec = case.scenarios
+    if spec.source == "clear_sky_days":
+        return False
     return spec.source == "file" or spec.map_model != "uniform"
 
 

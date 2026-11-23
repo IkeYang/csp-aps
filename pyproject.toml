@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cspaps"
-version = "0.8.0"
+version = "0.9.0"
 description = "Heliostat field layout and aim-point strategy (APS) optimization for solar towers with a cylindrical receiver"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 gui = ["streamlit>=1.35", "plotly>=5.18"]
 exact = ["pyscipopt>=5"]
+# GPU backend for the spot / flux kernel (CSPAPS_GPU=1); pick the CuPy wheel of your CUDA (12.x here)
+gpu = ["cupy-cuda12x>=13"]
 dev = ["pytest>=7", "streamlit>=1.35", "plotly>=5.18", "pyscipopt>=5"]
 
 [project.scripts]

@@ -33,7 +33,7 @@ from .conftest import ROOT, small_case_dict
 
 def _case(**scen):
     d = small_case_dict()
-    d["scenarios"] = {"n_scenarios": 4, "map_model": "half_swap", **scen}
+    d["scenarios"] = {"source": "weather", "n_scenarios": 4, "map_model": "half_swap", **scen}
     d["uniformity"] = {"enabled": True, "mode": "weighted", "weight": 0.3}
     d["layout_opt"]["uniformity_weight"] = 0.3
     return case_from_dict(d, base_dir=ROOT)
@@ -338,7 +338,7 @@ def test_cli_scenarios_value_and_rescore(tmp_path):
     from cspaps.cli import main
 
     d = small_case_dict()
-    d["scenarios"] = {"n_scenarios": 2, "map_model": "half_swap"}
+    d["scenarios"] = {"source": "weather", "n_scenarios": 2, "map_model": "half_swap"}
     d["field"]["generator"]["r_max"] = 70
     d["layout_opt"]["n_heliostats"] = 40
     path = tmp_path / "tiny.yaml"
@@ -395,6 +395,8 @@ def test_site_cases_build_their_scenario_sets(name):
     from cspaps.layout_value import baseline_layout
 
     case = load_case(ROOT / "cases" / f"{name}.yaml")
+    assert case.scenarios.source == "clear_sky_days"  # design baseline; the map studies are sensitivity analyses
+    case.scenarios.source = "weather"
     hourly = sun.hourly_samples(case)
     assert len(hourly) > 3000  # NASA POWER 2024, sun above 5 degrees
     sset = build_scenarios(case, hourly=hourly)

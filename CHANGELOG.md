@@ -1,5 +1,30 @@
 # CSP-APS 更新日志
 
+## 0.9.0 · 年度计算加速：控制变量、复用、贝叶斯搜索、通量价格换位、多核与 GPU
+
+V(L) 的定义不变；推导见 [模型说明 0.9 节](docs/MODEL.md)，实测见 README 0.9.0 节。
+
+- **控制变量修正年度值**（`layout_opt.control_variate`，默认开）
+  - 工况集记录每个小时归到哪个代表工况（`ScenarioSet.assignment`，保存为 `hourly_members.csv`）。
+  - 每个工况用它的全部成员小时的中心瞄准能量修正代表状态的取样误差：f_s = Σ_t w_t C(t) / (h_s C(s))，V_cv = Σ_s h_s J_s f_s。只多算一次全年逐时中心瞄准，不解 APS。
+  - 结果另列 V_cv、E_cv、Π_cv 和修正幅度；`layout_opt.rank_by: value_cv` 时按 V_cv 排名，默认仍按正式 V。
+  - 逐时 APS 参考值的核对脚本：`scripts/validate_annual_estimators.py`。
+- **复用计算**（`layout_opt.inner_reuse`）
+  - `responses`（默认）：同一太阳方向的光斑响应只建一次，方案与独立求解逐位相同。
+  - `full`：限值从未起作用的方案直接按 DNI 比例用于同方向更低的 DNI 档（P、U 对 DNI 一次齐次），并沿太阳轨迹热启动。
+  - `scenarios.shared_directions`：全年统一聚类太阳方向，各地图、各 DNI 档共用，每张地图的 DNI 能量守恒。
+  - 求解器记录通量限值是否排除过候选（`flux_limited`、`limits_active`），复用只在限值没起作用时发生。
+- **贝叶斯布局搜索**（`layout_opt.search_method: bayes`，新模块 `bayes.py`）：高斯过程（Matern 5/2、自动相关长度）+ 期望改进，批量提出、整批进进程池；目标直接是少量工况上的低保真正式 V。`layout_opt.sector_spacing` 增加北 / 东 / 南 / 西四个扇区稀疏系数。
+- **通量价格指导换位**（`layout_opt.swap_pricing: dual`，默认）
+  - 每个工况的 APS 上界给出吸热器各网格的拥挤价格（拉格朗日乘子），空闲镜位按约化成本定价，镜子按去掉它的损失定价，配对换位，重新求解后 V 提高才接受。
+  - 单独加入一个镜位的增益上界经穷举验证（`certify.aps_upper_bound(price_mask=…)`、`certify.removal_losses`）。
+  - `build_response(blockers=…)`：候选镜位按“已加入”计算被布局遮挡。
+- **多核与 GPU**
+  - 多个布局的全部（布局, 工况链）进同一个进程池（`evaluate_layout_values`），用于正式排名、换位和贝叶斯批量评价。
+  - 可选 GPU 后端（`backend.py`，`pip install -e ".[gpu]"`，`CSPAPS_GPU=1`，`CSPAPS_GPU_DEVICES`，`CSPAPS_GPU_MIN`）：光斑 / 通量核在 CuPy 上计算，多卡按进程分配；无 CuPy 时自动走 CPU，结果不变。年度价值记录所用后端。
+- **界面**：新选项都有中文说明（快在哪里、深在哪里）；排名表增加“全年估计 V_cv”；换位表显示选镜依据和预测增益；搜索历史图区分 Sobol 初始设计与贝叶斯提议。
+- **时间估计**：顾问按通量价格换位（每轮约两个布局）和贝叶斯搜索（每个提议：选镜 + 低保真 V）计时。
+
 ## 0.8.0 · 按规模和时间预算推荐算法：快速 / 标准 / 深度思考
 
 - **三档计算深度**（`advisor.py`）。单时刻瞄准、比较已有布局、搜索新布局各有快速、标准、深度思考三档，每档写明算什么、什么时候用、预计多久。软件按镜数分为验证级、小、中、大四个规模，推荐时间预算内最深的一档。

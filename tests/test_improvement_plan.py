@@ -26,6 +26,7 @@ WRONG = ROOT / "cases" / "wrong_site"
 def test_actual_hours_and_energy_weight_are_recorded_separately():
     """20 clusters of the Aksai demo year: 4,028 actual hours vs 2,800.62 irradiance-equivalent hours."""
     case = load_case(ROOT / "cases" / "aksai_demo.yaml")
+    case.scenarios.source = "weather"  # the weather-year scenario set (sensitivity analyses)
     hourly = sun.hourly_samples(case)
     t = sun.sun_bins(hourly, 20, seed=7, weighting="time_mean")
     e = sun.sun_bins(hourly, 20, seed=7, weighting="energy_weighted")
@@ -134,7 +135,7 @@ def test_single_mirror_boundary_case_uses_the_margin_everywhere():
 
 def _case(**scen):
     d = small_case_dict()
-    d["scenarios"] = {"n_scenarios": 4, "map_model": "half_swap", **scen}
+    d["scenarios"] = {"source": "weather", "n_scenarios": 4, "map_model": "half_swap", **scen}
     d["uniformity"] = {"enabled": True, "mode": "weighted", "weight": 0.3}
     d["layout_opt"]["uniformity_weight"] = 0.3
     return case_from_dict(d, base_dir=ROOT)

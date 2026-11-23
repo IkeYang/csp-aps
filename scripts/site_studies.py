@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def study(name: str, out: Path, n_scenarios: int, dense: int, map_model: str | None = None,
           cloud_maps: int | None = None) -> dict:
     case = load_case(ROOT / "cases" / f"{name}.yaml")
+    # these studies are the spatial-DNI sensitivity analyses of 0.5 / 0.6 (weather year + DNI maps); the design
+    # baseline of the cases is the clear-sky annual value (scenarios.source: clear_sky_days, README 0.9.0)
+    case.scenarios.source = "weather"
     if map_model:
         case.scenarios.map_model = map_model
     if cloud_maps:
@@ -106,6 +109,7 @@ def robustness(name: str, keys: list[str], out: Path) -> dict:
     layouts["initial"] = "initial"
     res = {}
     base = load_case(ROOT / "cases" / f"{name}.yaml")
+    base.scenarios.source = "weather"  # cloud-map robustness: a sensitivity analysis, not the design baseline
     for seed in (base.scenarios.seed, base.scenarios.seed + 1000):
         case = base.copy()
         case.scenarios.seed = seed
