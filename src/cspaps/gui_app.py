@@ -13,6 +13,7 @@ import argparse
 import copy
 import dataclasses
 import hashlib
+import importlib.machinery
 import json
 import os
 import sys
@@ -45,6 +46,15 @@ from cspaps.optics import footprints_at
 from cspaps.resources import demo_case_path
 from cspaps.receiver import build_grid, incident_limit_w_m2, panel_of, surface_normal, surface_point
 from cspaps.simulate import evaluate, sun_state
+
+# Streamlit executes this file as a fresh module named "__main__" on every rerun, with ``__file__`` set but no
+# ``__spec__``. Worker processes of the background jobs' process pools (``parallel.pool``: ``spawn`` on Windows,
+# ``forkserver`` on Linux) re-execute such a main *file*: the whole GUI would run once per worker without a Streamlit
+# session, logging "Thread 'MainThread': missing ScriptRunContext!" for every st.* call and delaying each worker.
+# Workers only receive cspaps functions and data, never anything defined here, so a main spec named "__main__" tells
+# multiprocessing to leave the main module alone in the children (``multiprocessing.spawn._fixup_main_from_name``).
+if __name__ == "__main__" and getattr(sys.modules.get("__main__"), "__spec__", None) is None:
+    sys.modules["__main__"].__spec__ = importlib.machinery.ModuleSpec("__main__", None)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CASE = demo_case_path()  # repository copy, or the copy packaged in the wheel
@@ -3736,4 +3746,7 @@ def main() -> None:
      "光学校验": page_optics, "参数设置": page_parameters, "运行记录": page_runs, "方法与理论": page_theory}[page](case)
 
 
-main()
+# Streamlit runs this script with __name__ == "__main__"; anything else that executes the file (an import, a
+# multiprocessing worker re-running the main module as "__mp_main__") must not draw the GUI.
+if __name__ == "__main__":
+    main()

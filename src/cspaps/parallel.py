@@ -7,7 +7,10 @@ a pickle boundary. Main-thread scripts use processes:
   ``if __name__ == "__main__":`` guard are safe;
 * multi-threaded host (the Streamlit GUI runs scripts in worker threads, where
   forking can deadlock): ``forkserver`` (or ``spawn``), which re-imports the
-  main module -- Streamlit's entry point is guarded;
+  main module. Under Streamlit ``__main__`` is the GUI script itself; ``gui_app``
+  marks it with a ``__main__`` module spec so that the workers leave it alone
+  instead of re-running the whole GUI (Streamlit's "missing ScriptRunContext"
+  warnings);
 * other platforms: ``spawn``. Scripts that use parallel runs on Windows/macOS
   need the usual ``if __name__ == "__main__":`` guard;
 * GPU backend switched on (``CSPAPS_GPU=1``): ``forkserver`` on Linux too, because CUDA cannot be used in

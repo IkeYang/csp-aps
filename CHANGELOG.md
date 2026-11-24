@@ -1,5 +1,12 @@
 # CSP-APS 更新日志
 
+## 未发布
+
+- **修复：图形界面后台任务刷屏 `Thread 'MainThread': missing ScriptRunContext!`**（Windows 上每次多核计算都会出现）
+  - 原因：Streamlit 把 `gui_app.py` 当作 `__main__` 模块运行；后台任务的进程池（Windows 为 `spawn`，Linux 多线程时为 `forkserver`）会在每个工作进程里重新执行主模块，于是整个界面在没有 Streamlit 会话的进程里又跑一遍，每个 `st.*` 调用打印一次警告，每个工作进程的启动也被拖慢。
+  - 修复：`gui_app` 给 Streamlit 的主模块标记名为 `__main__` 的模块规格，工作进程不再执行界面脚本（工作进程只接收 cspaps 的函数和数据）；文件末尾的 `main()` 加 `if __name__ == "__main__":` 保护。
+  - 回归测试：`tests/test_parallel.py::test_gui_job_workers_do_not_rerun_the_gui`（按 Windows 的 `spawn` 启动方式）。
+
 ## 0.9.0 · 晴空年度设计基线；年度计算加速：控制变量、复用、贝叶斯搜索、通量价格换位、多核与 GPU
 
 推导见 [模型说明 0.9 节](docs/MODEL.md)，实测见 README 0.9.0 节。

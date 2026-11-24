@@ -66,3 +66,45 @@ def test_parallel_and_serial_annual_agree(small_case):
     a = annual(small_case, fld, samples=bins, with_flux=False, workers=1)
     b = annual(small_case, fld, samples=bins, with_flux=False, workers=2)
     assert abs(a.energy_mwh["intercept"] - b.energy_mwh["intercept"]) < 1e-6 * a.energy_mwh["intercept"]
+
+
+def _streamlit_loaded() -> bool:
+    return "streamlit" in sys.modules
+
+
+def test_gui_job_workers_do_not_rerun_the_gui(monkeypatch, tmp_path):
+    """Under Streamlit ``__main__`` is the GUI script. Process-pool workers of a GUI job (spawn on Windows) must
+    not re-run it: that drew the whole GUI once per worker and flooded the console with Streamlit's
+    "Thread 'MainThread': missing ScriptRunContext!" warnings."""
+    import pytest
+
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+
+    from cspaps import parallel
+
+    from .conftest import small_case_dict
+
+    gui = ROOT / "src" / "cspaps" / "gui_app.py"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(sys.modules, "__main__", sys.modules["__main__"])  # Streamlit replaces it; restore afterwards
+    at = AppTest.from_file(str(gui), default_timeout=120)
+    at.session_state["case_dict"] = small_case_dict()
+    at.session_state["base_dir"] = str(ROOT)
+    at.session_state["ver"] = 1
+    at.run()
+    assert not at.exception and at.radio(key="page").value == "总览"  # the guarded main() still draws the GUI
+    assert sys.modules["__main__"].__file__ == str(gui)  # what the workers would otherwise re-execute
+
+    monkeypatch.setattr(parallel, "start_method", lambda: "spawn")  # the Windows start method
+    results = []
+
+    def job():  # a GUI background job: a non-main thread whose work pickles -> a process pool
+        with parallel.pool(2, probe=(_streamlit_loaded, None)) as workers:
+            results.extend(workers.apply(_streamlit_loaded) for _ in range(2))
+
+    task = threading.Thread(target=job)
+    task.start()
+    task.join(timeout=300)
+    assert not task.is_alive()
+    assert results == [False, False]
