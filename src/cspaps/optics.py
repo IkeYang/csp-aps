@@ -130,6 +130,12 @@ def intercept_fraction(
     R = rec.radius
     z_lo, z_hi = z_range if z_range is not None else (rec.center[2] - 0.5 * rec.height, rec.center[2] + 0.5 * rec.height)
     c_bot = np.array([rec.center[0], rec.center[1], z_lo])
+    from .backend import enabled, intercept_fraction_gpu
+
+    if enabled():  # large beam sets on the GPU (same formula and quadrature)
+        gpu = intercept_fraction_gpu(aim_xyz, t, sigma, R, c_bot, z_hi - z_lo, n_quad)
+        if gpu is not None:
+            return gpu.reshape(shape)
     h = -t.copy()
     h[:, 2] = 0.0
     h /= np.linalg.norm(h, axis=1, keepdims=True)  # horizontal, axis -> heliostat
@@ -251,6 +257,12 @@ def flux_on_receiver(
     efficiencies.
     """
     n = aim_xyz.shape[0]
+    from .backend import enabled, flux_and_power_gpu
+
+    if enabled():  # formed and reduced on the GPU: only the (M,) flux and (N,) powers come back
+        gpu = flux_and_power_gpu(grid.points, grid.normals, aim_xyz, t, sigma, power, grid.cell_area)
+        if gpu is not None:
+            return gpu
     flux = np.zeros(grid.points.shape[0])
     intercepted = np.zeros(n)
     for start in range(0, n, chunk):

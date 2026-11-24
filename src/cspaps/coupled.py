@@ -44,6 +44,20 @@ def _weighted_upper(prob, beam, intercepted, allowed, snap, weight):
     support = grid.alpha.copy()
     support[mask] *= 1 - weight * np.sqrt(q.size) * direction
     largest_ratio, linear = 0.0, 0.0
+    from .backend import enabled, row_stats_gpu
+
+    gpu = (row_stats_gpu(grid.points, grid.normals, prob.aim_xyz.reshape(-1, 3), prob.rs.t.reshape(-1, 3),
+                         prob.sigma.ravel(), beam.ravel(), support) if enabled() else None)
+    if gpu is not None:  # the same bound with the image sums formed on the GPU
+        sample_power = gpu[0].reshape(prob.n, prob.k) * grid.cell_area
+        coeff = gpu[1].reshape(prob.n, prob.k) * grid.cell_area
+        lit = allowed & (intercepted > 0)
+        if np.any(lit & (sample_power <= 0)):
+            return np.inf
+        if np.any(lit):
+            largest_ratio = float((intercepted[lit] / sample_power[lit]).max())
+        linear = float(np.maximum(np.where(allowed, coeff, 0.0).max(axis=1), 0.0).sum())
+        return linear * largest_ratio + 1e-10 * max(1.0, float(beam.sum()))
     stride = max(1, 1_000_000 // (prob.k * len(grid.alpha)))
     for start in range(0, prob.n, stride):
         sl = slice(start, start + stride)

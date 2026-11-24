@@ -15,12 +15,15 @@ dependencies = [
     "pyyaml>=6.0",
     "matplotlib>=3.7",
     "scipy>=1.10",
+    # compiled solver loops (bit-identical to the numpy code; without it the numpy path runs)
+    "numba>=0.59",
 ]
 
 [project.optional-dependencies]
 gui = ["streamlit>=1.35", "plotly>=5.18"]
 exact = ["pyscipopt>=5"]
-# GPU backend for the spot / flux kernel (CSPAPS_GPU=1); pick the CuPy wheel of your CUDA (12.x here)
+# GPU backend for the spot / flux kernels (CSPAPS_GPU=1); pick the CuPy wheel of your CUDA driver (12.x here;
+# CUDA 11 drivers: pip install cupy-cuda11x). RTX 2080 Ti (sm_75) and RTX 3080 (sm_86) are both supported.
 gpu = ["cupy-cuda12x>=13"]
 dev = ["pytest>=7", "streamlit>=1.35", "plotly>=5.18", "pyscipopt>=5"]
 

@@ -1,17 +1,35 @@
-"""Optional GPU backend (CuPy) for the flux kernel every spot computation goes through.
+"""Optional GPU backend (CuPy) for the dense spot kernel and the reductions that follow it.
 
-``optics.footprints_at`` -- spot responses of the aim candidates, fine-grid verification, flux maps -- is a
-dense exp over beams x surface points and dominates large fields. With ``CSPAPS_GPU=1`` and CuPy installed it
-runs on the GPU when the work is large enough (``CSPAPS_GPU_MIN`` elements, default 2 million) to pay for the
-transfers; worker processes spread over the devices of ``CSPAPS_GPU_DEVICES`` (default: all) by process id.
+``optics.footprints_at`` -- spot responses of the aim candidates, fine-grid verification, flux maps, joint-pose
+evaluations -- is a dense exp over beams x surface points. Every caller reduces the dense block right away (sum
+over beams, sum per beam, support cells above a cutoff, a weighted sum), so on the GPU the block is formed *and
+reduced* on the device and only the small result crosses the bus:
+
+* ``flux_sum_gpu``             superposed flux at the points (fine-grid verification, ``verify``)
+* ``flux_and_power_gpu``       flux at the cells and power per beam (``optics.flux_on_receiver``, ``evaluate``)
+* ``sparse_responses_gpu``     peak, support cells and float32 support values per heliostat (``aps.build_response``)
+* ``row_stats_gpu``            sum and weighted sum per beam (``coupled._weighted_upper``)
+* ``footprints_gpu``           the dense block itself (other callers)
+
+Switch on with ``CSPAPS_GPU=1`` (CuPy installed: ``pip install -e ".[gpu]"``). Dense blocks below
+``CSPAPS_GPU_MIN`` elements (default 2 million), reduced ones below an eighth of that, stay on the CPU. Blocks are sized to ``CSPAPS_GPU_BLOCK`` elements (default 8
+million, ~40 bytes each while a block is formed) and to the memory share of the process.
+
+Several GPUs: every process of a process pool gets its own device, round-robin over ``CSPAPS_GPU_DEVICES``
+(default: all visible devices; ``parallel.pool`` assigns them in its worker initializer), and the processes
+sharing one device split its memory (``CSPAPS_GPU_SHARE``). Run as many workers as CPU cores: the sequential
+search loops run on the cores, the dense kernels on the GPUs. With several workers per GPU, NVIDIA MPS
+(``nvidia-cuda-mps-control -d``) lets their kernels run concurrently instead of time-sliced.
 
 The CPU path is the existing numpy code, unchanged, so results without a GPU stay bit-identical. GPU results
 agree to float32 rounding (the exp is evaluated in float32 on both paths), not bit for bit: a run records the
-backend it used (``backend_name``) and comparisons should not mix the two.
+backend it used (``backend_name``, ``describe``) and comparisons should not mix the two.
 """
 
 from __future__ import annotations
 
+import contextlib
+import math
 import os
 
 import numpy as np
@@ -42,13 +60,51 @@ def devices() -> list[int]:
 
 
 def device_for_this_process() -> int | None:
-    """The device of this (worker) process: process id modulo the number of devices."""
+    """The device of this process: ``CSPAPS_GPU_DEVICE`` (set per pool worker by ``worker_init``), else the
+    pool-worker number round-robin over ``devices()``, else the first device."""
     devs = devices()
-    return devs[os.getpid() % len(devs)] if devs else None
+    if not devs:
+        return None
+    raw = os.environ.get("CSPAPS_GPU_DEVICE", "").strip()
+    if raw:
+        return int(raw)
+    import multiprocessing as mp
+
+    ident = getattr(mp.current_process(), "_identity", ())
+    return devs[(ident[-1] - 1) % len(devs)] if ident else devs[0]
+
+
+def worker_init(counter, n_workers: int) -> None:
+    """Pool-worker initializer: the next device round-robin and the memory share of each process on it."""
+    with counter.get_lock():
+        index = counter.value
+        counter.value += 1
+    devs = devices()
+    if not devs:
+        return
+    os.environ["CSPAPS_GPU_DEVICE"] = str(devs[index % len(devs)])
+    os.environ["CSPAPS_GPU_SHARE"] = str(max(1, math.ceil(n_workers / len(devs))))
 
 
 def backend_name() -> str:
     return "cupy" if _cupy() is not None else "numpy"
+
+
+def describe() -> dict:
+    """Backend, devices and kernels of this process (recorded with results)."""
+    from . import kernels
+
+    out = {"backend": backend_name(), "cpu_kernels": kernels.name()}
+    cp = _cupy()
+    if cp is not None:
+        dev = device_for_this_process()
+        try:
+            props = cp.cuda.runtime.getDeviceProperties(dev or 0)
+            name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
+        except Exception:  # noqa: BLE001
+            name = "?"
+        out.update(device=dev, device_name=name, devices=devices())
+    return out
 
 
 def min_elements() -> int:
@@ -56,6 +112,44 @@ def min_elements() -> int:
         return int(float(os.environ.get("CSPAPS_GPU_MIN", 2_000_000)))
     except ValueError:
         return 2_000_000
+
+
+def _share() -> int:
+    try:
+        return max(1, int(os.environ.get("CSPAPS_GPU_SHARE", "1")))
+    except ValueError:
+        return 1
+
+
+_CONFIGURED: set = set()
+
+
+@contextlib.contextmanager
+def _device(cp):
+    """This process's device as the current one; on first use caps the memory pool at its share."""
+    dev = device_for_this_process() or 0
+    with cp.cuda.Device(dev):
+        if dev not in _CONFIGURED:
+            _CONFIGURED.add(dev)
+            share = _share()
+            if share > 1:
+                with contextlib.suppress(Exception):
+                    cp.get_default_memory_pool().set_limit(fraction=0.9 / share)
+        yield dev
+
+
+def block_elements(cp=None) -> int:
+    """Elements of one dense block on the device: ``CSPAPS_GPU_BLOCK``, capped by this process's memory share
+    (forming a block keeps ~5 float64 temporaries alive)."""
+    try:
+        block = int(float(os.environ.get("CSPAPS_GPU_BLOCK", 8_000_000)))
+    except ValueError:
+        block = 8_000_000
+    if cp is not None:
+        with contextlib.suppress(Exception):
+            free, total = cp.cuda.runtime.memGetInfo()
+            block = min(block, int(0.8 * min(free, total / _share()) / 40))
+    return max(block, 100_000)
 
 
 def footprints_xp(xp, points, normals, aim_xyz, t, sigma, power):
@@ -75,22 +169,173 @@ def footprints_xp(xp, points, normals, aim_xyz, t, sigma, power):
     return out
 
 
+def _dev(cp, a, dtype=np.float64):
+    return cp.asarray(np.ascontiguousarray(a, dtype=dtype))
+
+
+def _beams(cp, aim_xyz, t, sigma, power, sl):
+    return (_dev(cp, aim_xyz[sl]), _dev(cp, t[sl]), _dev(cp, sigma[sl]), _dev(cp, power[sl]))
+
+
+def _gpu_for(n_elements: int, dense: bool = False):
+    """CuPy when the GPU backend is on and the work is large enough, else None.
+
+    A dense result crosses the bus whole (``CSPAPS_GPU_MIN`` elements to pay for it); a reduced one is small, so
+    the GPU pays off from an eighth of that."""
+    if n_elements < (min_elements() if dense else min_elements() // 8):
+        return None
+    return _cupy()
+
+
 def footprints_gpu(points, normals, aim_xyz, t, sigma, power):
     """The footprint matrix on the GPU, or None when the CPU path should be used."""
-    if aim_xyz.shape[0] * points.shape[0] < min_elements():
-        return None
-    cp = _cupy()
+    cp = _gpu_for(aim_xyz.shape[0] * points.shape[0], dense=True)
     if cp is None:
         return None
-    dev = device_for_this_process()
-    with cp.cuda.Device(dev if dev is not None else 0):
+    with _device(cp):
         args = [cp.asarray(np.asarray(a, dtype=np.float64)) for a in (points, normals, aim_xyz, t, sigma, power)]
         return cp.asnumpy(footprints_xp(cp, *args))
 
 
+def flux_sum_gpu(points, normals, aim_xyz, t, sigma, power):
+    """Superposed flux of all beams at the points, (P,), reduced on the device; None -> CPU path."""
+    n_b, n_p = aim_xyz.shape[0], points.shape[0]
+    cp = _gpu_for(n_b * n_p)
+    if cp is None:
+        return None
+    with _device(cp):
+        pts, nrm = _dev(cp, points), _dev(cp, normals)
+        step = max(1, block_elements(cp) // max(n_p, 1))
+        out = cp.zeros(n_p)
+        for s in range(0, n_b, step):
+            out += footprints_xp(cp, pts, nrm, *_beams(cp, aim_xyz, t, sigma, power, slice(s, s + step))).sum(axis=0)
+        return cp.asnumpy(out)
+
+
+def flux_and_power_gpu(points, normals, aim_xyz, t, sigma, power, cell_area):
+    """(flux at the points (P,), flux sum per beam x ``cell_area`` (R,)), reduced on the device; None -> CPU."""
+    n_b, n_p = aim_xyz.shape[0], points.shape[0]
+    cp = _gpu_for(n_b * n_p)
+    if cp is None:
+        return None
+    with _device(cp):
+        pts, nrm = _dev(cp, points), _dev(cp, normals)
+        step = max(1, block_elements(cp) // max(n_p, 1))
+        flux = cp.zeros(n_p)
+        per_beam = cp.zeros(n_b)
+        for s in range(0, n_b, step):
+            f = footprints_xp(cp, pts, nrm, *_beams(cp, aim_xyz, t, sigma, power, slice(s, s + step)))
+            flux += f.sum(axis=0)
+            per_beam[s:s + f.shape[0]] = f.sum(axis=1) * cell_area
+        return cp.asnumpy(flux), cp.asnumpy(per_beam)
+
+
+def row_stats_gpu(points, normals, aim_xyz, t, sigma, power, weights):
+    """Per beam: the flux sum over the points and the ``weights``-weighted sum, (R,) each; None -> CPU path."""
+    n_b, n_p = aim_xyz.shape[0], points.shape[0]
+    cp = _gpu_for(n_b * n_p)
+    if cp is None:
+        return None
+    with _device(cp):
+        pts, nrm, w = _dev(cp, points), _dev(cp, normals), _dev(cp, weights)
+        step = max(1, block_elements(cp) // max(n_p, 1))
+        sums, dots = cp.zeros(n_b), cp.zeros(n_b)
+        for s in range(0, n_b, step):
+            f = footprints_xp(cp, pts, nrm, *_beams(cp, aim_xyz, t, sigma, power, slice(s, s + step)))
+            sums[s:s + f.shape[0]] = f.sum(axis=1)
+            dots[s:s + f.shape[0]] = f @ w
+        return cp.asnumpy(sums), cp.asnumpy(dots)
+
+
+def sparse_responses_gpu(points, normals, aim_xyz, t, sigma, power, cutoff):
+    """Sparse candidate responses of N heliostats x K candidates, built on the device.
+
+    ``aim_xyz``/``t`` (N, K, 3), ``sigma``/``power`` (N, K). Per heliostat, as ``aps.build_response`` does on the
+    CPU: the peak of its (K, P) block, the cells where some candidate exceeds ``cutoff`` x peak (sorted) and the
+    (K, S) float32 values there. Only the support values cross the bus. Returns (peaks, cells, resp) or None."""
+    n, k = sigma.shape
+    n_p = points.shape[0]
+    cp = _gpu_for(n * k * n_p)
+    if cp is None:
+        return None
+    peaks = np.zeros(n)
+    cells: list[np.ndarray] = []
+    resp: list[np.ndarray] = []
+    with _device(cp):
+        pts, nrm = _dev(cp, points), _dev(cp, normals)
+        step = max(1, block_elements(cp) // max(k * n_p, 1))
+        for s in range(0, n, step):
+            e = min(n, s + step)
+            m = e - s
+            f = footprints_xp(cp, pts, nrm, _dev(cp, aim_xyz[s:e].reshape(-1, 3)), _dev(cp, t[s:e].reshape(-1, 3)),
+                              _dev(cp, sigma[s:e].reshape(-1)), _dev(cp, power[s:e].reshape(-1))).reshape(m, k, n_p)
+            peak = f.reshape(m, -1).max(axis=1)
+            mask = (f.max(axis=1) > cutoff * peak[:, None]) & (peak[:, None] > 0)
+            rows, cols = cp.nonzero(mask)  # row-major: heliostat by heliostat, cells ascending
+            vals = f.astype(cp.float32).transpose(0, 2, 1)[rows, cols]  # (nnz, K)
+            peaks[s:e] = cp.asnumpy(peak)
+            rows, cols, vals = cp.asnumpy(rows), cp.asnumpy(cols).astype(np.int64), cp.asnumpy(vals)
+            counts = np.bincount(rows, minlength=m)
+            ends = np.cumsum(counts)
+            for j in range(m):
+                a, b = ends[j] - counts[j], ends[j]
+                cells.append(cols[a:b])
+                resp.append(np.ascontiguousarray(vals[a:b].T))
+    return peaks, cells, resp
+
+
+def intercept_xp(xp, ndtr, aim_xyz, t, sigma, radius, c_bot, z_span, x, w):
+    """``optics.intercept_fraction`` for any array module (same formula and quadrature); xp inputs, (n,) out."""
+    z = xp.asarray([0.0, 0.0, 1.0])
+    e_u = xp.cross(t, z)
+    norm = xp.linalg.norm(e_u, axis=-1, keepdims=True)
+    e_u = xp.where(norm > 1e-9, e_u / xp.maximum(norm, 1e-12), xp.asarray([1.0, 0.0, 0.0]))
+    e_v = xp.cross(e_u, t)
+    h = -t.copy()
+    h[:, 2] = 0.0
+    h /= xp.linalg.norm(h, axis=1, keepdims=True)
+    a_u = xp.sum((aim_xyz - c_bot) * e_u, axis=1)
+    lo = xp.maximum(-radius, a_u - 8 * sigma)
+    hi = xp.minimum(radius, a_u + 8 * sigma)
+    ok = hi > lo
+    mid, half = 0.5 * (hi + lo), 0.5 * xp.where(ok, hi - lo, 0.0)
+    U = mid[:, None] + half[:, None] * x[None, :]
+    depth = xp.sqrt(xp.maximum(radius * radius - U * U, 0.0))
+    p_bot = c_bot + h[:, None, :] * depth[..., None] + e_u[:, None, :] * U[..., None]
+    r = p_bot - aim_xyz[:, None, :]
+    u = U - a_u[:, None]
+    v_bot = xp.sum(r * e_v[:, None, :], axis=2)
+    v_top = v_bot + z_span * e_v[:, 2:3]
+    s = sigma[:, None]
+    pdf = xp.exp(-0.5 * (u / s) ** 2) / (math.sqrt(2 * math.pi) * s)
+    band = xp.abs(ndtr(v_top / s) - ndtr(v_bot / s))
+    frac = (pdf * band) @ w * half
+    return xp.minimum(xp.maximum(xp.where(ok, frac, 0.0), 0.0), 1.0)
+
+
+def intercept_fraction_gpu(aim_xyz, t, sigma, radius, c_bot, z_span, n_quad):
+    """Gaussian intercept fractions of (n,) beams on the device; None -> CPU path."""
+    n = sigma.shape[0]
+    cp = _gpu_for(4 * n * n_quad)
+    if cp is None:
+        return None
+    from cupyx.scipy.special import ndtr
+
+    x, w = np.polynomial.legendre.leggauss(n_quad)
+    out = np.empty(n)
+    with _device(cp):
+        xd, wd, cb = _dev(cp, x), _dev(cp, w), _dev(cp, c_bot)
+        step = max(1, block_elements(cp) // (12 * n_quad))
+        for s in range(0, n, step):
+            sl = slice(s, s + step)
+            out[sl] = cp.asnumpy(intercept_xp(cp, ndtr, _dev(cp, aim_xyz[sl]), _dev(cp, t[sl]), _dev(cp, sigma[sl]),
+                                              float(radius), cb, float(z_span), xd, wd))
+    return out
+
+
 def self_check(n_beams: int = 4000, n_points: int = 4000, seed: int = 0) -> dict:
-    """GPU vs CPU on random beams: largest relative difference and the time of each (run on the GPU machine:
-    ``CSPAPS_GPU=1 python -m cspaps.backend``)."""
+    """GPU vs CPU on random beams: largest relative difference and the time of each, per device (run on the GPU
+    machine: ``CSPAPS_GPU=1 python -m cspaps.backend``)."""
     import time
 
     rng = np.random.default_rng(seed)
@@ -104,22 +349,27 @@ def self_check(n_beams: int = 4000, n_points: int = 4000, seed: int = 0) -> dict
     sigma, power = rng.uniform(0.5, 2.0, n_beams), rng.uniform(1e4, 6e4, n_beams)
     t0 = time.perf_counter()
     cpu = footprints_xp(np, pts, nrm, aim, t, sigma, power)
+    cpu_sum = cpu.sum(axis=0)
     t_cpu = time.perf_counter() - t0
-    out = {"backend": backend_name(), "devices": devices(), "elements": n_beams * n_points, "cpu_s": round(t_cpu, 3)}
+    out = {**describe(), "elements": n_beams * n_points, "cpu_s": round(t_cpu, 3)}
     cp = _cupy()
     if cp is None:
         out["note"] = "no CuPy / GPU: set CSPAPS_GPU=1 and install the gpu extra (pip install -e \".[gpu]\")"
         return out
-    with cp.cuda.Device(device_for_this_process() or 0):
-        small = [cp.asarray(a[:8]) for a in (pts, nrm, aim, t, sigma, power)]
-        cp.asnumpy(footprints_xp(cp, *small))  # warm-up: context and kernel compilation
-        t0 = time.perf_counter()
-        args = [cp.asarray(a) for a in (pts, nrm, aim, t, sigma, power)]  # transfers included, as in use
-        gpu = cp.asnumpy(footprints_xp(cp, *args))
-        t_gpu = time.perf_counter() - t0
-    scale = float(np.abs(cpu).max()) or 1.0
-    out.update(gpu_s=round(t_gpu, 3), speedup=round(t_cpu / max(t_gpu, 1e-9), 1),
-               max_abs_diff_rel_to_peak=float(np.abs(gpu - cpu).max() / scale))
+    per_device = []
+    for dev in devices():
+        os.environ["CSPAPS_GPU_DEVICE"] = str(dev)
+        with cp.cuda.Device(dev):
+            small = [cp.asarray(a[:8]) for a in (pts, nrm, aim, t, sigma, power)]
+            cp.asnumpy(footprints_xp(cp, *small))  # warm-up: context and kernel compilation
+            t0 = time.perf_counter()
+            gpu_sum = flux_sum_gpu(pts, nrm, aim, t, sigma, power)  # transfers included, as in use
+            t_gpu = time.perf_counter() - t0
+        scale = float(np.abs(cpu_sum).max()) or 1.0
+        per_device.append({"device": dev, "gpu_s": round(t_gpu, 4), "speedup": round(t_cpu / max(t_gpu, 1e-9), 1),
+                           "max_abs_diff_rel_to_peak": float(np.abs(gpu_sum - cpu_sum).max() / scale)})
+    os.environ.pop("CSPAPS_GPU_DEVICE", None)
+    out["devices_checked"] = per_device
     return out
 
 

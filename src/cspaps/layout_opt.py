@@ -636,7 +636,7 @@ def optimize_layout(
 
     def callback(intermediate_result):
         gen["n"] += 1
-        say(f"generation {gen['n']}: best so far {-intermediate_result.fun:.1f} MWh")
+        say(f"generation {gen['n']}/{spec.maxiter}: best so far {-intermediate_result.fun:.1f} MWh")
         if stop():
             return True  # stops differential evolution
 

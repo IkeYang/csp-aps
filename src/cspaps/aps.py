@@ -218,11 +218,13 @@ def build_response(
     cells: list[np.ndarray] = []
     resp: list[np.ndarray] = []
     peaks = np.zeros(n)
-    from .backend import backend_name, min_elements
+    from .backend import enabled, sparse_responses_gpu
 
-    if backend_name() == "cupy":  # GPU: blocks big enough to pay for the transfers (results do not depend on it)
-        chunk = max(chunk, -(-4 * min_elements() // max(k * grid.points.shape[0], 1)))
-    for start in range(0, n, chunk):
+    gpu = (sparse_responses_gpu(grid.points, grid.normals, aim_xyz, t, sigma, unit_beam, FOOTPRINT_CUTOFF)
+           if enabled() and n else None)
+    if gpu is not None:  # formed, thresholded and compacted on the GPU: only the support values come back
+        peaks, cells, resp = gpu
+    for start in range(0, n if gpu is None else 0, chunk):
         stop = min(n, start + chunk)
         f = optics.footprints(
             grid, aim_xyz[start:stop].reshape(-1, 3), t[start:stop].reshape(-1, 3),

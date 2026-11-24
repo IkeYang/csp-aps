@@ -31,8 +31,18 @@ def _print(result: dict) -> int:
     return 0
 
 
-def _progress(msg: str) -> None:
-    print(f"  {msg}", file=sys.stderr, flush=True)
+_TRACKER = None
+
+
+def _progress(msg, total=None) -> None:
+    """Progress line with the stage's percentage and remaining time (``progress.ProgressTracker``)."""
+    global _TRACKER
+    from .progress import ProgressTracker, cli_line
+
+    if _TRACKER is None:
+        _TRACKER = ProgressTracker()
+    _TRACKER(msg, total)
+    print(cli_line(_TRACKER.state()), file=sys.stderr, flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -171,7 +181,11 @@ def _safe_console() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _TRACKER
     _safe_console()
+    from .progress import ProgressTracker
+
+    _TRACKER = ProgressTracker()  # elapsed / remaining times count from the start of this command
     args = build_parser().parse_args(argv)
     if args.command == "gui":
         app = Path(__file__).with_name("gui_app.py")

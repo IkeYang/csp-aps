@@ -661,16 +661,20 @@ def _input_digest(case, args, options):
 
 
 class Job:
-    def __init__(self, fn, *args, input_digest=None, **kwargs):
+    def __init__(self, fn, *args, input_digest=None, expected_s: float | None = None, **kwargs):
+        from cspaps.progress import ProgressTracker
+
         self.input_digest = input_digest
-        self.messages: list[str] = []
+        # progress messages -> stage fraction and remaining time (``expected_s``: the depth's time estimate)
+        self.tracker = ProgressTracker(expected_total_s=expected_s)
+        self.messages: list[str] = self.tracker.messages
         self.result = None
         self.error: str | None = None
         self.cancel = threading.Event()
         self.cancellable = "cancel" in kwargs
         self.started = _time.time()
         if "progress" in kwargs:
-            kwargs["progress"] = self.messages.append
+            kwargs["progress"] = self.tracker
         if "cancel" in kwargs:
             kwargs["cancel"] = self.cancel.is_set
         self.thread = threading.Thread(target=self._run, args=(fn, args, kwargs), daemon=True)
@@ -718,7 +722,9 @@ def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help
         if st.button(label, key=f"btn_{key}", type="primary", help=help, width="stretch"):
             if cancellable:
                 kwargs["cancel"] = True
-            job = Job(fn, case, RESULTS, *args, input_digest=digest, **kwargs)
+            # the chosen depth's time estimate (if a depth was chosen for this task) for the overall remaining time
+            expected = st.session_state.get(f"expected_s_{DEPTH_TASK_OF_JOB.get(key, '')}")
+            job = Job(fn, case, RESULTS, *args, input_digest=digest, expected_s=expected, **kwargs)
             if os.environ.get("CSPAPS_GUI_SYNC"):
                 job.collect(key)
             else:
@@ -729,14 +735,27 @@ def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help
     return digest
 
 
+# job key -> depth task of ``_depth_selector`` (whose time estimate the progress display uses)
+DEPTH_TASK_OF_JOB = {"lv": "compare", "single": "aim", "opt": "search"}
+
+
 @st.fragment(run_every=1.0)
 def _job_status(key: str) -> None:
     job = st.session_state.get(f"job_{key}")
     if job is None:
         return
     if not job.done:
-        msg = job.messages[-1] if job.messages else "计算中…"
-        st.info(f"⏳ {_progress_zh(msg)}（已用 {(_time.time() - job.started):.0f} s）")
+        from cspaps.progress import describe_zh
+
+        state = job.tracker.state()
+        msg = _progress_zh(state.message) if state.message else "计算中…"
+        if state.fraction is not None:  # a counter: bar of the current stage
+            st.progress(min(max(state.fraction, 0.0), 1.0), text=f"⏳ {msg}")
+        elif state.overall_remaining_s is not None and job.tracker.expected_total_s:
+            st.progress(min(state.elapsed_s / job.tracker.expected_total_s, 0.99), text=f"⏳ {msg}")
+        else:
+            st.info(f"⏳ {msg}")
+        st.caption(describe_zh(state))
         if job.cancellable and st.button("取消", key=f"cancel_{key}"):
             job.cancel.set()
         return
@@ -751,6 +770,10 @@ def _progress_zh(msg: str) -> str:
     m = re.match(r"APS scenarios (.+): (\d+)/(\d+)$", msg)
     if m:  # "正在评估布局 B，已完成 8/20 个工况"
         return f"正在评估{wf.layout_label(m.group(1))}，已完成 {m.group(2)}/{m.group(3)} 个工况"
+    m = re.match(r"APS scenarios, all layouts: (\d+)/(\d+) \((.+) (\d+)/(\d+)\)$", msg)
+    if m:  # several layouts in one pool: "同时评估各布局，已完成 40/669 个工况（布局 B 13/223）"
+        return (f"同时评估各布局，已完成 {m.group(1)}/{m.group(2)} 个工况"
+                f"（{wf.layout_label(m.group(3))} {m.group(4)}/{m.group(5)}）")
     m = re.match(r"(sampling check|independent cloud maps): (.+) on (\d+) scenarios", msg)
     if m:
         what = "更密工况复核" if m.group(1) == "sampling check" else "独立云图复核"
@@ -2004,6 +2027,8 @@ def _depth_selector(case, task: str, n_layouts: int = 2) -> str:
                           help="快速 = 先看结果；标准 = 日常使用；深度思考 = 定方案前把每一步算细。选中后才会改动设置。")
     shown = rec["recommended"] if choice == "custom" else choice
     o = opts[shown]
+    # the overall time estimate shown with the progress bar: only when a depth (not "current settings") is chosen
+    st.session_state[f"expected_s_{task}"] = float(o["seconds"]) if choice in MODES else None
     head = ("推荐" if choice == "custom" else "已选") + f" {o['icon']} {o['label']}"
     _callout("info", f"{head} · 预计 {fmt_duration(o['range'][0])} – {fmt_duration(o['range'][1])}"
              + ("（超出校准规模，估计偏粗）" if o.get("extrapolated") else ""), o["text"])

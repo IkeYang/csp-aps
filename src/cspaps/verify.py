@@ -70,6 +70,12 @@ def _flux_at(points, normals, aim, t, sigma, power, chunk_elems=4_000_000) -> np
     out = np.zeros(points.shape[0])
     if aim.shape[0] == 0:
         return out
+    from .backend import enabled, flux_sum_gpu
+
+    if enabled():  # summed over the beams on the GPU
+        gpu = flux_sum_gpu(points, normals, aim, t, sigma, power)
+        if gpu is not None:
+            return gpu
     step = max(1, chunk_elems // max(points.shape[0], 1))
     for s in range(0, aim.shape[0], step):
         sl = slice(s, s + step)

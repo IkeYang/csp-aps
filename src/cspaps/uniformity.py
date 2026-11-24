@@ -101,9 +101,21 @@ class _State:
 
 def _local_search(prob, state: _State, mu: float, passes: int, absorb_power: np.ndarray, order,
                   prev_aim_xyz: np.ndarray | None = None, prev_active: np.ndarray | None = None) -> None:
-    """Coordinate moves maximising absorbed power minus the uniformity penalty."""
+    """Coordinate moves maximising absorbed power minus the uniformity penalty.
+
+    Runs the compiled kernel (``kernels.local_search``, bit-identical to the loop below) when Numba is available."""
+    from . import kernels
+
     limit = prob.limit
     p_ref = absorb_power[:, prob.center_k]
+    if kernels.enabled():
+        move_cost = None
+        if prev_aim_xyz is not None and prev_active is not None:
+            # the numpy loop's penalty, (penalty * p_ref_i) * |aim - previous aim| * active_i, for all i at once
+            move = np.linalg.norm(prob.aim_xyz - np.asarray(prev_aim_xyz)[:, None, :], axis=2)
+            move_cost = (prob.case.aps.move_penalty_per_m * p_ref[:, None]) * move * np.asarray(prev_active, bool)[:, None]
+        kernels.local_search(prob, state, mu, passes, absorb_power, order, move_cost)
+        return
     for _ in range(passes):
         moved = 0
         for i in order:

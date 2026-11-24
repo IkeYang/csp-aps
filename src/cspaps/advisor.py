@@ -293,12 +293,17 @@ def _file_scenarios(case: Case) -> int:
 
 def _gpu_note() -> str:
     from .backend import backend_name, devices, enabled
+    from .kernels import enabled as compiled
 
+    cpu = ("均匀度局部搜索已编译运行（Numba，结果与 numpy 逐位相同）。" if compiled() else
+           "未启用编译内核（未安装 Numba 或 CSPAPS_JIT=0），均匀度局部搜索按 numpy 运行。")
     if backend_name() == "cupy":
-        return f"光斑与通量计算使用 GPU（CuPy，设备 {devices()}），时间估计按 CPU 校准，实际会更短。"
+        devs = devices()
+        return (f"光斑与通量计算使用 GPU（CuPy，{len(devs)} 张卡 {devs}，各工作进程轮流分配），"
+                f"时间估计按 CPU 校准，实际会更短。" + cpu)
     if enabled():
-        return "已设置 CSPAPS_GPU=1，但没有找到 CuPy 或 GPU，按 CPU 计算。"
-    return "当前按 CPU 多进程计算；安装 CuPy 并设置 CSPAPS_GPU=1 后，光斑与通量计算可在 GPU 上进行。"
+        return "已设置 CSPAPS_GPU=1，但没有找到 CuPy 或 GPU，按 CPU 计算。" + cpu
+    return "当前按 CPU 多进程计算；安装 CuPy 并设置 CSPAPS_GPU=1 后，光斑与通量计算可在 GPU 上进行。" + cpu
 
 
 def fmt_duration(s: float) -> str:

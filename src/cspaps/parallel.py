@@ -15,6 +15,7 @@ a pickle boundary. Main-thread scripts use processes:
   need the usual ``if __name__ == "__main__":`` guard;
 * GPU backend switched on (``CSPAPS_GPU=1``): ``forkserver`` on Linux too, because CUDA cannot be used in
   a child forked after the parent initialised it. Scripts then need the ``__main__`` guard as well.
+  Each worker gets its own device, round-robin over ``CSPAPS_GPU_DEVICES`` (``backend.worker_init``).
 """
 
 from __future__ import annotations
@@ -68,4 +69,11 @@ def pool(workers: int, probe=None):
     if threading.current_thread() is not threading.main_thread():
         if forced != "process" and (probe is None or not _picklable(probe)):
             return ThreadPool(workers)
-    return mp.get_context(start_method()).Pool(workers)
+    ctx = mp.get_context(start_method())
+    from .backend import enabled as gpu_enabled
+
+    if gpu_enabled():  # every worker its own GPU, round-robin, and its share of that GPU's memory
+        from .backend import worker_init
+
+        return ctx.Pool(workers, initializer=worker_init, initargs=(ctx.Value("i", 0), workers))
+    return ctx.Pool(workers)

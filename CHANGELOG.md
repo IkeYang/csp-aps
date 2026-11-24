@@ -2,6 +2,18 @@
 
 ## 未发布
 
+- **多 GPU 加速**（`CSPAPS_GPU=1`，详见 README“多 GPU 部署与加速”）
+  - 光斑核之后的归约都在显卡上完成，只传回小结果：细网格复核的叠加通量（`flux_sum_gpu`）、热流图与逐镜截获（`flux_and_power_gpu`，`evaluate`）、光斑响应的稀疏化（`sparse_responses_gpu`，只传回支撑网格的 float32 值）、联合姿态上界的逐束求和（`row_stats_gpu`）、截获率积分（`intercept_fraction_gpu`）。CPU 路径代码不变，结果逐位不变。
+  - 多卡：进程池的每个工作进程按轮转分到一张卡（`backend.worker_init`，替代原来的“进程号取模”），同一张卡上的进程分摊显存（`CSPAPS_GPU_SHARE`，内存池上限与分块大小随之调整，`CSPAPS_GPU_BLOCK`）。
+  - 年度价值记录所用显卡型号（`gpu_model`）：不同型号的 float32 舍入可能不同。
+  - `python -m cspaps.backend` 逐卡对比 GPU 与 CPU；`scripts/gpu_benchmark.py` 在目标机器上测单进程加速比与多卡吞吐。
+- **编译内核**（Numba，新依赖；`CSPAPS_JIT=0` 关闭）：均匀度局部搜索（年度评价中最耗时的串行坐标搜索，无法拆给 GPU 线程）编译运行，快 3–6 倍。与 numpy 代码**逐位相同**：复现 numpy 的求和顺序（连续数组成对求和、布尔筛选后的候选行顺序求和），运行时先对照本机 numpy 检验，不一致则自动回到 numpy。
+- **进度条与剩余时间**（`progress.py`）
+  - 图形界面后台任务显示进度条和“已用 · 本阶段 k/n · 本阶段预计还需 · 整体预计还需”；剩余时间按本阶段的实测速度估计，选了计算深度时另给整体估计。
+  - 命令行进度行带百分比、已用时间和剩余时间。
+  - 差分进化的代数带总数（`generation 3/16`）；多个布局同进程池评价时先报总进度（`APS scenarios, all layouts: 40/669 (B 13/223)`）。
+- 回归测试：`tests/test_kernels.py`（编译内核逐位相同，含限值起作用、可达性、移动惩罚和热点点）、`tests/test_gpu_backend.py`（严格的 CuPy 替身 `tests/fake_cupy.py`：主机与设备数组混用即报错，各 GPU 路径与 CPU 一致，多卡分配）、`tests/test_progress.py`。
+
 - **修复：图形界面后台任务刷屏 `Thread 'MainThread': missing ScriptRunContext!`**（Windows 上每次多核计算都会出现）
   - 原因：Streamlit 把 `gui_app.py` 当作 `__main__` 模块运行；后台任务的进程池（Windows 为 `spawn`，Linux 多线程时为 `forkserver`）会在每个工作进程里重新执行主模块，于是整个界面在没有 Streamlit 会话的进程里又跑一遍，每个 `st.*` 调用打印一次警告，每个工作进程的启动也被拖慢。
   - 修复：`gui_app` 给 Streamlit 的主模块标记名为 `__main__` 的模块规格，工作进程不再执行界面脚本（工作进程只接收 cspaps 的函数和数据）；文件末尾的 `main()` 加 `if __name__ == "__main__":` 保护。

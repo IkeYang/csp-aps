@@ -867,12 +867,15 @@ def _finish_value(case, name, xyz, ids, results, sset, settings, lam_l, t0, tags
             results[i] = ScenarioRecord(sset.ids[i], sset.map_id(i), float(s.weight_h[i]), float(s.elevation[i]),
                                         float(s.azimuth[i]), float(s.dni[i]), plan, float(s.actual_hours[i]),
                                         sset.samples.map_of(i).digest())
-    from .backend import backend_name
+    from .backend import backend_name, describe
 
     basis = sset.meta.get("basis")
     labels = value_labels(basis)
+    compute = {"backend": backend_name()}
+    if compute["backend"] == "cupy":  # GPU models can differ in the last float32 bits: record which one
+        compute["gpu_model"] = describe().get("device_name")
     out = LayoutValue(name, xyz, ids, results, settings.lam_aps, lam_l, sset.fingerprint(), settings,
-                      _time.perf_counter() - t0, {**(tags or {}), "backend": backend_name(), "basis": basis,
+                      _time.perf_counter() - t0, {**(tags or {}), **compute, "basis": basis,
                                                   "value_label": labels["value"], "energy_label": labels["energy"]})
     if case.layout_opt.control_variate and not stop() and all(r.plan.status != "not_solved" for r in results):
         if progress:
@@ -925,8 +928,8 @@ def evaluate_layout_values(case: Case, layouts: dict, sset, settings: InnerSetti
                     results[name][i] = rec
                     done[name] += 1
                 if progress:
-                    progress(f"APS scenarios {name}: {done[name]}/{len(sset)} "
-                             f"(all layouts {sum(done.values())}/{len(sset) * len(names)})")
+                    progress(f"APS scenarios, all layouts: {sum(done.values())}/{len(sset) * len(names)} "
+                             f"({name} {done[name]}/{len(sset)})")
                 if stop():
                     p.terminate()
                     break
