@@ -132,6 +132,8 @@ def test_scenario_solve_on_gpu_matches_cpu(small_case, gpu):
 
 def test_round_robin_devices_and_memory_share(monkeypatch, gpu):
     gpu(n_devices=3)
+    for key in ("CSPAPS_GPU_DEVICE", "CSPAPS_GPU_SHARE"):  # worker_init sets them: restore after the test
+        monkeypatch.setenv(key, "")
     counter = mp.Value("i", 0)
     seen = []
     for _ in range(7):
@@ -166,6 +168,12 @@ def _worker_device(_):
     return os.getpid(), os.environ.get("CSPAPS_GPU_DEVICE"), os.environ.get("CSPAPS_GPU_SHARE")
 
 
+def _worker_env(_):
+    import os
+
+    return os.environ.get("CSPAPS_GPU"), os.environ.get("CSPAPS_GPU_DEVICES"), os.environ.get("CSPAPS_GPU_DEVICE")
+
+
 def test_process_pool_assigns_devices(monkeypatch):
     """A real pool with the GPU backend on: every worker is initialised with a device and a share."""
     from cspaps.parallel import pool
@@ -177,3 +185,26 @@ def test_process_pool_assigns_devices(monkeypatch):
     devices = {pid: (dev, share) for pid, dev, share in rows}
     assert {d for d, _ in devices.values()} <= {"0", "1"}
     assert all(share == "2" for _, share in devices.values())
+
+
+def test_workers_take_the_current_settings(monkeypatch):
+    """A fork server started earlier keeps its old environment; workers must still see the parent's settings
+    of the moment the pool is created (set and unset)."""
+    import threading
+    import time
+
+    from cspaps.parallel import pool
+
+    threading.Thread(target=time.sleep, args=(5,), daemon=True).start()  # multi-threaded: forkserver
+    monkeypatch.setenv("CSPAPS_GPU", "1")
+    monkeypatch.delenv("CSPAPS_GPU_DEVICES", raising=False)
+    with pool(2) as p:  # (re)uses the fork server with CSPAPS_GPU_DEVICES unset
+        p.map(_worker_env, range(4))
+    monkeypatch.setenv("CSPAPS_GPU_DEVICES", "0,1")
+    with pool(2) as p:
+        rows = set(p.map(_worker_env, range(8), chunksize=1))
+    assert all(gpu == "1" and devs == "0,1" and dev in ("0", "1") for gpu, devs, dev in rows)
+    monkeypatch.setenv("CSPAPS_GPU", "0")
+    with pool(2) as p:  # switched off in the parent: off in the workers, no device assigned
+        rows = set(p.map(_worker_env, range(4)))
+    assert all(gpu == "0" and dev is None for gpu, _, dev in rows)

@@ -16,6 +16,8 @@ a pickle boundary. Main-thread scripts use processes:
 * GPU backend switched on (``CSPAPS_GPU=1``): ``forkserver`` on Linux too, because CUDA cannot be used in
   a child forked after the parent initialised it. Scripts then need the ``__main__`` guard as well.
   Each worker gets its own device, round-robin over ``CSPAPS_GPU_DEVICES`` (``backend.worker_init``).
+* Workers take the parent's ``CSPAPS_*`` settings as they are when the pool is created (a fork server keeps
+  the environment it was started with).
 """
 
 from __future__ import annotations
@@ -70,10 +72,21 @@ def pool(workers: int, probe=None):
         if forced != "process" and (probe is None or not _picklable(probe)):
             return ThreadPool(workers)
     ctx = mp.get_context(start_method())
-    from .backend import enabled as gpu_enabled
+    # the parent's CSPAPS_* settings as they are now: a fork server keeps the environment it was started with
+    env = {k: v for k, v in os.environ.items() if k.startswith("CSPAPS_") and k not in _PER_WORKER}
+    return ctx.Pool(workers, initializer=_worker_init, initargs=(env, ctx.Value("i", 0), workers))
 
-    if gpu_enabled():  # every worker its own GPU, round-robin, and its share of that GPU's memory
-        from .backend import worker_init
 
-        return ctx.Pool(workers, initializer=worker_init, initargs=(ctx.Value("i", 0), workers))
-    return ctx.Pool(workers)
+_PER_WORKER = ("CSPAPS_GPU_DEVICE", "CSPAPS_GPU_SHARE")  # assigned to each worker by backend.worker_init
+
+
+def _worker_init(env: dict, counter, n_workers: int) -> None:
+    """Pool-worker initializer: the parent's CSPAPS_* settings (stale ones removed), then with the GPU backend on
+    the next device round-robin and this worker's share of it."""
+    for key in [k for k in os.environ if k.startswith("CSPAPS_") and k not in env]:
+        del os.environ[key]
+    os.environ.update(env)
+    from .backend import enabled, worker_init
+
+    if enabled():
+        worker_init(counter, n_workers)
