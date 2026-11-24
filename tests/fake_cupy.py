@@ -103,6 +103,43 @@ class _Module(types.ModuleType):
     def get_default_memory_pool(self):
         return self._pool
 
+    def RawKernel(self, code, name, options=()):  # noqa: N802 - CuPy's name
+        """A CUDA kernel run as its C++ build (sources written for ``gpu_search``'s CPU emulation)."""
+        if _STATE.get("raw_kernel_error"):
+            raise RuntimeError(_STATE["raw_kernel_error"])
+        import ctypes
+
+        from cspaps.gpu_search import compile_cpu
+
+        f = compile_cpu(code, name)
+
+        def launch(grid, block, args, shared_mem=0):
+            _STATE.setdefault("launches", []).append({"grid": grid, "block": block, "shared_mem": shared_mem,
+                                                      "options": options, "device": _STATE["current"]})
+            assert shared_mem <= 48 * 1024, "dynamic shared memory over 48 KB"
+            c_args = []
+            for a in args:
+                if isinstance(a, DeviceArray):
+                    assert a.flags.c_contiguous
+                    c_args.append(ctypes.c_void_p(a.ctypes.data))
+                elif isinstance(a, np.ndarray):
+                    raise TypeError("host array passed to a kernel")
+                elif isinstance(a, np.int64):
+                    c_args.append(ctypes.c_longlong(int(a)))
+                elif isinstance(a, np.int32):
+                    c_args.append(ctypes.c_int(int(a)))
+                elif isinstance(a, np.float64):
+                    c_args.append(ctypes.c_double(float(a)))
+                else:
+                    raise TypeError(f"kernel argument of type {type(a)}: pass a numpy scalar of the C type")
+            f(*c_args)
+
+        class Kernel:
+            def __call__(self, grid, block, args, shared_mem=0):
+                launch(grid, block, args, shared_mem)
+
+        return Kernel()
+
     @staticmethod
     def asarray(a, dtype=None):
         if isinstance(a, DeviceArray):
@@ -127,6 +164,8 @@ class _Module(types.ModuleType):
 
     def __getattr__(self, name):
         f = getattr(np, name)
+        if isinstance(f, type) and issubclass(f, np.generic):  # dtypes (cupy.int32 is numpy.int32)
+            return f
         if callable(f):
             return self._fn(f, name)
         return f
@@ -142,6 +181,12 @@ def install(monkeypatch, n_devices: int = 2):
     special = types.ModuleType("cupyx.scipy.special")
     special.ndtr = fake._fn(ndtr, "ndtr")
     cupyx = types.ModuleType("cupyx")
+
+    def scatter_add(a, slices, value):
+        _check_inputs("scatter_add", [a, slices, value])
+        np.add.at(a.view(np.ndarray), _unwrap(slices), _unwrap(value))
+
+    cupyx.scatter_add = scatter_add
     cupyx.scipy = types.ModuleType("cupyx.scipy")
     cupyx.scipy.special = special
     for name, mod in (("cupy", fake), ("cupyx", cupyx), ("cupyx.scipy", cupyx.scipy), ("cupyx.scipy.special", special)):

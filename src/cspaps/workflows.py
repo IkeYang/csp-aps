@@ -1199,21 +1199,27 @@ def replay_layout_value(folder, base, progress=None, cancel=None):
     return task_layout_value(case, base, layouts, folder / "scenario_set", summary["lambda_layout"], progress, cancel)
 
 
-def task_rescore(folder: str | Path, lam_layout: float) -> dict:
-    """Recompute every layout's V for another outer weight from exported scenario tables only (no solver)."""
+def task_rescore(folder: str | Path, lam_layout: float, land_weight: float = 0.0) -> dict:
+    """Recompute every layout's V (and J = V - kappa A) for another outer weight / land weight from exported
+    scenario tables and layouts only (no solver)."""
     from .layout_value import recompute_from_csv
 
     folder = Path(folder)
     if not 0 <= lam_layout < float("inf"):
         raise ValueError("The uniformity weight must be finite and nonnegative")
+    if not 0 <= land_weight < float("inf"):
+        raise ValueError("The land weight must be finite and nonnegative")
     rows = []
     for csv in sorted(folder.rglob("scenario_values.csv")):
-        r = recompute_from_csv(csv, lam_layout)
+        r = recompute_from_csv(csv, lam_layout, land_weight)
         rows.append({"layout": csv.parent.name, **r, "file": str(csv)})
-    df = pd.DataFrame(rows).sort_values("value_mwh", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    key = "objective_mwh" if len(df) and "objective_mwh" in df and df["objective_mwh"].notna().all() else "value_mwh"
     if len(df):
-        df["rank"] = df["value_mwh"].where(df["complete"]).rank(ascending=False, method="min")
-    return {"summary": {"lambda_layout": lam_layout, "layouts": df.to_dict("records")}, "files": {}, "run_dir": folder}
+        df = df.sort_values(key, ascending=False).reset_index(drop=True)
+        df["rank"] = df[key].where(df["complete"]).rank(ascending=False, method="min")
+    return {"summary": {"lambda_layout": lam_layout, "land_weight": land_weight, "ranked_by": key,
+                        "layouts": df.to_dict("records")}, "files": {}, "run_dir": folder}
 
 
 def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, radius_m=(60.0, 140.0),

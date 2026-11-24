@@ -208,3 +208,29 @@ def test_workers_take_the_current_settings(monkeypatch):
     with pool(2) as p:  # switched off in the parent: off in the workers, no device assigned
         rows = set(p.map(_worker_env, range(4)))
     assert all(gpu == "0" and dev is None for gpu, _, dev in rows)
+
+
+@pytest.mark.parametrize("blockers", [False, True])
+def test_shading_on_gpu_matches_cpu(small_case, gpu, blockers):
+    from cspaps import shading, sun
+
+    case = small_case
+    fld = build_field(case)
+    rec = case.receiver
+    for time in ("2025-12-21 09:00", "2025-06-21 12:00"):
+        _, el, az, _ = sun_state(case, time)
+        s = sun.sun_vector(el, az)
+        aim = np.broadcast_to(np.asarray(rec.center, float), fld.xyz.shape)
+        normals, t, _, _ = optics.heliostat_geometry(fld.xyz, aim, s)
+        mask = (np.arange(fld.n) % 3 != 0) if blockers else None
+        cpu = shading.shading_blocking(fld.xyz, normals, s, t, case.heliostat, rec, fld.pairs, n_points=6,
+                                       blockers=mask)
+        with pytest.MonkeyPatch.context() as mp_:
+            _, state = fake_cupy.install(mp_, 2)
+            mp_.setenv("CSPAPS_GPU_MIN", "1")
+            dev = shading.shading_blocking(fld.xyz, normals, s, t, case.heliostat, rec, fld.pairs, n_points=6,
+                                           blockers=mask)
+            assert state["devices_used"]  # the device path ran
+        assert cpu["combined"].min() < 1.0  # some mirrors are shaded or blocked
+        for key in ("shading", "blocking", "combined", "tower_fraction", "non_tower_occluded"):
+            np.testing.assert_array_equal(dev[key], cpu[key])

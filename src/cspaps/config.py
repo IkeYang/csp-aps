@@ -295,6 +295,15 @@ class LayoutOpt:
     # weather year behind the scenario set); "value_cv" ranks by that estimate instead of the formal V
     control_variate: bool = True
     rank_by: str = "value"  # "value" (formal V on the scenario set) | "value_cv" (control-variate estimate)
+    # ---- land use: the layout objective is J(L) = E_abs - lambda_L Pi - kappa A(L), A = convex hull of the mirror
+    # centres (ha), counted once per layout (outside the annual sum); search and ranking use J, the hourly aiming
+    # its own objective. kappa in MWh_th per hectare and year: the annual heat worth one hectare (0 = land free).
+    land_weight: float = 0.0
+    max_land_ha: float = 0.0  # hard limit A(L) <= max (ha); 0 = none. Layouts over it are not ranked
+    # for the recommended kappa (layout_value.recommend_land_weight): annualised land cost per hectare and the
+    # value of one MWh_th of useful heat, same currency (0 = unknown -> recommendation from the field itself)
+    land_cost_per_ha_year: float = 0.0
+    heat_value_per_mwh: float = 0.0
     # reuse inside one layout's scenarios: "responses" (spot responses per sun direction built once; plans identical
     # to independent solves) | "full" (+ plans reused across DNI levels the limits never shaped, warm starts along
     # the sun path; faster) | "off"
@@ -495,6 +504,9 @@ def _validate(case: Case) -> None:
             raise ValueError(f"layout_opt.{name} must be sun_bins|sun_grid|hourly")
     if not 0 <= case.layout_opt.uniformity_weight < math.inf:
         raise ValueError("layout_opt.uniformity_weight must be >= 0")
+    for name in ("land_weight", "max_land_ha", "land_cost_per_ha_year", "heat_value_per_mwh"):
+        if not 0 <= float(getattr(case.layout_opt, name)) < math.inf:
+            raise ValueError(f"layout_opt.{name} must be finite and >= 0")
     if case.layout_opt.uniformity_metric not in ("circumferential", "surface"):
         raise ValueError("layout_opt.uniformity_metric must be circumferential|surface")
     if case.layout_opt.position_trials < 0:

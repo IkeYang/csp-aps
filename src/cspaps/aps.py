@@ -591,11 +591,20 @@ def solve_greedy(
             flux[prob.cells[i]] += prob.F(i)[c]
         stats["moves"] += int(c != old)
 
+    from . import kernels
+
+    def reassign_all(seq) -> None:
+        """``reassign`` over ``seq``: compiled when available (bit-identical), else the loop."""
+        if kernels.enabled():
+            kernels.greedy_pass(prob, seq, choice, flux, score_all, p_ref, tol, stats)
+        else:
+            for i in seq:
+                reassign(i)
+
     if init is None:
         choice = np.full(n, -1)
         flux = np.zeros(limit.size)
-        for i in order:
-            reassign(i)
+        reassign_all(order)
         n_full = spec.passes if full_passes is None else full_passes
         repairs = 0
     else:
@@ -626,8 +635,7 @@ def solve_greedy(
         if late():
             break
         before = stats["moves"]
-        for i in order:
-            reassign(i)
+        reassign_all(order)
         passes_done += 1
         if stats["moves"] == before:
             break

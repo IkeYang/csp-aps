@@ -191,15 +191,16 @@ def evaluate_layout(
                             shading_points=shading_points, workers=1, check_flux=False)
         center_energy = center_res.summary()["absorbed_energy_mwh"]
         penalty = lam * _spread_mwh(center_res, case)
+    land = land_penalty_mwh(case, xyz)  # J = E - lambda_L Pi - kappa A: the land term once per layout
     if aiming == "center":
-        return LayoutEval(params, n_cand, xyz, center_energy - penalty, center_res, cand_xyz, cand_e,
+        return LayoutEval(params, n_cand, xyz, center_energy - penalty - land, center_res, cand_xyz, cand_e,
                           center_energy_mwh=center_energy, search_aiming="center", uniformity=uni,
                           selection=sel_info)
     res = annual(case, Field(xyz), samples=samples, aiming=aiming, with_flux=True,
                  shading_points=shading_points, workers=1)
     aps_energy = res.summary()["feasible_absorbed_energy_mwh"]
     penalty = lam * _spread_mwh(res, case, operational=True)
-    return LayoutEval(params, n_cand, xyz, aps_energy - penalty, res, cand_xyz, cand_e,
+    return LayoutEval(params, n_cand, xyz, aps_energy - penalty - land, res, cand_xyz, cand_e,
                       aps_energy_mwh=aps_energy, aps_result=res, center_energy_mwh=center_energy,
                       search_aiming=aiming, uniformity=uni, selection=sel_info)
 
@@ -296,6 +297,25 @@ def layout_tradeoff(case: Case, kind: str, params: dict, samples: sun.Samples, n
     return rows
 
 
+LAND_LIMIT_OFFSET = 1e12  # MWh: a layout over the land limit scores below every layout within it ...
+LAND_LIMIT_SLOPE = 1e9  # ... and the more so the further over (MWh per hectare): the search is led back
+
+
+def land_penalty_mwh(case: Case, xyz) -> float:
+    """kappa A(L) of the layout objective J = E - lambda_L Pi - kappa A (A = convex hull of the mirror centres, ha),
+    plus, above the hard limit ``max_land_ha``, a penalty that ranks the layout below every layout within it."""
+    from .layout_value import land_area_ha, land_terms
+
+    kappa, a_max = land_terms(case)
+    if not kappa and not a_max:
+        return 0.0
+    area = land_area_ha(xyz)
+    pen = kappa * area
+    if a_max > 0 and area > a_max * (1 + 1e-12):
+        pen += LAND_LIMIT_OFFSET + LAND_LIMIT_SLOPE * (area - a_max)
+    return pen
+
+
 class _Objective:
     """Picklable objective for scipy's differential evolution (supports workers > 1)."""
 
@@ -351,7 +371,7 @@ def _refine_positions(case, ev, samples, rng):
         uni = (lu.layout_metrics(case, xyz, samples, result.state_power_w, spec.uniformity_weight)
                if spec.uniformity_weight > 0 else None)
         spread = _spread_mwh(result, case) if full else (uni["circ_spread_mwh"] if uni else 0)
-        score = energy - spec.uniformity_weight * spread
+        score = energy - spec.uniformity_weight * spread - land_penalty_mwh(case, xyz)
         if score > ev.energy_mwh:
             ev.xyz, ev.result, ev.uniformity = xyz, result, uni
             ev.energy_mwh, ev.center_energy_mwh = score, energy
@@ -451,10 +471,17 @@ class LayoutOptResult:
         out = self._summary(b, aps_summary)
         if self.formal:
             out["formal"] = formal_summary(self.formal)
-            out["ranking_basis"] = "aps_value: V(L) = sum_s h_s (P_s - lambda_L U_s) from per-scenario APS plans"
+            out["ranking_basis"] = ("aps_value: J(L) = V(L) - kappa A(L), V = sum_s h_s (P_s - lambda_L U_s) from "
+                                    "per-scenario APS plans, A = convex hull of the mirror centres (ha)")
             win = out["formal"]["winner_totals"]
             out["annual_energy_mwh_with_aps"] = round(win["energy_mwh"], 1)
             out["annual_value_mwh"] = round(win["value_mwh"], 1) if np.isfinite(win["value_mwh"]) else None
+            # land use: J = V - kappa A (the ranking key), A = convex hull of the mirror centres
+            out["land_ha"] = round(win.get("land_ha", 0.0), 4)
+            out["land_weight"] = win.get("land_weight", 0.0)
+            out["max_land_ha"] = win.get("max_land_ha", 0.0)
+            out["annual_objective_mwh"] = (round(win["objective_mwh"], 1)
+                                           if np.isfinite(win.get("objective_mwh", np.nan)) else None)
             out["operational_status"] = ("no_feasible_annual_states" if not win["status_counts"].get("feasible")
                                          else "formal_aps_value")
         else:
@@ -573,8 +600,9 @@ def _bayes_search(case, kind, names, lo, hi, obj, samples, hourly, aiming, nw, r
         out = []
         for j, x in enumerate(xs):
             name = f"bo_{len(records) + 1}"
-            if name in vals and vals[name].totals()["complete"]:
-                v = float(vals[name].totals()["value_mwh"])
+            tot = vals[name].totals() if name in vals else None
+            if tot is not None and tot["complete"] and tot["land_ok"]:
+                v = float(tot["objective_mwh"])  # J = V - kappa A
                 valid_values.append(v)
             else:  # not N heliostats on the site (or cancelled): below every buildable layout
                 v = (min(valid_values) - 0.05 * abs(min(valid_values))) if valid_values else 0.0
@@ -1054,7 +1082,7 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
     swaps = []
     search_names = [k for k in values if k != "initial"]
     if search_names and spec.formal_swap_rounds > 0:
-        lead = max(search_names, key=lambda k: values[k].totals()["value_mwh"])
+        lead = max(search_names, key=lambda k: values[k].totals()["objective_mwh"])
         ev, cur = owners[lead], values[lead]
         m = max(1, int(round(spec.swap_fraction * n_req)))
         dual = spec.swap_pricing == "dual"
@@ -1090,11 +1118,14 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
             new = evaluate_layout_value(case, new_xyz, sset, name, settings=settings, progress=say, cancel=stop,
                                         tags={"kind": "search_swap", "search_rank": cur.tags.get("search_rank"),
                                               "swap_pricing": spec.swap_pricing})
-            gain = new.totals()["value_mwh"] - cur.totals()["value_mwh"]
+            t_new, t_cur = new.totals(), cur.totals()
+            gain = t_new["objective_mwh"] - t_cur["objective_mwh"]  # J: a swap that takes more land must pay for it
+            if not t_new["land_ok"]:
+                gain = -math.inf
             row = {"round": r + 1, "layout": name, "pricing": spec.swap_pricing, "swapped": int(len(add)),
-                   "gain_value_mwh": float(gain),
-                   "gain_energy_mwh": new.totals()["energy_mwh"] - cur.totals()["energy_mwh"],
-                   "accepted": bool(gain > 0)}
+                   "gain_value_mwh": float(t_new["value_mwh"] - t_cur["value_mwh"]), "gain_objective_mwh": float(gain),
+                   "gain_energy_mwh": t_new["energy_mwh"] - t_cur["energy_mwh"],
+                   "land_change_ha": t_new["land_ha"] - t_cur["land_ha"], "accepted": bool(gain > 0)}
             if predicted is not None:
                 row.update(predicted_gain_mwh=float(predicted), bound_gap_mwh=float(bound_gap))
             swaps.append(row)
@@ -1110,10 +1141,10 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
     for trial in range(spec.formal_position_trials):
         if stop():
             break
-        complete = [name for name, val in values.items() if val.totals()["complete"]]
+        complete = [name for name, val in values.items() if val.totals()["complete"] and val.totals()["land_ok"]]
         if not complete:
             break
-        lead = max(complete, key=lambda name: values[name].totals()["value_mwh"])
+        lead = max(complete, key=lambda name: values[name].totals()["objective_mwh"])
         cur = values[lead]
         xyz = _position_proposal(case, cur, sset.samples, trial)
         if xyz is None:
@@ -1129,13 +1160,18 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
         values[name] = candidate
         parent = owners[lead]
         params = dict(parent.params) if parent is not None else {}
-        owners[name] = LayoutEval(params, n_req, xyz, candidate.totals()["value_mwh"], search_aiming="formal_aps_value")
+        owners[name] = LayoutEval(params, n_req, xyz, candidate.totals()["objective_mwh"], search_aiming="formal_aps_value")
     refine_competing_plans(case, values, sset, say, stop)
     ranking = compare_values(list(values.values()), reference="initial" if "initial" in values else None,
                              rank_by=spec.rank_by)
     winner = str(ranking.loc[0, "name"]) if bool(ranking.loc[0, "rankable"]) else None
     out = {"scenario_set": sset, "settings": settings, "values": values, "owners": owners, "winner": winner,
            "ranking": ranking, "swaps": swaps, "baseline_note": base_note}
+    from .layout_value import recommend_land_weight
+
+    complete = [v for v in values.values() if v.totals()["complete"]]
+    if complete:  # the land weight to start from and the weights at which this ranking would change
+        out["land"] = recommend_land_weight(case, complete, reference="initial" if "initial" in values else None)
     if winner is not None and "initial" in values and winner != "initial":
         out["displacement"] = displacement(values["initial"].xyz, values[winner].xyz)
     if (spec.cross_check_maps and case.scenarios.map_model == "clouds" and case.scenarios.source == "weather"
@@ -1191,6 +1227,8 @@ def formal_summary(formal: dict) -> dict:
         rows.append({k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in r.items()
                      if k in ("rank", "name", "value_mwh", "energy_mwh", "penalty_mwh", "weighted_penalty_mwh",
                               "delta_value_mwh", "delta_energy_mwh", "delta_uniformity_mwh", "complete",
+                              "land_ha", "land_penalty_mwh", "land_ok", "objective_mwh", "delta_objective_mwh",
+                              "delta_land_ha", "delta_land_mwh", "kappa_switch",
                               "inner_gap_annual", "max_inner_gap", "value_interval_mwh", "status_counts", "status_hours", "circ_penalty_mwh",
                               "cv_2d_power_weighted", "kind", "note", "reference")})
     win = formal.get("winner")
@@ -1201,7 +1239,7 @@ def formal_summary(formal: dict) -> dict:
            "comparison_status": ranking.iloc[0]["comparison_status"] if len(ranking) else "no_valid_layout",
            "validation_set": formal.get("validation_set"),
            "baseline_note": formal.get("baseline_note"), "dense_check": formal.get("dense"),
-           "cross_maps": formal.get("cross_maps"),
+           "cross_maps": formal.get("cross_maps"), "land": formal.get("land"),
            "winner_totals": formal["values"][win].totals() if win else {"value_mwh": float("nan"), "energy_mwh": 0.0,
                                                                          "status_counts": {}}}
     d = formal.get("displacement")

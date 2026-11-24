@@ -17,7 +17,8 @@ a pickle boundary. Main-thread scripts use processes:
   a child forked after the parent initialised it. Scripts then need the ``__main__`` guard as well.
   Each worker gets its own device, round-robin over ``CSPAPS_GPU_DEVICES`` (``backend.worker_init``).
 * Workers take the parent's ``CSPAPS_*`` settings as they are when the pool is created (a fork server keeps
-  the environment it was started with).
+  the environment it was started with), and each caps its BLAS / OpenMP threads at its share of the cores
+  (``worker_threads``): W processes with machine-sized thread pools would oversubscribe the CPU.
 """
 
 from __future__ import annotations
@@ -29,9 +30,25 @@ import sys
 import threading
 
 
+def cpu_count() -> int:
+    """CPUs this process may use: its CPU affinity (taskset, cluster schedulers) and, in a container, the cgroup
+    CPU quota -- not the machine's core count, which can be far larger than what a job is given."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # Windows / macOS
+        n = os.cpu_count() or 1
+    try:  # cgroup v2 quota, e.g. "400000 100000" = 4 CPUs
+        quota, period = open("/sys/fs/cgroup/cpu.max", encoding="ascii").read().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, int(int(quota) // int(period))))
+    except (OSError, ValueError):
+        pass
+    return max(1, n)
+
+
 def n_workers(setting: int) -> int:
-    """-1 = all CPUs, otherwise at least 1."""
-    return (os.cpu_count() or 1) if setting == -1 else max(1, int(setting))
+    """-1 = all usable CPUs (``cpu_count``), otherwise at least 1."""
+    return cpu_count() if setting == -1 else max(1, int(setting))
 
 
 def start_method() -> str:
@@ -74,18 +91,45 @@ def pool(workers: int, probe=None):
     ctx = mp.get_context(start_method())
     # the parent's CSPAPS_* settings as they are now: a fork server keeps the environment it was started with
     env = {k: v for k, v in os.environ.items() if k.startswith("CSPAPS_") and k not in _PER_WORKER}
-    return ctx.Pool(workers, initializer=_worker_init, initargs=(env, ctx.Value("i", 0), workers))
+    return ctx.Pool(workers, initializer=_worker_init,
+                    initargs=(env, ctx.Value("i", 0), workers, worker_threads(workers)))
 
 
 _PER_WORKER = ("CSPAPS_GPU_DEVICE", "CSPAPS_GPU_SHARE")  # assigned to each worker by backend.worker_init
+_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS")
 
 
-def _worker_init(env: dict, counter, n_workers: int) -> None:
-    """Pool-worker initializer: the parent's CSPAPS_* settings (stale ones removed), then with the GPU backend on
-    the next device round-robin and this worker's share of it."""
+def worker_threads(workers: int) -> int:
+    """BLAS / OpenMP threads per pool worker: ``CSPAPS_WORKER_THREADS``, else its share of the cores.
+
+    Every process otherwise starts a BLAS pool as large as the machine, so W workers run W x cores threads; on
+    4 cores 4 workers became 2.6x faster with one thread each (same single-process speed)."""
+    raw = os.environ.get("CSPAPS_WORKER_THREADS", "").strip()
+    if raw:
+        return max(1, int(raw))
+    return max(1, cpu_count() // max(1, int(workers)))
+
+
+def limit_threads(n: int) -> None:
+    """Cap the BLAS / OpenMP pools of this process at ``n`` threads (loaded libraries and later ones)."""
+    for var in _THREAD_VARS:
+        os.environ[var] = str(n)
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(n)
+    except Exception:  # noqa: BLE001 - threadpoolctl missing: the variables cover libraries loaded later
+        pass
+
+
+def _worker_init(env: dict, counter, n_workers: int, threads: int = 1) -> None:
+    """Pool-worker initializer: the parent's CSPAPS_* settings (stale ones removed), this worker's share of the
+    cores for BLAS / OpenMP, and with the GPU backend on the next device round-robin and its share of it."""
     for key in [k for k in os.environ if k.startswith("CSPAPS_") and k not in env]:
         del os.environ[key]
     os.environ.update(env)
+    limit_threads(threads)
     from .backend import enabled, worker_init
 
     if enabled():

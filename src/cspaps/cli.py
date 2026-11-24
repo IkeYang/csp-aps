@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help_)
         sp.add_argument("case", help="case YAML file")
         sp.add_argument("--out", default="results", help="output folder (default: results)")
+        sp.add_argument("--gpus", default=None,
+                        help="GPUs to use: a number (0 = CPU only, 'all' = every visible GPU) or ids like 0,2,5 "
+                             "(turns the GPU backend on; needs CuPy)")
+        sp.add_argument("--workers", type=int, default=None,
+                        help="parallel worker processes (-1 = all usable CPUs; default: the case / the depth)")
         return sp
 
     add("layout", "generate the field layout (CSV + plot)")
@@ -95,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="depth of the search and the formal ranking (see `cspaps advise --task search`)")
     sp.add_argument("--uniformity-weight", type=float, default=None,
                     help="lambda_L: weight of the circumferential receiver non-uniformity (0 = energy only)")
+    sp.add_argument("--land-weight", type=float, default=None,
+                    help="kappa: MWh_th per hectare and year of J = E - lambda_L Pi - kappa A (A = convex hull of the "
+                         "mirror centres); 0 = land free")
+    sp.add_argument("--max-land-ha", type=float, default=None, help="hard land limit A <= this (ha); 0 = none")
     sp = add("layout-tradeoff", "annual energy vs circumferential uniformity of the layout over lambda_L")
     sp.add_argument("--lambdas", type=float, nargs="*", default=None)
     sp = add("scenarios", "build and save the annual scenario set (sun, hours, spatial DNI map per scenario)")
@@ -109,6 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--layouts", nargs="*", default=None, help="layout CSV files (and/or 'initial')")
     sp.add_argument("--scenarios", default=None, help="saved scenario-set folder (default: build from the case)")
     sp.add_argument("--lambda-layout", type=float, default=None, help="outer weight lambda_L (default layout_opt)")
+    sp.add_argument("--land-weight", type=float, default=None, help="kappa of J = V - kappa A (MWh_th per ha and year)")
+    sp.add_argument("--max-land-ha", type=float, default=None, help="hard land limit A <= this (ha); 0 = none")
     sp = add("validation-suite", "ray-trace checks: low sun, cloud edge, high-load mixed aiming, near the flux limit")
     sp.add_argument("--states", nargs="*", default=None,
                     choices=["low_sun", "cloud_edge", "mixed_high_load", "near_limit"])
@@ -128,13 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("advise", "which algorithm depth fits the field size and the time budget (fast / standard / deep)")
     sp.add_argument("--task", choices=["aim", "compare", "search"], default="aim")
     sp.add_argument("--budget-min", type=float, default=15.0, help="time budget per run, minutes")
-    sp.add_argument("--workers", type=int, default=None, help="parallel workers (default: all cores but one)")
     sp.add_argument("--heliostats", type=int, default=None, help="what-if: number of heliostats instead of the case's")
     sp = add("calibrate", "measure the time model of the algorithm depths on this computer")
     sp.add_argument("--sizes", type=int, nargs="+", default=[400, 1200], help="field sizes to time (heliostats)")
-    sp = sub.add_parser("rescore", help="recompute V(L) from exported scenario_values.csv files for another lambda_L")
+    sp = sub.add_parser("rescore", help="recompute V(L) (and J = V - kappa A) from exported scenario_values.csv files "
+                                        "for another lambda_L / land weight")
     sp.add_argument("folder")
     sp.add_argument("--lambda-layout", type=float, required=True)
+    sp.add_argument("--land-weight", type=float, default=0.0, help="kappa (MWh_th per ha and year)")
     sp = add("cloud-compare", "one instant before / after a cloud: keep the plan vs re-solve APS")
     sp.add_argument("--time", required=True)
     sp.add_argument("--clouds", type=int, default=2, help="number of cloud shadows")
@@ -202,9 +214,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "replay-layout":
         return _print(wf.replay_layout_value(args.folder, args.out, progress=_progress))
     if args.command == "rescore":
-        res = wf.task_rescore(args.folder, args.lambda_layout)
+        res = wf.task_rescore(args.folder, args.lambda_layout, args.land_weight)
         print(json.dumps(res["summary"], indent=2, ensure_ascii=False, default=str))
         return 0
+    if getattr(args, "gpus", None) is not None:
+        from .backend import set_resources
+
+        g = args.gpus
+        set_resources([int(v) for v in str(g).split(",") if v.strip()] if "," in str(g) else g)
     case = load_case(args.case)
     if args.command == "engine":
         wf.engine_service(case, sys.stdin, lambda s: (sys.stdout.write(s + "\n"), sys.stdout.flush()))
@@ -216,8 +233,14 @@ def main(argv: list[str] | None = None) -> int:
         from .advisor import _field_size
 
         task = {"aps": "aim", "layout-value": "compare", "optimize-layout": "search"}[args.command]
-        case = apply_mode(case, task, args.mode, n=_field_size(case, task))
+        case = apply_mode(case, task, args.mode, workers=getattr(args, "workers", None), n=_field_size(case, task))
         _progress(f"depth: {args.mode} ({task})")
+    if getattr(args, "workers", None) is not None:  # scenario-level processes (-1 = all usable CPUs)
+        case.annual.workers = case.layout_opt.workers = int(args.workers)
+    if getattr(args, "land_weight", None) is not None:  # J = E - lambda_L Pi - kappa A
+        case.layout_opt.land_weight = float(args.land_weight)
+    if getattr(args, "max_land_ha", None) is not None:
+        case.layout_opt.max_land_ha = float(args.max_land_ha)
     if args.command == "advise":
         from .advisor import recommend
 

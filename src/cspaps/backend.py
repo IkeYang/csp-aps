@@ -36,7 +36,20 @@ import numpy as np
 
 
 def enabled() -> bool:
+    """GPU backend switched on (``CSPAPS_GPU=1``) and not limited to zero GPUs (``CSPAPS_GPUS=0``)."""
+    if os.environ.get("CSPAPS_GPUS", "").strip() == "0":
+        return False
     return os.environ.get("CSPAPS_GPU", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def detected_gpus() -> int:
+    """Visible CUDA devices (0 without CuPy / driver / device), whether or not the backend is on."""
+    try:
+        import cupy
+
+        return int(cupy.cuda.runtime.getDeviceCount())
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _cupy():
@@ -52,11 +65,34 @@ def _cupy():
 
 
 def devices() -> list[int]:
+    """The GPUs to use: ``CSPAPS_GPU_DEVICES`` (a list, e.g. ``0,2,5``), else the first ``CSPAPS_GPUS``
+    visible ones, else all visible devices."""
     raw = os.environ.get("CSPAPS_GPU_DEVICES", "").strip()
     if raw:
         return [int(v) for v in raw.replace(";", ",").split(",") if v.strip()]
     cp = _cupy()
-    return list(range(cp.cuda.runtime.getDeviceCount())) if cp is not None else []
+    if cp is None:
+        return []
+    visible = list(range(cp.cuda.runtime.getDeviceCount()))
+    count = os.environ.get("CSPAPS_GPUS", "").strip()
+    if count and count.lower() not in ("all", "-1"):
+        return visible[:max(0, int(count))]
+    return visible
+
+
+def set_resources(gpus=None) -> None:
+    """Choose the GPUs for this process and the pools it starts (CLI ``--gpus``, GUI): a number of GPUs
+    (0 = CPU only, "all" / -1 = every visible GPU) or a list of device ids."""
+    if gpus is not None:
+        if isinstance(gpus, (list, tuple)):
+            os.environ["CSPAPS_GPU_DEVICES"] = ",".join(str(int(g)) for g in gpus)
+            os.environ.pop("CSPAPS_GPUS", None)
+            os.environ["CSPAPS_GPU"] = "1" if gpus else "0"
+        else:
+            text = str(gpus).strip().lower()
+            os.environ.pop("CSPAPS_GPU_DEVICES", None)
+            os.environ["CSPAPS_GPUS"] = "all" if text in ("all", "-1") else str(max(0, int(text)))
+            os.environ["CSPAPS_GPU"] = "0" if os.environ["CSPAPS_GPUS"] == "0" else "1"
 
 
 def device_for_this_process() -> int | None:

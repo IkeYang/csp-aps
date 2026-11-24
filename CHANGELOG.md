@@ -2,6 +2,13 @@
 
 ## 未发布
 
+- **占地约束**：布局目标 J(L) = E_abs − λ_L·Π − κ·A(L)，A = 全部镜心的凸包面积（公顷，每套布局算一次），κ 单位 MWhₜₕ／（公顷·年）（`layout_opt.land_weight`，默认 0）。差分进化与贝叶斯搜索的目标、镜位微调、正式换位的接受条件和最终排名都用 J；逐时瞄准不变。硬约束 `layout_opt.max_land_ha`（超出的布局不排名）。推荐 κ（`layout_value.recommend_land_weight`）：有土地年成本与热量价值时取二者之比，否则取参考布局每公顷年吸热量的 5%；排名结果列出每对布局的 κ 切换点。界面：κ 滑块重新计分、占地与土地扣分列、推荐值一键写入；命令行 `--land-weight`、`--max-land-ha`，`rescore --land-weight`。
+- **计算资源由用户指定**：`--gpus N | 0,2,5 | 0 | all`（每个算例命令）、`CSPAPS_GPUS`、界面“计算资源”面板；可用 CPU 数按进程亲和性与容器配额从系统读取（`parallel.cpu_count`）；`--workers` 设并行进程数。
+- **多进程不再超额订阅 CPU**：每个工作进程的 BLAS / OpenMP 线程限制为它分到的核数（`threadpoolctl`，新依赖）。4 核上 4 个进程每分钟 9.5 → 24.5 个工况。
+- **GPU 均匀度局部搜索**（`gpu_search.py`）：一个工况一个线程块，保持逐镜串行的移动顺序，各 warp 分管候选行、各线程分管网格；与 CPU 内核移动相同、每个网格通量逐位相同（行求和顺序不同）。核函数源码可按 C++ 编译，测试在 CPU 上执行同一份代码；CUDA 编译或运行失败时自动改用 CPU 内核。`CSPAPS_GPU_SEARCH=0` 关闭。
+- **GPU 阴影遮挡**：光线与镜面、塔身求交在显卡上，镜对筛选仍在 CPU；结果与 CPU 相同（测试逐项比较）。
+- **贪心 APS 编译运行**（Numba），与 numpy 逐位相同。
+- `scripts/gpu_benchmark.py --plant large`：两万面镜级的大镜场几何（20 m² 定日镜、Ø14 m × 16 m 吸热器、塔高 200 m、无场地边界）；`--gpus` 选卡。
 - **多 GPU 加速**（`CSPAPS_GPU=1`，详见 README“多 GPU 部署与加速”）
   - 光斑核之后的归约都在显卡上完成，只传回小结果：细网格复核的叠加通量（`flux_sum_gpu`）、热流图与逐镜截获（`flux_and_power_gpu`，`evaluate`）、光斑响应的稀疏化（`sparse_responses_gpu`，只传回支撑网格的 float32 值）、联合姿态上界的逐束求和（`row_stats_gpu`）、截获率积分（`intercept_fraction_gpu`）。CPU 路径代码不变，结果逐位不变。
   - 多卡：进程池的每个工作进程按轮转分到一张卡（`backend.worker_init`，替代原来的“进程号取模”），同一张卡上的进程分摊显存（`CSPAPS_GPU_SHARE`，内存池上限与分块大小随之调整，`CSPAPS_GPU_BLOCK`）。

@@ -149,8 +149,10 @@ def apply_mode(case: Case, task: str, mode: str, workers: int | None = None, n: 
 
 
 def recommended_workers() -> int:
-    """Parallel workers for scenario-level work: all cores but one."""
-    return max(1, (os.cpu_count() or 2) - 1)
+    """Parallel workers for scenario-level work: all usable CPUs but one (``parallel.cpu_count``)."""
+    from .parallel import cpu_count
+
+    return max(1, cpu_count() - 1)
 
 
 # --------------------------------------------------------------------------- time model
@@ -226,7 +228,9 @@ def estimate_seconds(case: Case, task: str, mode: str, cal: Calibration | None =
     n = int(n if n is not None else _field_size(case, task))
     workers = int(workers or recommended_workers())
     c = apply_mode(case, task, mode, workers, n)
-    eff = max(1.0, 0.8 * min(workers, os.cpu_count() or workers))  # scenario-level parallel efficiency
+    from .parallel import cpu_count
+
+    eff = max(1.0, 0.8 * min(workers, cpu_count()))  # scenario-level parallel efficiency
     parts = {}
     if task == "aim":
         parts["solve"] = cal.t_aim(mode, n)

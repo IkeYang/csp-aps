@@ -2,6 +2,26 @@
 
 本文说明 csp-aps 每个计算环节用的模型、公式和近似，以及代码位置。坐标系：x = 东，y = 北，z = 上（m），原点在塔底；方位角按罗盘计（北 = 0°，东 = 90°，顺时针）。
 
+## 占地约束（未发布）
+
+布局目标在年度得分之外扣占地（`layout_value.land_area_ha`、`LayoutValue.totals`、`compare_values`、`layout_opt.land_penalty_mwh`）：
+
+```
+J(L) = V(L) − κ·A(L) = Σ_s h_s (P_s − λ_L U_s) − κ·A(L)
+A(L) = 镜心地面坐标 (x, y) 的凸包面积 / 10⁴（公顷）；少于 3 个点或全部共线时为 0
+κ    = layout_opt.land_weight，MWhₜₕ／（公顷·年）；κ = 0 时 J = V，排名与以前相同
+硬约束：layout_opt.max_land_ha > 0 时，A(L) > A_max 的布局不排名；搜索中得分再减
+        10¹² + 10⁹·(A − A_max)，排在所有满足上限的布局之后，并按超出量引导回上限内
+```
+
+A 对一套固定镜位只算一次，在年度求和之外；逐工况的 APS（P_s、U_s）不受 κ 影响，所以改 κ 只需重新计分（`rescore`、界面滑块），不必重解。值区间 [V, Σ h UB_s] 整体平移 κA，区间判断（`comparison_status`）按 J 进行。
+
+两套布局 i、j 的得分在 κ* = (V_i − V_j) / (A_i − A_j) 处相等（`kappa_switch`）：A_i < A_j 且 V_i < V_j 时，κ > κ* 时 i 排在 j 前。
+
+推荐值（`recommend_land_weight`）：有每公顷年化土地成本 c 与每 MWhₜₕ 热量价值 p 时 κ = c / p；否则 κ = ε·E/A（参考布局每公顷年吸热量的 ε 倍，ε = 0.05：面积增加 10% 至少要换来 0.5% 的年吸热量）。
+
+用 J 的地方：差分进化目标（`evaluate_layout` 的得分）、镜位微调（`_refine_positions`）、贝叶斯搜索的批量评价、正式换位的接受条件（ΔJ > 0）、自由镜位试探的领先者、最终排名。镜位挑选（N 选 n 的定价交换）本身不看面积，面积通过上述各步的接受与排名起作用。旧的 legacy 复核排名不含占地项。
+
 ## 0.9 晴空年度设计基线与年度计算加速
 
 ### 0.9.0 设计基线：晴空年度（`scenarios.source: clear_sky_days`，默认）

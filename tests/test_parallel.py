@@ -108,3 +108,24 @@ def test_gui_job_workers_do_not_rerun_the_gui(monkeypatch, tmp_path):
     task.join(timeout=300)
     assert not task.is_alive()
     assert results == [False, False]
+
+
+def _blas_threads(_):
+    from threadpoolctl import threadpool_info
+
+    return sorted({p["num_threads"] for p in threadpool_info() if p.get("user_api") == "blas"})
+
+
+def test_pool_workers_cap_blas_threads(monkeypatch):
+    """W workers x machine-sized BLAS pools oversubscribe the CPU: each worker gets its share of the cores."""
+    import pytest
+
+    pytest.importorskip("threadpoolctl")
+    from cspaps.parallel import pool, worker_threads
+
+    monkeypatch.delenv("CSPAPS_WORKER_THREADS", raising=False)
+    assert worker_threads(2) == max(1, (__import__("os").cpu_count() or 1) // 2)
+    monkeypatch.setenv("CSPAPS_WORKER_THREADS", "1")
+    with pool(2) as p:
+        rows = p.map(_blas_threads, range(4))
+    assert all(r in ([], [1]) for r in rows)  # [] when the BLAS library is not loaded in the worker

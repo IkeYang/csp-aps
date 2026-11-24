@@ -98,3 +98,44 @@ def test_compiled_kernel_does_not_change_formal_scores(monkeypatch, small_case):
     a, b = out
     assert a.status == b.status and a.p_abs_w == b.p_abs_w and a.u_w == b.u_w
     assert np.array_equal(a.choice, b.choice)
+
+
+def _greedy_both(monkeypatch, prob, **kw):
+    from cspaps.aps import solve_greedy
+
+    out = []
+    for jit in ("0", "1"):
+        monkeypatch.setenv("CSPAPS_JIT", jit)
+        owner = getattr(prob, "_prob", prob)
+        owner.flux_limited = 0
+        choice, info = solve_greedy(prob, prob.case.aps, **kw)
+        out.append((np.asarray(choice).copy(), info, owner.flux_limited))
+    (a, ia, fa), (b, ib, fb) = out
+    assert np.array_equal(a, b) and ia == ib and fa == fb
+    return a, fa
+
+
+def test_greedy_kernel_is_bit_identical(monkeypatch, small_case):
+    prob, start, _ = _problem(small_case)
+    choice, _ = _greedy_both(monkeypatch, prob)
+    assert (choice >= 0).any()
+    _greedy_both(monkeypatch, prob, init=start, full_passes=3)  # warm start: repair in Python, passes compiled
+
+
+def test_greedy_kernel_with_binding_limits_reach_moves_and_subfields(monkeypatch, small_case):
+    from cspaps.aps import _SubProblem, subfield_of
+
+    small_case.aps.move_penalty_per_m = 0.02
+    prob, start, _ = _problem(small_case, "2025-12-21 10:00")
+    peak = prob.flux(start).max()
+    prob.rs.limit_nom = np.full_like(prob.rs.limit_nom, 0.7 * peak / (1.0 - prob.margin))  # limits bind
+    rng = np.random.default_rng(1)
+    prob.reach = rng.random((prob.n, prob.k)) < 0.8
+    prev = prob.aim_xyz[np.arange(prob.n), rng.integers(0, prob.k, prob.n)]
+    _, limited = _greedy_both(monkeypatch, prob, prev_aim_xyz=prev, prev_active=rng.random(prob.n) < 0.9)
+    assert limited > 0
+    sector = subfield_of(prob, 3)
+    sub = _SubProblem(prob, prob.available & (sector == 1), prob.limit * 0.5)
+    _greedy_both(monkeypatch, sub)
+    small_case.aps.allow_defocus = False  # nothing feasible -> lowest peak ratio instead of defocus
+    _greedy_both(monkeypatch, prob)

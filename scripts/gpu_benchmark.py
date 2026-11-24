@@ -3,7 +3,9 @@
 Run on the target machine (e.g. 8 x RTX 2080 Ti / 3080):
 
     python scripts/gpu_benchmark.py cases/aksai_demo.yaml --heliostats 473 1500 --scenarios 6
-    python scripts/gpu_benchmark.py cases/aksai_demo.yaml --heliostats 3000 --throughput 64 --workers -1
+    python scripts/gpu_benchmark.py cases/aksai_demo.yaml --heliostats 1500 --throughput 64 --workers -1
+    python scripts/gpu_benchmark.py cases/aksai_demo.yaml --plant large --heliostats 5000 20000 --scenarios 2 \
+        --throughput 48 --workers -1 --gpus 8
 
 Part 1 (one process, the same scenarios in every configuration, each in a fresh process so the environment
 variables apply from the start):
@@ -31,16 +33,27 @@ CONFIGS = {
 }
 
 
-def _case(path: str, n: int):
+def _case(path: str, n: int, plant: str = "case"):
+    """The case, grown to about ``n`` heliostats. ``plant="large"``: a large-plant geometry (20 m2 heliostats,
+    14 m x 16 m receiver at 200 m, no site boundary) whose field reaches 20,000+ mirrors; the case's own receiver
+    and site would clip or overload such a field."""
     from cspaps import load_case
+    from cspaps.field import build_field
 
     case = load_case(path)
     gen = case.field.generator or {}
+    if plant == "large":
+        case.heliostat.width = case.heliostat.height = 4.5
+        case.heliostat.pivot_height = 3.0
+        rec = case.receiver
+        rec.center, rec.diameter, rec.height, rec.tower_diameter = [0.0, 0.0, 200.0], 14.0, 16.0, 15.0
+        case.field.boundary = None
+        gen["r_min"] = 110.0
     if n and case.field.layout_file is None and gen.get("r_max"):
-        from cspaps.field import build_field
-
-        base = build_field(case).n
-        gen["r_max"] = float(gen["r_max"]) * (n / max(base, 1)) ** 0.5  # area grows with the mirror count
+        lo, hi = float(gen.get("r_min", 50.0)) + 10.0, 6000.0
+        for _ in range(24):  # r_max for about n mirrors (bisection; the site boundary may cap it)
+            gen["r_max"] = 0.5 * (lo + hi)
+            lo, hi = (gen["r_max"], hi) if build_field(case).n < n else (lo, gen["r_max"])
     return case
 
 
@@ -53,7 +66,7 @@ def child(args) -> None:
     from cspaps.layout_value import evaluate_layout_value, inner_settings, solve_scenario
     from cspaps.scenarios import build_scenarios
 
-    case = _case(args.case, args.n)
+    case = _case(args.case, args.n, args.plant)
     fld = build_field(case)
     sset = build_scenarios(case)
     settings = inner_settings(case)
@@ -81,7 +94,10 @@ def child(args) -> None:
 
 def run(config: str, args, extra: list[str]) -> dict | None:
     env = {**os.environ, **CONFIGS[config]}
-    cmd = [sys.executable, __file__, args.case, "--child", config, *extra]
+    if config == "gpu" and args.gpus:
+        key = "CSPAPS_GPU_DEVICES" if "," in args.gpus else "CSPAPS_GPUS"
+        env[key] = args.gpus
+    cmd = [sys.executable, __file__, args.case, "--child", config, "--plant", args.plant, *extra]
     p = subprocess.run(cmd, env=env, capture_output=True, text=True)
     for line in p.stdout.splitlines():
         if line.startswith("RESULT "):
@@ -99,6 +115,9 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=-1)
     ap.add_argument("--child", default=None)
     ap.add_argument("--n", type=int, default=0)
+    ap.add_argument("--plant", choices=["case", "large"], default="case",
+                    help="'large': 20 m2 heliostats, 14 x 16 m receiver at 200 m, no site boundary (20k-mirror tests)")
+    ap.add_argument("--gpus", default=None, help="GPUs of the gpu configuration: a number or ids like 0,1,2,3")
     args = ap.parse_args()
     if args.child:
         args.config = args.child

@@ -20,13 +20,13 @@ from scipy.spatial import cKDTree
 from .config import Heliostat, Receiver
 
 
-def mirror_frames(normals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """In-plane unit axes (width: horizontal, height) of each mirror."""
-    z = np.array([0.0, 0.0, 1.0])
-    e_w = np.cross(z, normals)
-    norm = np.linalg.norm(e_w, axis=-1, keepdims=True)
-    e_w = np.where(norm > 1e-9, e_w / np.maximum(norm, 1e-12), np.array([1.0, 0.0, 0.0]))
-    e_h = np.cross(normals, e_w)
+def mirror_frames(normals: np.ndarray, xp=np) -> tuple[np.ndarray, np.ndarray]:
+    """In-plane unit axes (width: horizontal, height) of each mirror (``xp``: numpy or cupy)."""
+    z = xp.asarray([0.0, 0.0, 1.0])
+    e_w = xp.cross(z, normals)
+    norm = xp.linalg.norm(e_w, axis=-1, keepdims=True)
+    e_w = xp.where(norm > 1e-9, e_w / xp.maximum(norm, 1e-12), xp.asarray([1.0, 0.0, 0.0]))
+    e_h = xp.cross(normals, e_w)
     return e_w, e_h
 
 
@@ -46,18 +46,18 @@ def mirror_points(centers, e_w, e_h, helio: Heliostat, offsets) -> np.ndarray:
     )
 
 
-def ray_hits_rect(o, d, c, n, e_w, e_h, half_w, half_h) -> np.ndarray:
+def ray_hits_rect(o, d, c, n, e_w, e_h, half_w, half_h, xp=np) -> np.ndarray:
     """Does the ray o + s d (s > 0) hit the rectangle (centre c, normal n, axes e_w, e_h)?
 
-    All vector arguments broadcast against each other with a trailing axis of 3.
+    All vector arguments broadcast against each other with a trailing axis of 3 (``xp``: numpy or cupy).
     """
-    denom = np.sum(d * n, axis=-1)
-    safe = np.where(np.abs(denom) > 1e-12, denom, 1.0)
-    s = np.sum((c - o) * n, axis=-1) / safe
+    denom = xp.sum(d * n, axis=-1)
+    safe = xp.where(xp.abs(denom) > 1e-12, denom, 1.0)
+    s = xp.sum((c - o) * n, axis=-1) / safe
     p = o + s[..., None] * d - c
-    a = np.sum(p * e_w, axis=-1)
-    b = np.sum(p * e_h, axis=-1)
-    return (np.abs(denom) > 1e-12) & (s > 1e-6) & (np.abs(a) <= half_w) & (np.abs(b) <= half_h)
+    a = xp.sum(p * e_w, axis=-1)
+    b = xp.sum(p * e_h, axis=-1)
+    return (xp.abs(denom) > 1e-12) & (s > 1e-6) & (xp.abs(a) <= half_w) & (xp.abs(b) <= half_h)
 
 
 def shadow_cylinders(rec) -> list[tuple[float, float, float]]:
@@ -76,16 +76,16 @@ def shadow_cylinders(rec) -> list[tuple[float, float, float]]:
     return out
 
 
-def ray_hits_structure(o, d, rec) -> np.ndarray:
+def ray_hits_structure(o, d, rec, xp=np) -> np.ndarray:
     """Does the ray o + s d (s > 0) hit the tower or the receiver on it (``shadow_cylinders``)?"""
-    o = np.asarray(o, dtype=float)
-    hit = np.zeros(np.broadcast_shapes(o.shape, np.shape(d))[:-1], dtype=bool)
+    o = xp.asarray(o, dtype=float)
+    hit = xp.zeros(np.broadcast_shapes(o.shape, np.shape(d))[:-1], dtype=bool)
     for radius, z0, z1 in shadow_cylinders(rec):
-        hit |= ray_hits_tower(o, d, rec.center[:2], radius, z1, z0)
+        hit |= ray_hits_tower(o, d, rec.center[:2], radius, z1, z0, xp=xp)
     return hit
 
 
-def ray_hits_tower(o, d, center_xy, radius: float, z_top: float, z_bottom: float = 0.0) -> np.ndarray:
+def ray_hits_tower(o, d, center_xy, radius: float, z_top: float, z_bottom: float = 0.0, xp=np) -> np.ndarray:
     """Does the ray o + s d (s > 0) hit a vertical cylinder from z_bottom to z_top?"""
     ox = o[..., 0] - center_xy[0]
     oy = o[..., 1] - center_xy[1]
@@ -95,19 +95,19 @@ def ray_hits_tower(o, d, center_xy, radius: float, z_top: float, z_bottom: float
     c = ox * ox + oy * oy - radius * radius
     disc = b * b - 4 * a * c
     ok = (disc >= 0) & (a > 1e-12)
-    sq = np.sqrt(np.where(ok, disc, 0.0))
-    a_safe = np.where(a > 1e-12, a, 1.0)
+    sq = xp.sqrt(xp.where(ok, disc, 0.0))
+    a_safe = xp.where(a > 1e-12, a, 1.0)
     s1 = (-b - sq) / (2 * a_safe)
     s2 = (-b + sq) / (2 * a_safe)
-    hit = np.zeros(ok.shape, dtype=bool)
+    hit = xp.zeros(ok.shape, dtype=bool)
     for s in (s1, s2):
         z = o[..., 2] + s * d[..., 2]
         hit |= ok & (s > 1e-6) & (z >= z_bottom) & (z <= z_top)
     # End caps also cover vertical rays and origins directly below or inside the cylinder.
     dz = d[..., 2]
     for plane in (z_bottom, z_top):
-        s = (plane - o[..., 2]) / np.where(np.abs(dz) > 1e-12, dz, 1.)
-        hit |= (np.abs(dz) > 1e-12) & (s > 1e-6) & ((ox + s*dx)**2 + (oy + s*dy)**2 <= radius**2)
+        s = (plane - o[..., 2]) / xp.where(xp.abs(dz) > 1e-12, dz, 1.)
+        hit |= (xp.abs(dz) > 1e-12) & (s > 1e-6) & ((ox + s*dx)**2 + (oy + s*dy)**2 <= radius**2)
     return hit
 
 
@@ -145,10 +145,58 @@ class PairCache:
         return self.i[keep], self.j[keep]
 
 
-def _corridor(rel: np.ndarray, d: np.ndarray, diag: float, max_along: np.ndarray) -> np.ndarray:
-    along = np.sum(rel * d, axis=-1)
-    lateral = np.linalg.norm(rel - along[:, None] * d, axis=-1)
+def _corridor(rel: np.ndarray, d: np.ndarray, diag: float, max_along: np.ndarray, xp=np) -> np.ndarray:
+    along = xp.sum(rel * d, axis=-1)
+    lateral = xp.linalg.norm(rel - along[:, None] * d, axis=-1)
     return (along > -diag) & (along < max_along) & (lateral < diag)
+
+
+def _shading_blocking_gpu(cp, scatter_add, xyz, normals, sun_vec, t, helio, rec, i_all, j_all, r_shade, dz,
+                          n_points, tower_shadow) -> dict[str, np.ndarray]:
+    """``shading_blocking`` after the (CPU) neighbour-pair selection, on the device: same geometry and rules;
+    the hit masks are OR-ed per mirror with a scatter-add of the per-pair hits."""
+    from .backend import block_elements
+
+    n = xyz.shape[0]
+    X, Nrm, T, S = cp.asarray(xyz), cp.asarray(normals), cp.asarray(t), cp.asarray(sun_vec)
+    e_w, e_h = mirror_frames(Nrm, xp=cp)
+    offsets = grid_offsets(n_points)
+    off = cp.asarray(offsets)
+    pts = mirror_points(X, e_w, e_h, helio, off)
+    diag = helio.diagonal
+    hw, hh = 0.5 * helio.width, 0.5 * helio.height
+    p = offsets.shape[0]
+    chunk = max(1, block_elements(cp) // (12 * p))
+
+    def hit_mask(I, J, d):
+        counts = cp.zeros((n, p), dtype=cp.int32)
+        for start in range(0, int(I.size), chunk):
+            ii, jj = I[start:start + chunk], J[start:start + chunk]
+            dd = d[ii][:, None, :] if d.ndim == 2 else d[None, None, :]
+            hits = ray_hits_rect(pts[ii], dd, X[jj][:, None, :], Nrm[jj][:, None, :], e_w[jj][:, None, :],
+                                 e_h[jj][:, None, :], hw, hh, xp=cp)
+            scatter_add(counts, ii, hits.astype(cp.int32))
+        return counts > 0
+
+    I, J = cp.asarray(i_all), cp.asarray(j_all)
+    rel = X[J] - X[I]
+    keep_s = _corridor(rel, cp.broadcast_to(S, rel.shape), diag, cp.full(rel.shape[0], r_shade + diag), xp=cp)
+    shaded = hit_mask(I[keep_s], J[keep_s], S)
+    tower_hits = cp.zeros(shaded.shape, dtype=bool)
+    tower_fraction = cp.zeros(n)
+    if tower_shadow and rec is not None and rec.tower_radius > 0:
+        tower_hits = ray_hits_structure(pts, S[None, None, :], rec, xp=cp)
+        tower_fraction = tower_hits.mean(axis=1)
+    t_pair = T[I]
+    max_along = (helio.height + dz) / cp.maximum(t_pair[:, 2], 0.03) + diag
+    keep_b = _corridor(rel, t_pair, diag, max_along, xp=cp)
+    blocked = hit_mask(I[keep_b], J[keep_b], T)
+    other = shaded | blocked
+    eta_shade = 1.0 - (shaded | tower_hits).sum(axis=1) / p
+    eta_comb = 1.0 - (other | tower_hits).sum(axis=1) / p
+    eta_block = cp.where(eta_shade > 0, eta_comb / cp.where(eta_shade > 0, eta_shade, 1.0), 1.0)
+    return {"shading": cp.asnumpy(eta_shade), "blocking": cp.asnumpy(eta_block), "combined": cp.asnumpy(eta_comb),
+            "tower_fraction": cp.asnumpy(tower_fraction), "non_tower_occluded": cp.asnumpy(other)}
 
 
 def _hit_mask(points, i, j, d, xyz, normals, e_w, e_h, helio, n, chunk=4096) -> np.ndarray:
@@ -190,6 +238,12 @@ def shading_blocking(
     ones = np.ones(n)
     if n == 0:
         return {"shading": ones, "blocking": ones, "combined": ones, "tower_fraction": np.zeros(n)}
+    from .backend import enabled
+
+    if enabled():  # the ray tests on the GPU (pairs selected on the CPU, as below)
+        gpu = _shading_gpu(xyz, normals, sun_vec, t, helio, rec, pairs, n_points, tower_shadow, blockers)
+        if gpu is not None:
+            return gpu
     e_w, e_h = mirror_frames(normals)
     offsets = grid_offsets(n_points)
     pts = mirror_points(xyz, e_w, e_h, helio, offsets)
@@ -227,6 +281,30 @@ def shading_blocking(
         eta_block = np.where(eta_shade > 0, eta_comb / eta_shade, 1.0)
     return {"shading": eta_shade, "blocking": eta_block, "combined": eta_comb,
             "tower_fraction": tower_fraction, "non_tower_occluded": other_occlusion}
+
+
+def _shading_gpu(xyz, normals, sun_vec, t, helio, rec, pairs, n_points, tower_shadow, blockers):
+    """``shading_blocking`` on the GPU when the backend is on and the ray tests are many; else None."""
+    from . import backend
+
+    dz = float(np.ptp(xyz[:, 2])) if xyz.shape[0] > 1 else 0.0
+    sun_el = np.degrees(np.arcsin(np.clip(sun_vec[2], -1, 1)))
+    r_shade = interaction_radius(helio, sun_el, dz)
+    t_el = np.degrees(np.arcsin(np.clip(t[:, 2], -1, 1)))
+    r_block = interaction_radius(helio, float(t_el.min()), dz)
+    i_all, j_all = pairs.get(max(r_shade, r_block))
+    if blockers is not None:
+        keep = np.asarray(blockers, dtype=bool)[j_all]
+        i_all, j_all = i_all[keep], j_all[keep]
+    cp = backend._gpu_for(int(i_all.size) * n_points * n_points)
+    if cp is None:
+        return None
+    import cupyx
+
+    with backend._device(cp):
+        return _shading_blocking_gpu(cp, cupyx.scatter_add, np.asarray(xyz, float), np.asarray(normals, float),
+                                     np.asarray(sun_vec, float), np.asarray(t, float), helio, rec, i_all, j_all,
+                                     r_shade, dz, n_points, tower_shadow)
 
 
 def shading_blocking_bruteforce(

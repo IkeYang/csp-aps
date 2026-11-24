@@ -111,6 +111,10 @@ LABELS = {
     "aps.subfield_sectors": "子场分解扇区数",
     "aps.certify_rounds": "松弛随机取整次数", "layout_opt.upper_bound": "计算可证上界",
     "layout_opt.uniformity_weight": "布局均匀度权重 λ_L",
+    "layout_opt.land_weight": "土地权重 κ（MWhₜₕ／（公顷·年），0 = 不计占地）",
+    "layout_opt.max_land_ha": "占地上限 A_max（公顷，0 = 不限）",
+    "layout_opt.land_cost_per_ha_year": "每公顷年化土地成本（用于推荐 κ，0 = 未知）",
+    "layout_opt.heat_value_per_mwh": "每 MWhₜₕ 有用热量的价值（与土地成本同一货币，0 = 未知）",
     "layout_opt.selection_iterations": "镜位定价迭代次数（搜索阶段）", "layout_opt.uniformity_sectors": "均匀度扇区数（0 = 按管屏）",
     "uniformity.enabled": "启用均匀度约束", "uniformity.max_cv": "允许二维 CV (ε)",
     "uniformity.mode": "均匀度目标模式", "uniformity.weight": "均匀度权重 λ",
@@ -282,6 +286,11 @@ HELP = {
     "layout_opt.upper_bound": "按单镜无干扰年潜力与圆盘最密堆积计算任意布局的年能量上界，给出最优性差距。",
     "layout_opt.uniformity_weight": "吸热器周向受热不均匀的惩罚权重。0 = 只追求全年能量（高纬度下镜场会集中在塔北侧）；"
                                     "越大镜场越环绕吸热器，吸热器各朝向受热越均匀。",
+    "layout_opt.land_weight": "布局目标 J = E − λ_L·Π − κ·A：A 是全部镜心的凸包面积（公顷），每套布局只算一次。"
+                              "κ = 100 表示每年最多愿意牺牲 100 MWhₜₕ 的等效热量来省一公顷地。布局搜索和最终排名都用 J，"
+                              "逐时瞄准仍用原目标。不知道怎么定时，看布局比较结果里的推荐值和排名切换点。",
+    "layout_opt.max_land_ha": "硬约束 A ≤ A_max：工程上只给这么多地时直接填这里，不必猜土地价格；超出的布局不参与排名。",
+    "layout_opt.land_cost_per_ha_year": "一次性征地费先折算成年成本（例如按年金系数）。与热量价值一起给出时，推荐 κ = 土地年成本 ÷ 热量价值。",
     "heliostat.width": "定日镜反射面宽度（水平方向），单位米。", "heliostat.height": "定日镜反射面高度，单位米。",
     "heliostat.pivot_height": "定日镜旋转中心离地高度，单位米。",
     "receiver.diameter": "圆柱外置式吸热器直径，单位米。", "receiver.height": "吸热器受光段高度，单位米。",
@@ -2659,6 +2668,15 @@ def _ranking_table(ranking: pd.DataFrame) -> pd.DataFrame:
         "内层差距": ranking["inner_gap_annual"].map(lambda g: _pct(g, 2)),
         "工况状态": ranking["status_counts"].map(statuses),
         "周向扣分对照 Π_circ (MWhₜₕ)": ranking["circ_penalty_mwh"].round(1)})
+    if "land_ha" in ranking:  # land use: J = V - kappa A ranks the layouts
+        kappa = float(ranking["land_weight"].iloc[0]) if len(ranking) else 0.0
+        out.insert(3, "年度目标 J = V − κA (MWhₜₕ)", ranking["objective_mwh"].round(1))
+        out.insert(4, "占地 A（公顷，镜心凸包）", ranking["land_ha"].round(3))
+        out.insert(5, f"土地扣分 κA（κ = {kappa:g}）", ranking["land_penalty_mwh"].round(1))
+        out.insert(8, "ΔJ", ranking["delta_objective_mwh"].round(1))
+        out["κ 切换点（与第一名互换）"] = ranking["kappa_switch"].map(lambda v: "—" if pd.isna(v) else f"{v:.0f}")
+        if "land_ok" in ranking and not ranking["land_ok"].all():
+            out["占地上限"] = ranking["land_ok"].map(lambda ok: "满足" if ok else "超出，不排名")
     if "value_cv_mwh" in ranking and ranking["value_cv_mwh"].notna().any():
         # control variate: the hourly centre-aim energy of each scenario's member hours corrects its sampling error
         out.insert(4, "全年估计 V_cv (MWhₜₕ)", ranking["value_cv_mwh"].round(1))
@@ -2792,6 +2810,35 @@ def _calc_basis(case, values: dict, ranking: pd.DataFrame, sset) -> None:
         st.caption("“候选瞄准点”就是求解范围：最优性差距与上界只对这组候选点成立。比较布局时必须用同一工况集指纹和设置指纹。")
 
 
+def _land_advice(case, values: dict, key: str) -> None:
+    """Recommended land weight kappa and the weights at which this ranking changes; one click to use it."""
+    from cspaps.layout_value import recommend_land_weight
+
+    done = [v for v in values.values() if v.totals()["complete"]]
+    if not done:
+        return
+    try:
+        rec = recommend_land_weight(case, done, reference="initial" if "initial" in values else None)
+    except Exception as exc:  # noqa: BLE001 - advice only
+        st.caption(f"暂时无法给出土地权重建议：{exc}")
+        return
+    lines = []
+    if rec.get("kappa") is not None:
+        lines.append(f"推荐 κ ≈ **{rec['kappa']:.0f}** MWhₜₕ／（公顷·年）。依据：{rec['text']}。")
+    for p in rec.get("switch_points", [])[:5]:
+        lines.append(f"κ > {p['kappa']:.0f} 时 {wf.layout_label(p['layout'])} 超过 {wf.layout_label(p['over'])}"
+                     f"（少占 {p['saves_ha']:.2f} 公顷，少 {p['costs_value_mwh']:.0f} MWhₜₕ 年度得分）。")
+    if not rec.get("switch_points"):
+        lines.append("这批布局里没有“更省地但得分更低”的组合，κ 取多大都不改变第一名。")
+    lines.append("有土地报价时：κ = 每公顷年化土地成本 ÷ 每 MWhₜₕ 有用热量价值（在参数设置里填两个价格即可）；"
+                 "只知道最多给多少地时，直接设占地上限 A_max。")
+    _callout("info", "土地权重怎么定", " ".join(lines))
+    if rec.get("kappa") is not None and st.button(f"把 κ = {rec['kappa']:.0f} 写入参数（下次搜索与排名使用）", key=key):
+        st.session_state["case_dict"].setdefault("layout_opt", {})["land_weight"] = round(float(rec["kappa"]), 1)
+        st.session_state["ver"] += 1
+        st.rerun()
+
+
 def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bound: dict | None = None,
                    dense: dict | None = None, disp: dict | None = None, run_dir=None, swaps=None,
                    cross: dict | None = None) -> None:
@@ -2816,10 +2863,16 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
                             key=f"{key}_lam")
             totals = {n: v.totals() for n, v in values.items()}
             _chart(lambda_sweep_chart(totals, labels, lam, max(1.0, 2 * lam_now)), f"{key}_sweep")
-        shown = compare_values(list(values.values()), lam, reference=ranking["reference"].iloc[0]) if lam != lam_now else ranking
+        kappa_now = float(ranking["land_weight"].iloc[0]) if "land_weight" in ranking else 0.0
+        kappa = st.slider("土地权重 κ 重新计分（MWhₜₕ／公顷·年，不重新求解瞄准方案）", 0.0,
+                          float(max(500.0, 3 * kappa_now)), kappa_now, 5.0, key=f"{key}_kappa")
+        shown = (compare_values(list(values.values()), lam, reference=ranking["reference"].iloc[0], land_weight=kappa)
+                 if lam != lam_now or kappa != kappa_now else ranking)
         st.dataframe(_ranking_table(shown), hide_index=True)
-        st.caption("V(L) = Σ_s h_s (P_s − λ_L·U_s)。内层用 λ_APS 选瞄准方案，外层只按 λ_L 对这组方案的 P_s、U_s 重新计分，"
-                   "每个工况的惩罚只扣一次；改变 λ_L 时各直线斜率为 −Π，交点处排名互换。周向扣分仅作对照，不参与排名。")
+        st.caption("J(L) = V(L) − κ·A(L)，V(L) = Σ_s h_s (P_s − λ_L·U_s)。内层用 λ_APS 选瞄准方案，外层只按 λ_L 对这组方案的 "
+                   "P_s、U_s 重新计分，每个工况的惩罚只扣一次；占地 A 是全部镜心的凸包面积，每套布局只扣一次 κA。"
+                   "κ 切换点：κ 取这个值时该布局与第一名得分相同。周向扣分仅作对照，不参与排名。")
+        _land_advice(case, values, f"{key}_land")
         if swaps:
             def _r2(v):
                 return None if v is None else round(float(v), 2)
@@ -3728,6 +3781,36 @@ def page_runs(case) -> None:
                 st.rerun()
 
 
+@st.cache_resource(show_spinner=False)
+def _detected_gpus() -> int:
+    from cspaps.backend import detected_gpus
+
+    return detected_gpus()
+
+
+def _resources() -> None:
+    """Hardware of this computer: usable CPUs (read from the system) and how many GPUs the calculations use."""
+    from cspaps import backend
+    from cspaps.parallel import cpu_count
+
+    n_gpu = _detected_gpus()
+    with st.expander("计算资源", expanded=False):
+        st.caption(f"本机可用 CPU {cpu_count()} 个（按进程亲和性与容器配额读取）；检测到 GPU {n_gpu} 张。")
+        if n_gpu == 0:
+            st.caption("未检测到可用 GPU（未安装 CuPy 或没有 NVIDIA 显卡），全部在 CPU 上计算。")
+            return
+        current = len(backend.devices()) if backend.enabled() else 0
+        use = st.number_input("使用 GPU 数（0 = 只用 CPU）", min_value=0, max_value=n_gpu, value=min(current, n_gpu),
+                              step=1, key="use_gpus",
+                              help="工作进程按顺序轮流分到这些卡上；并行进程数在参数设置的“并行进程”里设（-1 = 全部 CPU）。")
+        if int(use) != current:
+            backend.set_resources(int(use))
+            st.rerun()
+        if use:
+            st.caption(f"光斑核、复核、阴影和均匀度局部搜索在前 {int(use)} 张卡上计算。每张卡多个进程时建议先运行 "
+                       "`nvidia-cuda-mps-control -d`。")
+
+
 def main() -> None:
     st.set_page_config(page_title="CSP-APS · 镜场与瞄准优化", page_icon="☀", layout="wide",
                        initial_sidebar_state="expanded")
@@ -3766,6 +3849,7 @@ def main() -> None:
         if st.button("恢复阿克塞演示算例"):
             _load_into_state(yaml.safe_load(DEFAULT_CASE.read_text(encoding="utf-8")), DEFAULT_CASE.parent)
             st.rerun()
+        _resources()
         st.caption(f"结果目录 {RESULTS}")
     {"总览": page_overview, "瞄准优化": page_aps, "布局优化": page_layout, "云影回放": page_replay,
      "光学校验": page_optics, "参数设置": page_parameters, "运行记录": page_runs, "方法与理论": page_theory}[page](case)

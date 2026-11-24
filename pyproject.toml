@@ -17,6 +17,8 @@ dependencies = [
     "scipy>=1.10",
     # compiled solver loops (bit-identical to the numpy code; without it the numpy path runs)
     "numba>=0.59",
+    # per-worker caps on BLAS / OpenMP threads (avoids W workers x all-core thread pools)
+    "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]

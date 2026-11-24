@@ -375,6 +375,26 @@ class ScenarioRecord:
         }
 
 
+def land_area_ha(xyz) -> float:
+    """Land use of a layout: area of the convex hull of the mirror centres (x, y), hectares (0 below 3 points or
+    for collinear points)."""
+    xy = np.unique(np.asarray(xyz, dtype=float).reshape(-1, 3)[:, :2], axis=0)
+    if len(xy) < 3:
+        return 0.0
+    from scipy.spatial import ConvexHull, QhullError
+
+    try:
+        return float(ConvexHull(xy).volume) / 1e4  # in 2-D the "volume" is the area
+    except QhullError:  # all points on a line
+        return 0.0
+
+
+def land_terms(case: Case) -> tuple[float, float]:
+    """(kappa MWh_th/(ha yr), A_max ha; 0 = no limit) of the layout objective."""
+    lo = case.layout_opt
+    return float(lo.land_weight or 0.0), float(lo.max_land_ha or 0.0)
+
+
 def annual_value(table: pd.DataFrame, lam_l: float) -> dict:
     """V, E, Pi (MWh) from a per-scenario table (columns hours, p_abs_mw, u_mw, status) -- the scoring rule."""
     if not len(table):
@@ -411,19 +431,29 @@ class LayoutValue:
     settings: InnerSettings
     runtime_s: float = 0.0
     tags: dict = dc_field(default_factory=dict)
+    land_weight: float = 0.0  # kappa of J = V - kappa A, MWh_th / (ha yr)
+    max_land_ha: float = 0.0  # A_max, ha (0 = no limit)
 
     @property
     def n(self) -> int:
         return int(len(self.xyz))
 
+    @property
+    def land_ha(self) -> float:
+        return land_area_ha(self.xyz)
+
     def table(self, lam_l: float | None = None) -> pd.DataFrame:
         lam = self.lam_layout if lam_l is None else float(lam_l)
         return pd.DataFrame([r.row(self.lam_aps, lam) for r in self.records])
 
-    def totals(self, lam_l: float | None = None) -> dict:
+    def totals(self, lam_l: float | None = None, land_weight: float | None = None) -> dict:
         lam = self.lam_layout if lam_l is None else float(lam_l)
+        kappa = self.land_weight if land_weight is None else float(land_weight)
         t = self.table(lam)
         v = annual_value(t, lam)
+        area = self.land_ha
+        land = kappa * area  # counted once per layout, outside the annual sum
+        land_ok = not (self.max_land_ha > 0 and area > self.max_land_ha * (1 + 1e-12))
         status = t["status"].value_counts().to_dict() if len(t) else {}
         hours = t.groupby("status")["hours"].sum().to_dict() if len(t) else {}
         fe = t[t["counts_in_value"]] if len(t) else t
@@ -461,6 +491,14 @@ class LayoutValue:
             "penalty_cv_mwh": v.get("penalty_cv_mwh"),
             "cv_correction_pct": (100.0 * (v["value_cv_mwh"] / v["value_mwh"] - 1.0)
                                   if v.get("value_cv_mwh") is not None and v["complete"] and v["value_mwh"] else None),
+            # land use: J = V - kappa A (the layout objective; ranking key), A = convex hull of the mirror centres
+            "land_ha": area, "land_weight": kappa, "land_penalty_mwh": land, "max_land_ha": self.max_land_ha,
+            "land_ok": land_ok,
+            "objective_mwh": v["value_mwh"] - land, "objective_partial_mwh": v["value_partial_mwh"] - land,
+            "objective_cv_mwh": (v["value_cv_mwh"] - land) if v.get("value_cv_mwh") is not None else None,
+            "objective_interval_mwh": ([inner_j - land, inner_ub - land]
+                                       if abs(lam - self.lam_aps) < 1e-12 and np.isfinite(inner_ub)
+                                       and not status.get("no_feasible_found") else None),
             "scenario_fingerprint": self.scenario_fingerprint, "settings_digest": self.settings.digest(),
             "runtime_s": round(self.runtime_s, 2), **self.tags,
         }
@@ -526,11 +564,18 @@ def _jsonable(obj):
     return obj
 
 
-def recompute_from_csv(path, lam_l: float | None = None) -> dict:
-    """V, E, Pi from an exported ``scenario_values.csv`` alone (the audit path)."""
+def recompute_from_csv(path, lam_l: float | None = None, land_weight: float = 0.0) -> dict:
+    """V, E, Pi from an exported ``scenario_values.csv`` alone (the audit path); with ``land_weight`` also
+    J = V - kappa A from the ``layout.csv`` next to it."""
     t = pd.read_csv(path)
     lam = float(t["lambda_layout"].iloc[0]) if lam_l is None and len(t) else float(lam_l or 0.0)
-    return {**annual_value(t, lam), "lambda_layout": lam}
+    out = {**annual_value(t, lam), "lambda_layout": lam}
+    layout = Path(path).with_name("layout.csv")
+    if layout.exists():
+        area = land_area_ha(pd.read_csv(layout)[["x", "y", "z"]].to_numpy(float))
+        out.update(land_ha=area, land_weight=float(land_weight), land_penalty_mwh=float(land_weight) * area,
+                   objective_mwh=out["value_mwh"] - float(land_weight) * area)
+    return out
 
 
 def control_variate(case: Case, value: "LayoutValue", sset, workers: int | None = None) -> bool:
@@ -874,9 +919,11 @@ def _finish_value(case, name, xyz, ids, results, sset, settings, lam_l, t0, tags
     compute = {"backend": backend_name()}
     if compute["backend"] == "cupy":  # GPU models can differ in the last float32 bits: record which one
         compute["gpu_model"] = describe().get("device_name")
+    kappa, a_max = land_terms(case)
     out = LayoutValue(name, xyz, ids, results, settings.lam_aps, lam_l, sset.fingerprint(), settings,
                       _time.perf_counter() - t0, {**(tags or {}), **compute, "basis": basis,
-                                                  "value_label": labels["value"], "energy_label": labels["energy"]})
+                                                  "value_label": labels["value"], "energy_label": labels["energy"]},
+                      land_weight=kappa, max_land_ha=a_max)
     if case.layout_opt.control_variate and not stop() and all(r.plan.status != "not_solved" for r in results):
         if progress:
             progress(f"control variate {name}: centre-aim energy of the member hours")
@@ -941,9 +988,10 @@ def evaluate_layout_values(case: Case, layouts: dict, sset, settings: InnerSetti
 
 
 def compare_values(values: list[LayoutValue], lam_l: float | None = None, reference: str | None = None,
-                   rank_by: str = "value") -> pd.DataFrame:
-    """Ranking by V (or by its control-variate estimate, ``rank_by="value_cv"``) with the decomposition of
-    every difference into heat and uniformity."""
+                   rank_by: str = "value", land_weight: float | None = None) -> pd.DataFrame:
+    """Ranking by the layout objective J = V - kappa A (V or its control-variate estimate, ``rank_by="value_cv"``;
+    kappa = 0: by V) with every difference split into heat, uniformity and land. Layouts over the land limit
+    A_max are not ranked. ``kappa_switch`` is the land weight at which a layout and the leader swap places."""
     if not values:
         return pd.DataFrame()
     fps = {v.scenario_fingerprint for v in values}
@@ -955,33 +1003,45 @@ def compare_values(values: list[LayoutValue], lam_l: float | None = None, refere
     lam = values[0].lam_layout if lam_l is None else float(lam_l)
     if not 0 <= lam < math.inf:
         raise ValueError("The uniformity weight must be finite and nonnegative")
-    rows = [v.totals(lam) for v in values]
+    kappa = values[0].land_weight if land_weight is None else float(land_weight)
+    if not 0 <= kappa < math.inf:
+        raise ValueError("The land weight must be finite and nonnegative")
+    rows = [v.totals(lam, kappa) for v in values]
     df = pd.DataFrame(rows)
-    df["rankable"] = df["complete"]
-    key = "value_mwh"
-    if rank_by == "value_cv" and "value_cv_mwh" in df and df["value_cv_mwh"].notna().all():
-        key = "value_cv_mwh"
+    df["rankable"] = df["complete"] & df["land_ok"]
+    key = "objective_mwh"
+    if rank_by == "value_cv" and "objective_cv_mwh" in df and df["objective_cv_mwh"].notna().all():
+        key = "objective_cv_mwh"
     df["ranked_by"] = key
     df = df.sort_values(["rankable", key], ascending=[False, False], kind="stable").reset_index(drop=True)
     df["rank"] = np.where(df["rankable"], np.arange(1, len(df) + 1), np.nan)
     ref_name = reference if reference in set(df["name"]) else df.loc[0, "name"]
     ref = df.loc[df["name"] == ref_name].iloc[0]
     df["delta_value_mwh"] = df["value_mwh"] - ref["value_mwh"]
+    df["delta_objective_mwh"] = df["objective_mwh"] - ref["objective_mwh"]
     df["delta_energy_mwh"] = df["energy_mwh"] - ref["energy_mwh"]
     df["delta_uniformity_mwh"] = -lam * (df["penalty_mwh"] - ref["penalty_mwh"])
+    df["delta_land_ha"] = df["land_ha"] - ref["land_ha"]
+    df["delta_land_mwh"] = -kappa * df["delta_land_ha"]
     df["reference"] = ref_name
+    # J_i = V_i - kappa A_i equals the leader's J at kappa* = (V_i - V_lead) / (A_i - A_lead): above kappa* the
+    # smaller of the two ranks first
+    lead = df.loc[0]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        k_sw = (df["value_mwh"] - lead["value_mwh"]) / (df["land_ha"] - lead["land_ha"])
+    df["kappa_switch"] = np.where((df.index > 0) & np.isfinite(k_sw) & (k_sw >= 0), k_sw, np.nan)
     # bound intervals (equal weights): a layout whose upper end reaches the leader's found value could still win
     # with a larger inner budget -- these get more budget before the ranking is called final
-    lead_lo = df.loc[0, "value_mwh"] if bool(df.loc[0, "rankable"]) else float("nan")
+    lead_lo = df.loc[0, "objective_mwh"] if bool(df.loc[0, "rankable"]) else float("nan")
 
     def overlap(row):
-        iv = row["value_interval_mwh"]
+        iv = row["objective_interval_mwh"]
         if row.name == 0 or iv is None or not np.isfinite(lead_lo):
             return None
         return bool(iv[1] >= lead_lo)
 
     df["interval_overlaps_leader"] = df.apply(overlap, axis=1)
-    intervals = df["value_interval_mwh"].tolist()
+    intervals = df["objective_interval_mwh"].tolist()
     if not df["complete"].all():
         decision = "incomplete"
     elif len(df) == 1:
@@ -1009,9 +1069,9 @@ def refine_competing_plans(case, values, sset, progress=None, cancel=None):
     rank = compare_values(list(values.values()))
     if rank.iloc[0]["comparison_status"] != "overlapping_bounds":
         return
-    lead = rank.iloc[0]["value_mwh"]
+    lead = rank.iloc[0]["objective_mwh"]
     for value in values.values():
-        interval = value.totals()["value_interval_mwh"]
+        interval = value.totals()["objective_interval_mwh"]
         if interval is None or interval[1] < lead:
             continue
         candidates = [r for r in value.records if r.plan.upper_bound_w is not None and
@@ -1047,9 +1107,64 @@ def refine_competing_plans(case, values, sset, progress=None, cancel=None):
             row.plan = chosen
 
 
-def rescore(values: list[LayoutValue], lam_l: float, reference: str | None = None) -> pd.DataFrame:
-    """The ranking for another outer weight on the *same* plans (no re-solve; P_s, U_s unchanged)."""
-    return compare_values(values, lam_l, reference)
+def rescore(values: list[LayoutValue], lam_l: float, reference: str | None = None,
+            land_weight: float | None = None) -> pd.DataFrame:
+    """The ranking for another outer weight / land weight on the *same* plans (no re-solve; P_s, U_s and the
+    areas unchanged)."""
+    return compare_values(values, lam_l, reference, land_weight=land_weight)
+
+
+LAND_ELASTICITY = 0.05  # default trade: 10 % more land must bring at least 0.5 % more annual heat
+
+
+def recommend_land_weight(case: Case, values: list[LayoutValue] | None = None, reference: str | None = None,
+                          energy_mwh: float | None = None, area_ha: float | None = None,
+                          elasticity: float = LAND_ELASTICITY) -> dict:
+    """A land weight kappa (MWh_th / (ha yr)) to start from, and how it was obtained.
+
+    * ``price``: annualised land cost per hectare / value of one MWh_th of useful heat
+      (``layout_opt.land_cost_per_ha_year``, ``heat_value_per_mwh``; a one-time land price annualised first).
+    * ``elasticity`` (no prices): kappa = e x E / A of the reference layout (its annual absorbed heat per hectare):
+      a layout may take 10 % more land if it brings at least e x 10 % more heat (e = 0.05 by default).
+    With evaluated layouts it also lists ``switch_points``: the kappa at which each layout and the kappa = 0 leader
+    swap places -- the land weights at which the decision changes."""
+    lo = case.layout_opt
+    out: dict = {"elasticity": elasticity}
+    ref = None
+    if values:
+        by_name = {v.name: v for v in values}
+        rank0 = compare_values(values, land_weight=0.0)
+        ref = by_name.get(reference) or by_name.get("initial") or by_name[str(rank0.loc[0, "name"])]
+        energy_mwh, area_ha = ref.totals()["energy_mwh"], ref.land_ha
+        lead = rank0.loc[0]
+        points = []
+        for _, row in rank0.iloc[1:].iterrows():
+            d_a = row["land_ha"] - lead["land_ha"]
+            d_v = lead["value_mwh"] - row["value_mwh"]
+            if d_a < 0 and d_v > 0 and row["rankable"]:  # smaller and worse at kappa = 0: wins above kappa*
+                points.append({"layout": row["name"], "kappa": float(d_v / -d_a), "saves_ha": float(-d_a),
+                               "costs_value_mwh": float(d_v), "over": lead["name"]})
+        out["switch_points"] = sorted(points, key=lambda r: r["kappa"])
+        out["reference"] = ref.name
+    if area_ha is None:
+        area_ha = land_area_ha(build_field_xyz(case))
+    out.update(reference_land_ha=area_ha, reference_energy_mwh=energy_mwh)
+    if lo.land_cost_per_ha_year > 0 and lo.heat_value_per_mwh > 0:
+        out.update(kappa=float(lo.land_cost_per_ha_year / lo.heat_value_per_mwh), method="price",
+                   text=(f"每公顷年化土地成本 {lo.land_cost_per_ha_year:g} ÷ 每 MWhₜₕ 热量价值 {lo.heat_value_per_mwh:g}"))
+    elif energy_mwh is not None and area_ha:
+        out.update(kappa=float(elasticity * energy_mwh / area_ha), method="elasticity",
+                   text=(f"没有土地价格时：参考布局每公顷年吸热 {energy_mwh / area_ha:,.0f} MWhₜₕ 的 "
+                         f"{100 * elasticity:g}%（多占 10% 的地，至少要多带来 {10 * elasticity:g}% 的年吸热量）"))
+    else:
+        out.update(kappa=None, method="unavailable", text="需要先评价一套布局（或填写土地价格与热量价值）")
+    return out
+
+
+def build_field_xyz(case: Case) -> np.ndarray:
+    from .field import build_field
+
+    return build_field(case).xyz
 
 
 # --------------------------------------------------------------------------- small exhaustive checks
