@@ -37,7 +37,7 @@ from cspaps.gui_plots import (
     lambda_sweep_chart, layout_overlay, layout_tradeoff_chart, loss_waterfall, pareto_chart, plant_scene,
     potential_map_chart, receiver_aims_3d, receiver_aims_map, receiver_map, receiver_rose, refinement_chart,
     replay_timeline, scenario_contrib_chart, scenario_sky_chart, state_bars, uniformity_curves,
-    value_decomposition_chart,
+    value_decomposition_chart, _viewport,
 )
 from cspaps.layout_opt import validate_layout
 from cspaps.layout_value import value_labels
@@ -45,7 +45,7 @@ from cspaps.tables import export_name, read_user_csv
 from cspaps.optics import footprints_at
 from cspaps.resources import demo_case_path
 from cspaps.receiver import build_grid, incident_limit_w_m2, panel_of, surface_normal, surface_point
-from cspaps.simulate import evaluate, sun_state
+from cspaps.simulate import STAGES, evaluate, sun_state
 
 # Streamlit executes this file as a fresh module named "__main__" on every rerun, with ``__file__`` set but no
 # ``__spec__``. Worker processes of the background jobs' process pools (``parallel.pool``: ``spawn`` on Windows,
@@ -103,7 +103,10 @@ LABELS = {
     "field.boundary": "场地边界多边形 (YAML)", "field.exclusion_radius": "塔周禁排半径 (m)",
     "aps.method": "求解方法", "aps.safety_margin": "安全裕度", "aps.n_height_levels": "候选高度数",
     "aps.height_span": "候选高度覆盖比例", "aps.azimuth_offsets_deg": "候选周向偏移 (°)",
-    "aps.passes": "改进轮数", "aps.tie_tolerance": "等效功率容差", "aps.move_penalty_per_m": "移动惩罚 (每米)",
+    "aps.passes": "改进轮数", "aps.tie_tolerance": "等效功率容差",
+    "aps.move_penalty_per_m": "移动代价（每移动 1 m 须多换来的该镜功率比例）",
+    "aps.initial_aim": "初始瞄准方案（没有运行状态时）", "aps.max_aim_shift_m": "瞄准点最大移动 (m，0 = 不限)",
+    "aps.max_rotation_deg": "镜面最大转角 (°，0 = 不限)",
     "aps.allow_defocus": "允许散焦", "aps.milp_time_limit_s": "MILP 时限 (s)", "aps.milp_max_nnz": "MILP 系数上限", "aps.verify": "细网格复核",
     "aps.verify_max_rounds": "热点约束最多轮数", "aps.verify_max_cells": "复核网格上限",
     "aps.auto_grid": "自动细化求解网格", "aps.max_solver_cells": "求解网格上限",
@@ -185,6 +188,7 @@ CHOICES = {
     "sun.shape": ["gaussian", "pillbox"], "sun.dni_model": ["meinel", "constant"],
     "atmosphere.model": ["vittitoe_biggs_clear", "vittitoe_biggs_hazy", "beer_lambert"],
     "weather.source": ["clear_sky", "file"], "aps.method": ["greedy", "kfactor", "center", "milp", "subfield"],
+    "aps.initial_aim": ["spread", "kfactor", "center", "none"],
     "uniformity.mode": ["cv_limit", "weighted"],
     "annual.method": ["sun_bins", "sun_grid", "representative_days", "hourly"],
     "annual.aiming": ["center", "greedy", "kfactor"], "layout_opt.generator": ["radial_staggered", "biomimetic"],
@@ -209,6 +213,8 @@ CHOICES = {
     "layout_opt.search_method": ["de", "bayes"],
 }
 CHOICE_LABELS = {
+    "aps.initial_aim": {"spread": "均布瞄准（推荐）：按光斑大小铺满吸热器高度", "kfactor": "瞄准因子：上下两条带",
+                        "center": "全部瞄吸热器中心", "none": "不设初始状态（纯功率最优，可能集中到一侧）"},
     "layout_opt.uniformity_metric": {"circumferential": "管屏之间（周向）", "surface": "整个考核区（二维热流）"},
     "sun.shape": {"gaussian": "高斯太阳盘", "pillbox": "均匀圆盘"},
     "sun.dni_model": {"meinel": "Meinel 晴空模型", "constant": "固定 DNI"},
@@ -259,6 +265,13 @@ HELP = {
     "weather.file": "EPW 文件或两列 CSV（time,dni）。DNI 单位 W/m²，时间需注明时区或按场址时区解释。",
     "aps.method": "瞄准算法为每面镜子选择接收器表面的位置。贪心法适合大镜场，小规模 MILP 可作候选集精确基准。",
     "aps.safety_margin": "相对设备通量上限预留的比例。例如 0.05 表示优化目标不超过上限的 95%。",
+    "aps.initial_aim": "没有上传运行状态时，方案从这个初始瞄准出发，并对偏离它的移动计价。均布瞄准：每面镜瞄自己正对的方位，"
+                       "每个方位扇区的镜子按允许热流把功率平均分到各个高度，大光斑（远镜）靠中间、小光斑（近镜）可用上下边缘，"
+                       "光斑始终留在吸热器上（2σ）。",
+    "aps.move_penalty_per_m": "一面镜的瞄准点每离开初始状态 1 m，至少要多换来这个比例的该镜功率才值得移动。0.001 = 每米 0.1%，"
+                              "移动 15 m 要多 1.5%。0 = 移动不计代价（λ = 0 时会全部移到单镜功率最大的位置）。",
+    "aps.max_aim_shift_m": "硬约束：相对初始状态，瞄准点在吸热器表面最多移动这么远（米）。0 = 不限。",
+    "aps.max_rotation_deg": "硬约束：相对初始状态，镜面法向最多转这么多度（同一太阳位置下两个瞄准点对应的镜面姿态之差）。0 = 不限。",
     "uniformity.mode": "CV 上限模式直接要求二维 CV 不超过目标。固定权重模式最大化吸收功率 − λ × 考核区面积 × 热流标准差。",
     "uniformity.max_cv": "考核区面积加权二维变异系数上限。CV 越小表示表面热流越均匀。",
     "uniformity.weight": "固定权重 λ。数值越大越重视均匀受热，可能牺牲部分吸收功率。",
@@ -479,12 +492,18 @@ def _show_files(result: dict, images: list[str] | None = None) -> None:
 def _apply_theme() -> None:
     st.markdown("""<style>
 :root{--cs-navy:#0f2a3a;--cs-teal:#14806f;--cs-teal-d:#0e5e52;--cs-amber:#e09b2d;--cs-ink:#16232b;
-      --cs-muted:#5d6d74;--cs-line:#dfe6e6;--cs-bg:#f4f6f6}
-.stApp{background:var(--cs-bg);font-family:Inter,'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif}
+      --cs-muted:#5d6d74;--cs-line:#dfe6e6;--cs-bg:#f2f6f8;--cs-cyan:#22c7d8;--cs-deep:#08131d;
+      --cs-mono:'JetBrains Mono','SFMono-Regular','Cascadia Mono',Consolas,'Roboto Mono',monospace}
+.stApp{font-family:Inter,'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif;
+  background:radial-gradient(1100px 520px at 88% -8%,#d9f1f4 0%,transparent 60%),
+    radial-gradient(900px 480px at -6% 4%,#e6eefc 0%,transparent 55%),
+    linear-gradient(rgba(15,42,58,.035) 1px,transparent 1px) 0 0/28px 28px,
+    linear-gradient(90deg,rgba(15,42,58,.035) 1px,transparent 1px) 0 0/28px 28px,var(--cs-bg)}
 .stMainBlockContainer{padding-top:2.4rem;max-width:1520px}
 header[data-testid="stHeader"]{background:transparent}
 [data-testid="stDeployButton"],[data-testid="stAppDeployButton"],#MainMenu,footer{display:none!important}
-section[data-testid="stSidebar"]{background:linear-gradient(185deg,#0f2a3a 0%,#123a46 70%,#16484f 100%)}
+section[data-testid="stSidebar"]{background:linear-gradient(185deg,#06121b 0%,#0b2431 48%,#0f3a40 100%);
+  border-right:1px solid #22c7d822}
 section[data-testid="stSidebar"] p,section[data-testid="stSidebar"] span,section[data-testid="stSidebar"] label,
 section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"]{color:#dce9e7}
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"]{background:#ffffff12;border-color:#ffffff40}
@@ -500,18 +519,30 @@ section[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked){ba
 section[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) p{color:#fff;font-weight:650}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"]>div>div:first-child{display:none}
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button{background:#ffffff1a;border-color:#ffffff55}
-div[class*="st-key-card_"]{background:#fff;border-radius:14px;box-shadow:0 1px 3px #0f2a3a12}
+div[class*="st-key-card_"]{position:relative;background:rgba(255,255,255,.94);border-radius:16px;
+  border:1px solid #14806f1f!important;box-shadow:0 1px 2px #0f2a3a10,0 8px 24px -14px #0f2a3a40;
+  backdrop-filter:blur(6px);transition:box-shadow .2s ease,transform .2s ease}
+div[class*="st-key-card_"]:before{content:"";position:absolute;left:18px;right:18px;top:0;height:2px;border-radius:2px;
+  background:linear-gradient(90deg,var(--cs-cyan),var(--cs-teal) 45%,var(--cs-amber))}
+div[class*="st-key-card_"]:hover{box-shadow:0 1px 2px #0f2a3a10,0 14px 32px -16px #0f2a3a55}
 .cs-brand{display:flex;align-items:center;gap:.65rem;margin:.2rem 0 .1rem}
 .cs-brand .name{font:750 1.32rem Inter,sans-serif;letter-spacing:.04em;color:#fff}
 .cs-brand .sub{font-size:.72rem;color:#9fc0bb;letter-spacing:.08em}
-.cs-logo{width:34px;height:34px;border-radius:9px;flex:none;background:
+.cs-logo{width:34px;height:34px;border-radius:9px;flex:none;box-shadow:0 0 18px #22c7d855;background:
   radial-gradient(circle at 50% 38%,#ffd38a 0 16%,transparent 18%),
   repeating-radial-gradient(ellipse at 50% 118%,#0b524f 0 4px,#6cc0b1 5px 6px,#124e4c 7px 9px)}
 .cs-side-card{background:#ffffff10;border:1px solid #ffffff26;border-radius:10px;padding:.7rem .8rem;margin:.4rem 0;
   font-size:.8rem;color:#dce9e7;line-height:1.55}
 .cs-side-card b{color:#fff}
-.cs-hero{position:relative;overflow:hidden;border-radius:16px;padding:1.35rem 1.6rem 1.2rem;margin:0 0 1.1rem;color:#fff;
-  background:linear-gradient(118deg,#0f2a3a 0%,#134b4c 58%,#1b6c60 100%);box-shadow:0 6px 18px #0f2a3a22}
+.cs-hero{position:relative;overflow:hidden;border-radius:18px;padding:1.35rem 1.6rem 1.2rem;margin:0 0 1.1rem;color:#fff;
+  background:linear-gradient(118deg,#06121b 0%,#0d2f3a 45%,#135a55 100%);box-shadow:0 10px 30px -12px #06121baa;
+  border:1px solid #22c7d833}
+.cs-hero:before{content:"";position:absolute;inset:0;pointer-events:none;opacity:.55;
+  background:linear-gradient(rgba(34,199,216,.08) 1px,transparent 1px) 0 0/22px 22px,
+    linear-gradient(90deg,rgba(34,199,216,.08) 1px,transparent 1px) 0 0/22px 22px,
+    linear-gradient(100deg,transparent 30%,rgba(255,209,102,.16) 45%,transparent 60%) 0 0/220% 100%;
+  animation:cs-sweep 9s linear infinite}
+@keyframes cs-sweep{from{background-position:0 0,0 0,120% 0}to{background-position:0 0,0 0,-120% 0}}
 .cs-hero:after{content:"";position:absolute;right:-70px;top:-90px;width:280px;height:280px;border-radius:50%;
   background:radial-gradient(circle,#f6c66f 0%,#e09b2d66 30%,transparent 68%)}
 .cs-hero .eyebrow{font-size:.74rem;letter-spacing:.14em;color:#a8d4cb;font-weight:650}
@@ -520,21 +551,27 @@ div[class*="st-key-card_"]{background:#fff;border-radius:14px;box-shadow:0 1px 3
 .cs-chip{display:inline-block;padding:.2rem .65rem;border-radius:999px;background:#ffffff1c;border:1px solid #ffffff33;
   font-size:.76rem;margin:.65rem .4rem 0 0;color:#eef7f5}
 .cs-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(175px,100%),1fr));gap:12px;margin:.2rem 0 1rem}
-.cs-kpi{position:relative;background:#fff;border:1px solid var(--cs-line);border-radius:12px;padding:.8rem 1rem .75rem 1.1rem;
-  box-shadow:0 1px 2px #0f2a3a0d}
-.cs-kpi:before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;border-radius:3px;background:var(--cs-teal)}
-.cs-kpi.good:before{background:#2a9d6f}.cs-kpi.warn:before{background:#e09b2d}.cs-kpi.bad:before{background:#c2453a}
-.cs-kpi.navy:before{background:#2d5d7b}
-.cs-kpi .k{font-size:.78rem;color:var(--cs-muted);letter-spacing:.02em}
-.cs-kpi .v{font-size:1.42rem;font-weight:700;color:var(--cs-ink);font-variant-numeric:tabular-nums;line-height:1.25;
-  margin-top:.12rem;overflow-wrap:anywhere}
-.cs-kpi .u{font-size:.82rem;font-weight:500;color:var(--cs-muted);margin-left:.18rem}
-.cs-kpi .n{font-size:.75rem;color:var(--cs-muted);margin-top:.18rem;line-height:1.4}
+.cs-kpi{position:relative;overflow:hidden;background:linear-gradient(150deg,#0a1b26 0%,#0f2b36 60%,#123a40 100%);
+  border:1px solid #22c7d82e;border-radius:14px;padding:.8rem 1rem .75rem 1.1rem;
+  box-shadow:0 8px 22px -14px #06121bcc,inset 0 1px 0 #ffffff12}
+.cs-kpi:after{content:"";position:absolute;right:-30px;top:-40px;width:110px;height:110px;border-radius:50%;
+  background:radial-gradient(circle,#22c7d826 0%,transparent 70%);pointer-events:none}
+.cs-kpi:before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;border-radius:3px;background:var(--cs-cyan);
+  box-shadow:0 0 10px var(--cs-cyan)}
+.cs-kpi.good:before{background:#2ee6a6;box-shadow:0 0 10px #2ee6a6}.cs-kpi.warn:before{background:#ffb547;box-shadow:0 0 10px #ffb547}
+.cs-kpi.bad:before{background:#ff6b5e;box-shadow:0 0 10px #ff6b5e}.cs-kpi.navy:before{background:#7aa7ff;box-shadow:0 0 10px #7aa7ff}
+.cs-kpi .k{font-size:.76rem;color:#8fb6c2;letter-spacing:.06em}
+.cs-kpi .v{font:700 1.38rem var(--cs-mono);color:#ecfbff;font-variant-numeric:tabular-nums;line-height:1.3;
+  margin-top:.14rem;overflow-wrap:anywhere;text-shadow:0 0 14px #22c7d840}
+.cs-kpi .u{font:500 .8rem Inter,sans-serif;color:#8fb6c2;margin-left:.22rem}
+.cs-kpi .n{font-size:.74rem;color:#9fbcc6;margin-top:.2rem;line-height:1.45}
 .cs-sec{display:flex;align-items:center;gap:.55rem;font-weight:680;font-size:1.03rem;color:var(--cs-ink);margin:.05rem 0 .35rem}
-.cs-step{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--cs-teal);
-  color:#fff;font-size:.78rem;font-weight:700;flex:none}
+.cs-step{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:8px;
+  background:linear-gradient(135deg,var(--cs-cyan),var(--cs-teal));box-shadow:0 0 0 3px #22c7d822,0 4px 10px -4px #14806f;
+  color:#fff;font:700 .78rem var(--cs-mono);flex:none}
 .cs-sec-cap{color:var(--cs-muted);font-size:.84rem;margin:-.1rem 0 .65rem;line-height:1.55}
-.cs-callout{border-radius:12px;padding:.85rem 1.1rem;border:1px solid;margin:.3rem 0 1rem;line-height:1.6;font-size:.9rem;color:var(--cs-ink)}
+.cs-callout{border-radius:12px;padding:.85rem 1.1rem;border:1px solid;border-left-width:4px;margin:.3rem 0 1rem;line-height:1.6;
+  font-size:.9rem;color:var(--cs-ink);backdrop-filter:blur(4px)}
 .cs-callout.ok{background:#eaf6f1;border-color:#a7d8c5}.cs-callout.warn{background:#fdf5e7;border-color:#efcf94}
 .cs-callout.bad{background:#fbecea;border-color:#eab2ab}.cs-callout.info{background:#edf3f6;border-color:#c4d7e0}
 .cs-callout .t{font-weight:700;margin-bottom:.2rem}
@@ -546,14 +583,27 @@ div[class*="st-key-card_"]{background:#fff;border-radius:14px;box-shadow:0 1px 3
 .cs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(165px,100%),1fr));gap:10px;margin:.25rem 0 .6rem}
 .cs-card{background:#fff;border:1px solid var(--cs-line);border-top:3px solid var(--cs-teal);border-radius:10px;padding:.7rem .95rem}
 .cs-k{font-size:.8rem;color:var(--cs-muted)}.cs-v{font-size:1.15rem;font-weight:660;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-div.stButton>button[kind="primary"],div.stDownloadButton>button[kind="primary"]{background:var(--cs-teal);border-color:var(--cs-teal);
-  color:#fff;border-radius:9px;font-weight:650;padding:.5rem 1.2rem}
-div.stButton>button[kind="primary"]:hover{background:var(--cs-teal-d);border-color:var(--cs-teal-d);color:#fff}
-div.stButton>button{border-radius:9px}
-.stTabs [data-baseweb="tab-list"]{gap:.3rem;border-bottom:1px solid var(--cs-line)}
-.stTabs [data-baseweb="tab"]{padding:.45rem .9rem;border-radius:8px 8px 0 0}
-.stTabs [aria-selected="true"]{color:var(--cs-teal)!important;font-weight:650}
-.stTabs [data-baseweb="tab-highlight"]{background:var(--cs-teal)}
+div.stButton>button[kind="primary"],div.stDownloadButton>button[kind="primary"]{
+  background:linear-gradient(120deg,var(--cs-teal) 0%,#119c91 55%,var(--cs-cyan) 130%);border:0;
+  color:#fff;border-radius:10px;font-weight:650;padding:.5rem 1.2rem;box-shadow:0 6px 16px -8px #14806fcc}
+div.stButton>button[kind="primary"]:hover{filter:brightness(1.06);box-shadow:0 0 0 3px #22c7d833,0 8px 20px -8px #14806f;color:#fff}
+div.stButton>button{border-radius:10px;transition:box-shadow .15s ease,border-color .15s ease}
+div.stButton>button:hover{border-color:var(--cs-cyan)}
+.stTabs [data-baseweb="tab-list"],.stTabs div:has(> [data-testid="stTab"]){gap:.25rem;background:#e6eef1;border-radius:12px;
+  padding:.25rem;border:1px solid #d6e2e6;flex-wrap:wrap;width:fit-content;max-width:100%}
+.stTabs [data-baseweb="tab"],.stTabs [data-testid="stTab"]{padding:.38rem .9rem;border-radius:9px;height:auto;
+  transition:background .15s ease,box-shadow .15s ease}
+.stTabs [data-testid="stTab"]:hover{background:#ffffff99}
+.stTabs [aria-selected="true"]{color:var(--cs-teal-d)!important;font-weight:650;background:#fff;
+  box-shadow:0 1px 2px #0f2a3a1a,0 0 0 1px #22c7d840}
+.stTabs [aria-selected="true"] p{color:var(--cs-teal-d)!important;font-weight:650}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"],.stTabs .react-aria-SelectionIndicator{display:none}
+.cs-spec{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(330px,100%),1fr));gap:0;margin:.4rem 0 1rem;
+  background:#0b1c27;border:1px solid #22c7d82e;border-radius:14px;overflow:hidden}
+.cs-spec .r{display:flex;justify-content:space-between;gap:1rem;padding:.55rem .9rem;background:#0b1c27;color:#9fbcc6;font-size:.82rem;
+  box-shadow:inset 0 -1px 0 #22c7d826,inset -1px 0 0 #22c7d826}
+.cs-spec .r b{color:#ecfbff;font:600 .82rem var(--cs-mono);text-align:right;overflow-wrap:anywhere}
+div[data-testid="stPlotlyChart"]{border-radius:14px;overflow:hidden}
 div[data-testid="stExpander"] details{border-radius:10px;background:#fff}
 .katex{font-size:1.06em}
 button[data-testid="stNumberInputStepUp"],button[data-testid="stNumberInputStepDown"]{display:none}
@@ -1661,13 +1711,13 @@ def page_aps(case) -> None:
                 with st.expander("站址与气象数据"):
                     _fields("site", ["latitude", "longitude", "elevation_m", "timezone"])
                     _weather_panel(case, "aps")
-            with st.expander("预报 DNI 与上一周期方案（可选）"):
+            with st.expander("预报 DNI（可选）"):
                 up_fc = st.file_uploader("预测时段最高 DNI（CSV x,y,dni）", type=["csv"], key="s_fc",
                                          help="用于避免云层移开后预测时段内吸热器局部热流超限。")
-                up_prev = st.file_uploader("上一周期已执行的瞄准方案", type=["csv"], key="s_prev",
-                                           help="导入上一周期方案 CSV，按定日镜 ID 匹配后用于限制动作幅度。")
+        with _card("aps_initial"):
+            up_prev = _initial_state_inputs(case)
         with _card("aps_goal"):
-            _section(2, "优化目标", "λ 是均匀性的重要性超参数：λ = 0 只追求功率，λ 越大越重视受热均匀。")
+            _section(3, "优化目标", "λ 是均匀性的重要性超参数：λ = 0 只追求功率，λ 越大越重视受热均匀。")
             uni = data.setdefault("uniformity", {})
             current = case.uniformity.mode if case.uniformity.enabled else "power"
             goal = st.radio("目标", list(GOALS), index=list(GOALS).index(current), format_func=GOALS.get,
@@ -1736,7 +1786,7 @@ def page_aps(case) -> None:
                          f"{'λ = %g' % done.uniformity.weight if done.uniformity.enabled and done.uniformity.mode == 'weighted' else ('CV ≤ %g' % done.uniformity.max_cv if done.uniformity.enabled else '功率优先')}，"
                          f"安全裕度 {done.aps.safety_margin:.0%}）。可以在“调整参数”里改回，或重新计算。")
             _aps_results(res)
-    _pareto_section(case, f"{date} {tm}", dni_src, up_now)
+    _pareto_section(case, f"{date} {tm}", dni_src, up_now, up_prev)
     _scenario_check_section(case)
 
 
@@ -1751,7 +1801,7 @@ def _scenario_table(case_yaml: str, base_dir: str):
 def _scenario_check_section(case) -> None:
     """Task 1 for one annual scenario (sun + site DNI map) on the current field: the check of a layout score."""
     with _card("aps_scenario"):
-        _section(4, "年度工况复核（问题二的工况与 DNI 地图）",
+        _section(5, "年度工况复核（问题二的工况与 DNI 地图）",
                  "从年度工况集中选一个工况：太阳位置与场地 DNI 地图都来自工况集，各镜按自己的位置读 DNI。"
                  "求解设置与布局正式排名相同，所得 P、U 与布局工作区该工况的记录逐位一致。")
         try:
@@ -1886,7 +1936,8 @@ def _aps_results(res: dict) -> None:
     st.dataframe(aims_top[["id", "x", "y", "瞄准状态", "aim_azimuth_deg", "aim_z", "dni_w_m2", "p_receiver_kw"]].rename(columns={
         "id": "镜子 ID", "x": "x 东 (m)", "y": "y 北 (m)", "active": "工作", "aim_azimuth_deg": "瞄准方位 (°)",
         "aim_z": "瞄准高度 (m)", "dni_w_m2": "DNI (W/m²)", "p_receiver_kw": "送达功率 (kW)"}), hide_index=True, height=220)
-    tabs = st.tabs(["吸热器热流与瞄准点", "三维瞄准示意", "镜场", "最优性证书", "效率与损失", "逐镜方案"])
+    tabs = st.tabs(["吸热器热流与瞄准点", "单镜详情", "镜场与效率", "初始状态与移动", "三维瞄准示意", "最优性证书",
+                    "效率与损失", "逐镜方案"])
     with tabs[0]:
         _full_field_flux(case, snap, chk)
         _section(None, "瞄准点与光斑（叠加在同一张热流图上）",
@@ -1905,38 +1956,37 @@ def _aps_results(res: dict) -> None:
                    "入射角与截获比例。点图例“光斑轮廓”可按真实尺寸画出每个光斑的 2σ 椭圆。"
                    "横轴按罗盘方位展开圆柱面：北 0°、东 90°。")
     with tabs[1]:
+        _mirror_inspector(case, res)
+    with tabs[2]:
+        _field_efficiency(case, res)
+    with tabs[3]:
+        _moves_tab(case, res)
+    with tabs[4]:
         l, r = st.columns(2)
         with l:
-            _chart(aim_scene_3d(case, fld.xyz, snap.dni, snap.aim_azimuth, snap.aim_z, snap.active,
-                                sun_angles=(snap.sun_elevation, snap.sun_azimuth), beam_power=snap.power["intercept"],
-                                shadow_fraction=snap.tower_fraction,
-                                title="镜面中心 → 瞄准点（抽样光束，镜子按 DNI 着色）"), "s_scene3d")
+            _chart(_viewport(aim_scene_3d(case, fld.xyz, snap.dni, snap.aim_azimuth, snap.aim_z, snap.active,
+                                          sun_angles=(snap.sun_elevation, snap.sun_azimuth), beam_power=snap.power["intercept"],
+                                          shadow_fraction=snap.tower_fraction,
+                                          title="镜面中心 → 瞄准点（抽样光束，镜子按 DNI 着色）"), 520), "s_scene3d")
         with r:
-            _chart(receiver_aims_3d(case, snap.grid, snap.flux, fld.xyz, snap.aim_azimuth, snap.aim_z, snap.active,
-                                    snap.dni, fld.ids, beam_power=snap.power["intercept"], title="吸热器近景：入射热流与全部瞄准点"), "s_rec3d")
-    with tabs[2]:
-        color_by = st.radio("着色", ["DNI", "瞄准高度", "光学效率"], horizontal=True, key="s_field_color")
-        vals, label, scale = {"DNI": (snap.dni, "DNI (W/m²)", "Blues"),
-                              "瞄准高度": (snap.aim_z, "瞄准高度 z (m)", "RdBu"),
-                              "光学效率": (snap.eta_total, "光学效率", "Viridis")}[color_by]
-        _chart(field_map(case, fld.xyz, fld.ids, values=vals, label=label, colorscale=scale,
-                         title=f"镜场 · 按{color_by}着色（× 为散焦镜面）", inactive=~snap.active,
-                         sun_angles=(snap.sun_elevation, snap.sun_azimuth), shadow_fraction=snap.tower_fraction), "s_field")
-        if snap.tower_fraction is not None and snap.tower_fraction.any():
-            st.caption(f"紫色区域为塔影在镜轴高度处的投影。全遮挡且保持瞄准 {sum(snap.active & (snap.tower_fraction == 1))} 面，"
-                       f"部分遮挡 {sum((snap.tower_fraction > 0) & (snap.tower_fraction < 1))} 面。悬停可查看逐镜遮挡比例。")
-    with tabs[3]:
+            _chart(_viewport(receiver_aims_3d(case, snap.grid, snap.flux, fld.xyz, snap.aim_azimuth, snap.aim_z, snap.active,
+                                              snap.dni, fld.ids, beam_power=snap.power["intercept"],
+                                              title="吸热器近景：入射热流与全部瞄准点"), 520), "s_rec3d")
+        st.caption("想看某一面镜的完整光路（太阳光 → 镜面 → 光斑）和它的工作数据，请到“单镜详情”点选那面镜。")
+    with tabs[5]:
         _certificate_tab(res, cert)
-    with tabs[4]:
+    with tabs[6]:
         _chart(loss_waterfall(s["power_mw"]), "s_waterfall")
         st.dataframe(pd.DataFrame({"效率": s["field_efficiency"]}).T.rename(columns=LOSS_ZH), hide_index=True)
-    with tabs[5]:
+    with tabs[7]:
         aims = pd.read_csv(res["files"]["aims_csv"])
-        st.dataframe(aims[["id", "x", "y", "active", "aim_azimuth_deg", "aim_z", "aim_x", "aim_y", "dni_w_m2",
-                           "p_receiver_kw"]].rename(columns={
+        cols = ["id", "x", "y", "active", "aim_azimuth_deg", "aim_z", "aim_x", "aim_y", "dni_w_m2", "p_receiver_kw"]
+        cols += [c for c in ("initial_aim_z", "aim_shift_m", "rotation_deg") if c in aims]
+        st.dataframe(aims[cols].rename(columns={
             "id": "镜子 ID", "x": "x (m)", "y": "y (m)", "active": "工作", "aim_azimuth_deg": "瞄准方位 (°)",
             "aim_z": "瞄准高度 (m)", "aim_x": "瞄准点 x", "aim_y": "瞄准点 y", "dni_w_m2": "DNI (W/m²)",
-            "p_receiver_kw": "送达功率 (kW)"}), hide_index=True, height=360)
+            "p_receiver_kw": "送达功率 (kW)", "initial_aim_z": "初始瞄准高度 (m)", "aim_shift_m": "瞄准点移动 (m)",
+            "rotation_deg": "镜面转角 (°)"}), hide_index=True, height=360)
         _show_files(res, images=[])
 
 
@@ -2068,11 +2118,347 @@ def _full_field_flux(case, snap, chk: dict | None) -> None:
     _chart(tradeoff_profiles(flux, 0, labels=["本方案"]), "s_full_profiles")
 
 
-def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
+INITIAL_SOURCE_ZH = {"working_state": "上传的运行方案", "spread": "均布瞄准", "kfactor": "瞄准因子", "center": "全部瞄中心"}
+
+
+def _aims_table(res: dict) -> pd.DataFrame:
+    key = ("aims_table", str(res["files"]["aims_csv"]))
+    cache = st.session_state.setdefault("_aims_cache", {})
+    if key not in cache:
+        cache.clear()
+        cache[key] = pd.read_csv(res["files"]["aims_csv"])
+    return cache[key]
+
+
+def _initial_arrays(res: dict):
+    aims = _aims_table(res)
+    if "initial_aim_z" not in aims:
+        return None
+    return (aims["initial_aim_azimuth_deg"].to_numpy(float), aims["initial_aim_z"].to_numpy(float),
+            aims["initial_active"].to_numpy(bool))
+
+
+def _take_selection(event, ids) -> None:
+    """A click on a mirror of a field map selects it for the inspector (once per new selection)."""
+    try:
+        points = event["selection"]["points"] if event else []
+    except (KeyError, TypeError):
+        points = []
+    sig = repr([(p.get("curve_number"), p.get("point_index")) for p in points])
+    if not points or st.session_state.get("_insp_sig") == sig:
+        return
+    st.session_state["_insp_sig"] = sig
+    cd = points[0].get("customdata")
+    if isinstance(cd, (list, tuple)):
+        cd = cd[0] if cd else None
+    if cd is not None and int(cd) in set(np.asarray(ids).tolist()):
+        st.session_state["insp_id"] = int(cd)
+
+
+def _inspected_index(fld, default: int) -> int:
+    ids = np.asarray(fld.ids)
+    want = st.session_state.get("insp_id")
+    k = np.flatnonzero(ids == want) if want is not None else np.zeros(0, int)
+    return int(k[0]) if k.size else int(default)
+
+
+def _mirror_inspector(case, res: dict) -> None:
+    """Pick a mirror (click on the map, its ID, or a quick pick) and see its light path in 3-D and its numbers."""
+    from cspaps.gui_plots import mirror_closeup_3d, mirror_factor_chart, mirror_path_3d, mirror_spot_map
+    from cspaps.simulate import mirror_detail, occlusion_detail
+
+    snap, fld = res["snapshot"], res["field"]
+    ids = np.asarray(fld.ids)
+    initial = _initial_arrays(res)
+    eta = snap.eta_total
+    on = np.asarray(snap.active, bool)
+    lit = on & (snap.power["sun"] > 0)
+    dist = np.hypot(fld.xyz[:, 0] - case.receiver.center[0], fld.xyz[:, 1] - case.receiver.center[1])
+    picks = {"效率最高": np.where(lit, eta, -np.inf).argmax(), "效率最低": np.where(lit, eta, np.inf).argmin(),
+             "送达功率最大": snap.power["intercept"].argmax(), "离塔最远": dist.argmax(), "离塔最近": dist.argmin()}
+    if initial is not None:
+        shift = _aims_table(res)["aim_shift_m"].to_numpy(float)
+        picks["移动最大"] = int(np.where(on & initial[2], shift, -1).argmax())
+    _section(None, "单镜详情：点一面镜，看它的光路和工作数据",
+             "在左边镜场图上点任意一面镜（或输入编号、用快捷按钮），右边画出这面镜的三维光路："
+             "太阳光 → 镜面（按实际法向摆放）→ 反射光束与 2σ 包络 → 吸热器上的光斑；"
+             + ("有初始状态时同时画出初始瞄准点和移动。" if initial is not None else "") +
+             "下面列出它的效率链、功率、光斑与姿态，并与全场平均比较。")
+    i = _inspected_index(fld, picks["送达功率最大"])
+    left, right = st.columns([1, 1.6])
+    with left:
+        b = st.columns(3)
+        for j, (label, k) in enumerate(picks.items()):
+            if b[j % 3].button(label, key=f"insp_pick_{j}", width="stretch"):
+                st.session_state["insp_id"] = int(ids[int(k)])
+                st.rerun()
+        typed = st.number_input("镜子 ID", value=int(ids[i]), step=1, help="输入编号后回车；也可以直接点下面镜场图上的镜子。")
+        if int(typed) != int(ids[i]) and int(typed) in set(ids.tolist()):
+            st.session_state["insp_id"] = int(typed)
+            st.rerun()
+        fig = field_map(case, fld.xyz, fld.ids, values=eta, label="光学效率", colorscale="Viridis", selected=int(ids[i]),
+                        title="点一面镜查看详情（颜色 = 光学效率）", inactive=~on)
+        fig.update_layout(height=470, clickmode="event+select")
+        ev = _chart(fig, "insp_map", on_select="rerun", selection_mode="points")
+        _take_selection(ev, ids)
+    d = mirror_detail(case, snap, fld.xyz, i, initial)
+    occ = occlusion_detail(case, snap, fld.xyz, i)
+    with right:
+        view = st.radio("视图", ["全光路（太阳 → 镜面 → 吸热器）", "镜面近景（阴影与遮挡）"], horizontal=True,
+                        key="insp_view", label_visibility="collapsed")
+        if view.startswith("全光路"):
+            _chart(mirror_path_3d(case, d, fld.xyz, snap.grid, snap.flux, mirror_id=int(ids[i]), height=600,
+                                  title=f"镜 {int(ids[i])} 的光路 · 真实比例 · 视线垂直于入射面"), "insp_3d")
+        else:
+            _chart(mirror_closeup_3d(case, d, occ, fld.xyz, mirror_id=int(ids[i]), height=600,
+                                     title=f"镜 {int(ids[i])} 近景 · 相邻镜子按各自瞄准点摆放"), "insp_close")
+        lost = occ["lost_shading"] + occ["lost_blocking"]
+        st.caption(f"镜面上 {occ['n_points']} 个采样点：被相邻镜子或塔挡住阳光 {occ['lost_shading']:.0%}，"
+                   f"反射光被相邻镜子挡住 {occ['lost_blocking']:.0%}（合计损失 {lost:.0%}）；"
+                   f"给它投阴影的镜子 {len(occ['shaders'])} 面、挡它反射光的镜子 {len(occ['blockers'])} 面。"
+                   f"求解时每面镜用 {case.shading.n_points}×{case.shading.n_points} 个点，阴影×遮挡 = "
+                   f"{d['eta']['shading'] * d['eta']['blocking']:.3f}。"
+                   + ("单面镜的数值随采样点数会有出入（同一套射线测试，点更密就更准；全场平均差得很少），"
+                      "需要更准时可在“参数设置 → 阴影与遮挡”加密每边采样点数。"
+                      if abs((1 - d['eta']['shading'] * d['eta']['blocking']) - lost) > 0.05 else ""))
+    rank = d["rank"]
+    ini = d.get("initial")
+    _kpis([
+        ("光学效率（利用率）", f"{d['eta_total']:.3f}", "",
+         f"全场平均 {d['field_mean_total']:.3f}" + (f" · 高于 {rank:.0%} 的工作镜" if rank is not None else "")
+         + (f" · 塔影遮挡 {d['tower_fraction']:.0%}" if d["tower_fraction"] > 0 else ""),
+         "good" if d["eta_total"] >= d["field_mean_total"] else "warn"),
+        ("送达吸热器", f"{d['power_w']['intercept'] / 1e3:.1f}", "kW",
+         f"吸收 {d['absorbed_w'] / 1e3:.1f} kW · 占全场 {1000 * d['share']:.2f}‰"),
+        ("瞄准点", f"{d['aim_azimuth_deg']:.1f}° / {d['aim_z']:.2f} m", "",
+         f"第 {d['panel']} 管屏 · " + ("工作" if d["active"] else "散焦"), "" if d["active"] else "bad"),
+        ("光斑（2σ）", f"{d['spot_width_m']:.1f} × {d['spot_height_m']:.1f}", "m",
+         f"σ {d['sigma_m']:.2f} m · 斜距 {d['slant_m']:.0f} m"),
+        ("相对初始状态", f"{ini['shift_m']:.2f}" if ini else "—", "m" if ini else "",
+         f"镜面转 {ini['rotation_deg']:.2f}° · 初始 {ini['aim_azimuth_deg']:.1f}° / {ini['aim_z']:.2f} m" if ini else "本次没有初始状态"),
+    ])
+    a, b = st.columns([1, 1])
+    with a:
+        st.markdown("**效率链：本镜（柱）与全场平均（竖线）**")
+        _chart(mirror_factor_chart(d, height=300), "insp_factors")
+        worst = min(FACTOR_ZH, key=lambda k: d["eta"][k] - d["field_mean"][k])
+        best = max(FACTOR_ZH, key=lambda k: d["eta"][k] - d["field_mean"][k])
+        st.caption(f"比全场平均差得最多的是{FACTOR_ZH[worst]}（{d['eta'][worst]:.3f} 对 {d['field_mean'][worst]:.3f}），"
+                   f"好得最多的是{FACTOR_ZH[best]}（{d['eta'][best]:.3f} 对 {d['field_mean'][best]:.3f}）。")
+    with b:
+        st.markdown("**光斑在吸热器上的位置（底图 = 全场叠加热流）**")
+        _chart(mirror_spot_map(case, snap.grid, snap.flux, d, height=330), "insp_spot")
+    p = d["power_w"]
+    rows = [("位置 x / y / z", f"{d['xyz'][0]:.2f} / {d['xyz'][1]:.2f} / {d['xyz'][2]:.2f} m"),
+            ("离塔距离 · 方位", f"{d['distance_m']:.1f} m · {d['bearing_deg']:.0f}°（{_compass_zh(d['bearing_deg'])}）"),
+            ("DNI", f"{d['dni_w_m2']:.0f} W/m²"),
+            ("镜面法向", f"方位 {d['normal_azimuth_deg']:.1f}° · 仰角 {d['normal_elevation_deg']:.1f}°"),
+            ("太阳入射角", f"{d['incidence_deg']:.2f}°（余弦 {d['eta']['cosine']:.4f}）"),
+            ("塔影遮挡", f"{d['tower_fraction']:.0%}"),
+            ("功率链 (kW)", " → ".join(f"{STAGE_ZH.get(k, k)} {p[k] / 1e3:.1f}" for k in STAGES)),
+            ("吸收率", f"{d['alpha']:.3f}（吸收 {d['absorbed_w'] / 1e3:.2f} kW）"),
+            ("光斑入射角（吸热面）", f"{d['spot_incidence_deg']:.1f}°")]
+    if ini:
+        rows += [("初始瞄准点", f"{ini['aim_azimuth_deg']:.2f}° / {ini['aim_z']:.2f} m（{'工作' if ini['active'] else '散焦'}）"),
+                 ("瞄准点移动 · 镜面转角", f"{ini['shift_m']:.3f} m · {ini['rotation_deg']:.3f}°")]
+    st.markdown('<div class="cs-spec">' + "".join(f'<div class="r"><span>{escape(k)}</span><b>{escape(v)}</b></div>'
+                                                 for k, v in rows) + "</div>", unsafe_allow_html=True)
+
+
+FACTOR_ZH = {"cosine": "余弦", "reflectivity": "反射×清洁", "shading": "阴影", "blocking": "遮挡", "attenuation": "大气衰减",
+             "intercept": "截断"}
+STAGE_ZH = {"sun": "镜面入射", "cosine": "余弦后", "reflectivity": "反射后", "shading": "阴影后", "blocking": "遮挡后",
+            "attenuation": "大气后", "intercept": "送达"}
+
+
+def _compass_zh(bearing: float) -> str:
+    names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+    return names[int(((bearing % 360.0) + 22.5) // 45) % 8]
+
+
+def _field_efficiency(case, res: dict) -> None:
+    """Field map coloured by the optical efficiency or one of its factors, and where the differences come from."""
+    snap, fld = res["snapshot"], res["field"]
+    _section(None, "镜场与效率：每面镜的光学效率（利用率）从哪里来",
+             "光学效率 = 送达吸热器的功率 ÷ 镜面接收的太阳功率（DNI × 镜面积）"
+             " = 余弦 × 反射率×清洁度 × 阴影 × 遮挡 × 大气衰减 × 截断。选一项着色看它在镜场上的分布；点一面镜可在“单镜详情”看它的光路。")
+    eta = snap.eta
+    opts = {"光学效率（利用率）": (snap.eta_total, "光学效率", "Viridis"), "余弦效率": (eta["cosine"], "余弦", "Viridis"),
+            "阴影 × 遮挡": (eta["shading"] * eta["blocking"], "阴影×遮挡", "Viridis"),
+            "大气衰减": (eta["attenuation"], "大气衰减", "Viridis"), "截断效率": (eta["intercept"], "截断", "Viridis"),
+            "DNI": (snap.dni, "DNI (W/m²)", "Blues"), "瞄准高度": (snap.aim_z, "瞄准高度 z (m)", "RdBu")}
+    initial = _initial_arrays(res)
+    if initial is not None:
+        opts["瞄准点移动"] = (_aims_table(res)["aim_shift_m"].to_numpy(float), "移动 (m)", "Magma")
+    pick = st.radio("着色", list(opts), horizontal=True, key="s_field_color")
+    vals, label, scale = opts[pick]
+    on = np.asarray(snap.active, bool)
+    v = np.where(on | (pick in ("DNI", "瞄准高度", "瞄准点移动")), vals, np.nan)
+    sel = st.session_state.get("insp_id")
+    fig = field_map(case, fld.xyz, fld.ids, values=v, label=label, colorscale=scale,
+                    title=f"镜场 · 按{pick}着色（× 为散焦镜面）", inactive=~on, selected=sel,
+                    sun_angles=(snap.sun_elevation, snap.sun_azimuth), shadow_fraction=snap.tower_fraction)
+    ev = _chart(fig, "s_field", on_select="rerun", selection_mode="points")
+    _take_selection(ev, fld.ids)
+    if snap.tower_fraction is not None and snap.tower_fraction.any():
+        st.caption(f"紫色区域为塔影在镜轴高度处的投影。全遮挡且保持瞄准 {sum(snap.active & (snap.tower_fraction == 1))} 面，"
+                   f"部分遮挡 {sum((snap.tower_fraction > 0) & (snap.tower_fraction < 1))} 面。悬停可查看逐镜遮挡比例。")
+    _efficiency_breakdown(case, snap, fld)
+
+
+def _efficiency_breakdown(case, snap, fld) -> None:
+    """Mean of every efficiency factor by distance band and by compass side, with the reason in words."""
+    on = np.asarray(snap.active, bool) & (snap.power["sun"] > 0)
+    if on.sum() < 10:
+        return
+    rec = case.receiver
+    dx, dy = fld.xyz[:, 0] - rec.center[0], fld.xyz[:, 1] - rec.center[1]
+    dist = np.hypot(dx, dy)
+    bearing = np.degrees(np.arctan2(dx, dy)) % 360.0
+    varies = [k for k in FACTOR_ZH if np.ptp(snap.eta[k][on]) > 1e-9]  # reflectivity x cleanliness is one number
+    eta = {k: snap.eta[k] for k in varies}
+    total = snap.eta_total
+
+    def row(mask, name):
+        return {"分组": name, "镜数": int(mask.sum()), **{FACTOR_ZH[k]: round(float(eta[k][mask].mean()), 3) for k in varies},
+                "光学效率": round(float(total[mask].mean()), 3)}
+
+    edges = np.unique(np.round(np.quantile(dist[on], np.linspace(0, 1, 6)), 0))
+    by_dist = [row(on & (dist >= a) & (dist <= b), f"{a:.0f}–{b:.0f} m") for a, b in zip(edges[:-1], edges[1:])]
+    sector = (((bearing + 22.5) // 45) % 8).astype(int)
+    names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+    by_side = [row(on & (sector == s), f"{names[s]}侧") for s in range(8) if (on & (sector == s)).sum()]
+    near = on & (dist <= np.quantile(dist[on], 1 / 3))
+    far = on & (dist >= np.quantile(dist[on], 2 / 3))
+    beat = float((total[far] > np.median(total[near])).mean()) if far.any() and near.any() else 0.0
+    cos_side = {r["分组"]: r.get("余弦", 1.0) for r in by_side}
+    best_cos, worst_cos = max(cos_side, key=cos_side.get), min(cos_side, key=cos_side.get)
+    sun_az = snap.sun_azimuth % 360.0
+    parts = [f"此刻太阳在方位 {sun_az:.0f}°（{_compass_zh(sun_az)}）、高度角 {snap.sun_elevation:.0f}°。"
+             f"余弦效率取决于镜子相对塔和太阳的方位，而不是距离：{best_cos}最高（{cos_side[best_cos]:.3f}），"
+             f"{worst_cos}最低（{cos_side[worst_cos]:.3f}）。"]
+    if "attenuation" in varies:
+        att = [r["大气衰减"] for r in by_dist]
+        parts.append(f"离塔越远大气衰减越多（近 {att[0]:.3f} → 远 {att[-1]:.3f}）")
+    if "intercept" in varies:
+        icp = [r["截断"] for r in by_dist]
+        parts.append(f"，截断随光斑大小变化（各距离段 {min(icp):.3f}–{max(icp):.3f}）")
+    parts.append("。")
+    for key, word in (("blocking", "遮挡"), ("shading", "阴影")):
+        if key in varies:
+            vals = [r[FACTOR_ZH[key]] for r in by_dist]
+            if max(vals) - min(vals) > 0.01:
+                mono = all(a >= b for a, b in zip(vals, vals[1:])) or all(a <= b for a, b in zip(vals, vals[1:]))
+                parts.append(f"{word}由局部镜距、太阳高度和瞄准高度决定，各距离段在 {min(vals):.3f}–{max(vals):.3f} 之间"
+                             + ("。" if mono else "，并不随距离单调变化。"))
+    # the best outer side against the worst inner side: what makes "far but better" visible
+    side_of = lambda mask: {names[s_]: float(total[mask & (sector == s_)].mean())  # noqa: E731
+                            for s_ in range(8) if (mask & (sector == s_)).sum() >= 5}
+    outer, inner = side_of(far), side_of(near)
+    if outer and inner:
+        o_best, i_worst = max(outer, key=outer.get), min(inner, key=inner.get)
+        if outer[o_best] > inner[i_worst]:
+            parts.append(f"外圈{o_best}侧的镜子平均 {outer[o_best]:.3f}，高于内圈{i_worst}侧的 {inner[i_worst]:.3f}。")
+    parts.append(f"外圈三分之一的镜子里有 {beat:.0%} 比内圈三分之一的中位数还高"
+                 + ("——这是几何关系，不是计算错误。" if beat >= 0.05 else
+                    "；此刻距离带来的大气与遮挡损失占上风，太阳偏低、方位差别大时这个比例更高。")
+                 + "下表是各距离段、各方位的平均值；在“单镜详情”的镜面近景里能看到具体是哪几面相邻镜子挡住了它。")
+    _callout("info", "为什么有些远处的镜子效率反而更高", "".join(parts))
+    a, b = st.columns(2)
+    with a:
+        st.markdown("**按离塔距离（各段镜数相同）**")
+        st.dataframe(pd.DataFrame(by_dist), hide_index=True)
+    with b:
+        st.markdown("**按镜子所在方位**")
+        st.dataframe(pd.DataFrame(by_side), hide_index=True)
+
+
+def _moves_tab(case, res: dict) -> None:
+    """Where the plan started, how far every mirror moved, and the flux before / after."""
+    import plotly.graph_objects as go
+
+    s, snap, fld = res["summary"], res["snapshot"], res["field"]
+    init, moves = s.get("initial_state"), s.get("moves")
+    if not init or not moves:
+        st.info("本次没有初始状态：方案从零开始（初始瞄准方案设为“不设初始状态”，或用了中心瞄准）。"
+                "上传当前运行的瞄准方案，或选择“均布瞄准”作为初始瞄准方案，就能看到每面镜的移动。")
+        return
+    src = INITIAL_SOURCE_ZH.get(init["source"], init["source"])
+    _section(None, f"初始状态：{src}",
+             "方案从这个状态出发，镜子离开初始瞄准点要付移动代价；设了移动上限时，超过上限的瞄准点不可选（硬约束）。")
+    lim = []
+    if moves["max_aim_shift_m"] > 0:
+        lim.append(f"瞄准点 ≤ {moves['max_aim_shift_m']:g} m")
+    if moves["max_rotation_deg_limit"] > 0:
+        lim.append(f"镜面转角 ≤ {moves['max_rotation_deg_limit']:g}°")
+    dp = s["absorbed_power_mw"] - init["absorbed_power_mw"]
+    _kpis([
+        ("移动的镜子", f"{moves['n_moved']:,}", "面", f"共 {moves['n_mirrors']:,} 面 · 移动 > {moves['moved_tol_m']:g} m 才计"
+         + (f" · 新散焦 {moves['n_switched_off']} 面" if moves["n_switched_off"] else "")),
+        ("瞄准点移动", f"{moves['mean_shift_m']:.2f}", "m", f"平均 · 95% 分位 {moves['p95_shift_m']:.2f} m · 最大 {moves['max_shift_m']:.2f} m"),
+        ("镜面转角", f"{moves['mean_rotation_deg']:.3f}", "°", f"平均 · 95% 分位 {moves['p95_rotation_deg']:.3f}° · 最大 {moves['max_rotation_deg']:.3f}°"
+         + (f" · 最长转动 {moves['max_slew_time_s']:.0f} s" if "max_slew_time_s" in moves else "")),
+        ("移动约束", "满足" if moves["within_limits"] else f"{moves['n_outside_limits']} 面超限",
+         "", "；".join(lim) if lim else f"未设上限 · 移动代价 {moves['move_penalty_per_m']:g} / m",
+         "good" if moves["within_limits"] else "bad"),
+        ("吸收功率变化", f"{dp:+.2f}", "MW", f"初始 {init['absorbed_power_mw']:.2f} → 本方案 {s['absorbed_power_mw']:.2f} MW"),
+    ])
+    st.caption(f"初始状态：峰值 {init['peak_flux_kw_m2']:.0f} kW/m²（评价网格）· 二维 CV {init['cv_2d']:.3f} · "
+               f"高度 CV {init['cv_height']:.3f}；本方案：峰值 {s['peak_flux_kw_m2']:.0f} kW/m² · 二维 CV {s['cv_2d']:.3f} · "
+               f"高度 CV {s['cv_height']:.3f}。")
+    snap0 = res.get("initial_snapshot")
+    if snap0 is not None:
+        zmax = float(max(snap0.flux.max(), snap.flux.max())) / 1e3
+        a, b = st.columns(2)
+        with a:
+            _chart(receiver_map(case, snap0.grid, snap0.flux, f"初始状态（{src}）的热流", zmax=zmax, height=360), "mv_flux0")
+        with b:
+            _chart(receiver_map(case, snap.grid, snap.flux, "本方案的热流（同一色标）", zmax=zmax, height=360), "mv_flux1")
+    initial = _initial_arrays(res)
+    shift = _aims_table(res)["aim_shift_m"].to_numpy(float)
+    a, b = st.columns([1.3, 1])
+    with a:
+        _chart(receiver_aims_map(case, snap.grid, snap.flux, snap.aim_azimuth, snap.aim_z, snap.active, fld.ids,
+                                 shift, "移动 (m)", prev=initial, height=420,
+                                 title="瞄准点：本方案（点，按移动距离着色）与自初始状态的移动（线）"), "mv_aims")
+    with b:
+        both = np.asarray(snap.active, bool) & initial[2]
+        fig = go.Figure(go.Histogram(x=shift[both], nbinsx=40, marker_color="#14806f"))
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10), title="瞄准点移动距离的分布",
+                          xaxis_title="移动 (m)", yaxis_title="镜数", template="plotly_white", bargap=0.05)
+        _chart(fig, "mv_hist")
+
+
+def _initial_state_inputs(case):
+    """Card 2 of the aim page: where the plan starts (working state or generated initial plan) and what
+    moving a mirror away from it costs / is allowed. Returns the uploaded working state (or None)."""
+    _section(2, "初始状态与镜面移动",
+             "方案从镜场当前的瞄准状态出发：镜子离开初始瞄准点要付“移动代价”，可以再设移动上限作为硬约束。"
+             "这样 λ = 0 时得到的是初始状态附近功率最高的方案，而不是每面镜各自跑到单镜功率最大的位置（常常全部挤到吸热器上部）。")
+    up_prev = st.file_uploader("当前运行的瞄准方案（可选，CSV：id, aim_azimuth_deg, aim_z[, active]）", type=["csv"],
+                               key="s_prev", help="镜场正在执行的瞄准方案，按定日镜 ID 匹配。本程序导出的“逐镜瞄准方案 CSV”可直接用。"
+                                                  "上传后以它为初始状态，下面的移动代价和移动上限都相对它计算。")
+    if up_prev is None:
+        _fields("aps", ["initial_aim"], n_cols=1)
+        if (case.aps.initial_aim if case else "spread") == "none":
+            _callout("warn", "没有初始状态", "λ = 0 时每面镜各自选单镜功率最大的瞄准点。本站遮挡较重时，抬高瞄准点能少被前排挡住，"
+                     "方案会把大部分镜子集中到吸热器上部；移动代价与移动上限都不起作用。")
+    else:
+        st.caption("以上传的运行方案为初始状态（覆盖“初始瞄准方案”的设置）。结果页会列出每面镜的移动距离和镜面转角。")
+    _fields("aps", ["move_penalty_per_m", "max_aim_shift_m", "max_rotation_deg"], n_cols=3)
+    if case is not None and case.aps.move_penalty_per_m > 0:
+        mu = case.aps.move_penalty_per_m
+        span = 0.5 * case.receiver.height * case.aps.height_span
+        st.caption(f"移动代价 {mu:g}：瞄准点每移动 1 m，该镜要多换来 {100 * mu:.2g}% 的功率才值得动；"
+                   f"从中心移到最高候选点（{span:.1f} m）要多 {100 * mu * span:.2g}%。")
+    return up_prev
+
+
+def _pareto_section(case, stamp: str, dni_src: str, up_now, up_prev=None) -> None:
     with _card("pareto"):
-        _section(3, "功率–均匀度权衡曲线",
-                 "同一时刻、同一 DNI 分布下扫描均匀度权重 λ。每个点都是经过细网格通量复核、带最优性差距的方案，"
-                 "可用于选择合适的 λ。")
+        _section(4, "功率–均匀度权衡曲线",
+                 "同一时刻、同一 DNI 分布下扫描均匀度权重 λ。每个点都从同一个初始状态出发、对移动计同样的代价，"
+                 "经过细网格通量复核并带最优性差距，可用于选择合适的 λ。")
         c1, c2 = st.columns([2, 1])
         lam_txt = c1.text_input("λ 序列（逗号分隔）", "0, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0", key="pareto_lams")
         try:
@@ -2084,6 +2470,7 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
             _job_button("pareto", "计算权衡曲线", wf.task_pareto, stamp, lambdas=lambdas,
                         blockers=["请上传当前镜场 DNI 分布"] if dni_src == "upload" and up_now is None else None,
                         dni_map=_save_upload(up_now) if (dni_src == "upload" and up_now) else None,
+                        prev_aims=_save_upload(up_prev) if up_prev else None,
                         dni_source="cloud" if dni_src == "cloud" else "site", progress=True)
         _job_error("pareto")
         res = st.session_state.get("res_pareto")

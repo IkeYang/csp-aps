@@ -385,14 +385,16 @@ def local_search(prob, state, mu: float, passes: int, absorb_power: np.ndarray, 
 
 @_jit
 def _greedy_pass(order, available, ptr, cells, resp, n_k, dni_con, limit, score_all, p_ref, tol, reach,
-                 allow_defocus, choice, flux, counts):
+                 allow_defocus, choice, flux, counts, tie_first):
     """``aps.solve_greedy``'s ``reassign`` over ``order``, in place: take the heliostat's beam out, ``choose`` the
-    best flux-feasible candidate (ties: lowest peak ratio), put it back. counts += (moves, flux-limited steps).
-    Same float32 constraint basis, comparisons and divisions as the numpy code (no sums), so bit-identical."""
+    best flux-feasible candidate (ties: smallest ``tie_first`` when given, then lowest peak ratio), put it back.
+    counts += (moves, flux-limited steps). Same float32 constraint basis, comparisons and divisions as the numpy
+    code (no sums), so bit-identical."""
     f32_cut = np.float32(1e-3)
     ratio = np.empty(n_k)
     feasible = np.empty(n_k, dtype=np.bool_)
     has_reach = reach.shape[0] > 0
+    has_tie = tie_first.shape[0] > 0
     for i in order:
         a = ptr[i]
         n_s = ptr[i + 1] - a
@@ -452,7 +454,13 @@ def _greedy_pass(order, available, ptr, cells, resp, n_k, dni_con, limit, score_
                 best_k = -1
                 for k in range(n_k):
                     if feasible[k] and score_all[i, k] >= cut:
-                        if best_k < 0 or ratio[k] < ratio[best_k]:
+                        if best_k < 0:
+                            best_k = k
+                        elif has_tie:
+                            if tie_first[i, k] < tie_first[i, best_k] or (
+                                    tie_first[i, k] == tie_first[i, best_k] and ratio[k] < ratio[best_k]):
+                                best_k = k
+                        elif ratio[k] < ratio[best_k]:
                             best_k = k
             elif allow_defocus:
                 best_k = -1
@@ -472,7 +480,7 @@ def _greedy_pass(order, available, ptr, cells, resp, n_k, dni_con, limit, score_
 
 
 def greedy_pass(prob, order, choice: np.ndarray, flux: np.ndarray, score_all: np.ndarray, p_ref: np.ndarray,
-                tol: float, stats: dict) -> None:
+                tol: float, stats: dict, tie_first: np.ndarray | None = None) -> None:
     """Compiled ``reassign`` over ``order`` (``aps.solve_greedy``); ``choice``, ``flux`` and ``stats`` in place."""
     ptr, cells, resp = packed_responses(prob.rs)
     reach = np.ascontiguousarray(prob.reach, dtype=np.bool_) if prob.reach is not None else np.zeros((0, 0), np.bool_)
@@ -481,6 +489,7 @@ def greedy_pass(prob, order, choice: np.ndarray, flux: np.ndarray, score_all: np
                  ptr, cells, resp, int(prob.k), np.ascontiguousarray(prob.dni_con, dtype=float),
                  np.ascontiguousarray(prob.limit, dtype=float), np.ascontiguousarray(score_all, dtype=float),
                  np.ascontiguousarray(p_ref, dtype=float), float(tol), reach, bool(prob.case.aps.allow_defocus),
-                 choice, flux, counts)
+                 choice, flux, counts,
+                 np.ascontiguousarray(tie_first, dtype=float) if tie_first is not None else np.zeros((0, 0)))
     stats["moves"] += int(counts[0])
     stats["flux_limited"] += int(counts[1])

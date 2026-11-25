@@ -157,7 +157,15 @@ class APSSpec:
     azimuth_offsets_deg: list[float] = dc_field(default_factory=lambda: [-4.0, 0.0, 4.0])
     passes: int = 3  # improvement passes after the greedy construction
     tie_tolerance: float = 0.005  # candidates within this power fraction count as ties
-    move_penalty_per_m: float = 0.0  # real-time smoothing: power fraction lost per m of aim shift
+    # Initial state and mirror moves. A plan starts from the working state (uploaded aims) or, without one,
+    # from ``initial_aim`` (offline single-instant runs): "spread" = the image-size balanced plan that uses
+    # the whole receiver height, "kfactor", "center", "none" = cold start without an initial state.
+    initial_aim: str = "spread"
+    # power fraction a mirror must gain per metre of aim shift away from its initial aim (0 = moves are free);
+    # also the smoothing of the real-time engine (from the executed plan)
+    move_penalty_per_m: float = 0.001
+    max_aim_shift_m: float = 0.0  # hard limit of the aim shift on the receiver from the initial state (0 = none)
+    max_rotation_deg: float = 0.0  # hard limit of the mirror-normal rotation from the initial state (0 = none)
     allow_defocus: bool = True  # put heliostats on standby when no feasible aim exists
     milp_time_limit_s: float = 60.0
     milp_max_nnz: int = 4_000_000  # refuse MILPs with more flux coefficients (memory / time guard)
@@ -605,6 +613,10 @@ def _validate(case: Case) -> None:
         raise ValueError("aps.safety_margin must be in [0, 1)")
     if case.aps.method not in ("center", "kfactor", "greedy", "milp", "subfield"):
         raise ValueError(f"aps.method '{case.aps.method}' not in center|kfactor|greedy|milp|subfield")
+    if case.aps.initial_aim not in ("spread", "kfactor", "center", "none"):
+        raise ValueError(f"aps.initial_aim '{case.aps.initial_aim}' not in spread|kfactor|center|none")
+    if case.aps.move_penalty_per_m < 0 or case.aps.max_aim_shift_m < 0 or case.aps.max_rotation_deg < 0:
+        raise ValueError("aps.move_penalty_per_m, aps.max_aim_shift_m and aps.max_rotation_deg must be >= 0")
     if case.aps.subfield_sectors < 1:
         raise ValueError("aps.subfield_sectors must be >= 1")
     if case.annual.representative_dni not in ("time_mean", "energy_weighted"):

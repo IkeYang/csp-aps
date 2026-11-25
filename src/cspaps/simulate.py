@@ -247,6 +247,106 @@ def beam_spots(case: Case, xyz: np.ndarray, aim_azimuth, aim_z, sun_elevation: f
     return out
 
 
+def occlusion_detail(case: Case, snap: Snapshot, xyz: np.ndarray, i: int, n_points: int = 8,
+                     max_radius: float = 1000.0) -> dict:
+    """Where mirror ``i`` loses light to its neighbours: ``n_points`` x ``n_points`` sample points on it, each
+    "clear", "shaded" (its ray to the sun hits a neighbouring mirror), "tower" (... the tower or receiver) or
+    "blocked" (its reflected ray hits a neighbouring mirror), and the neighbours (within the shading / blocking
+    interaction radius, posed as they track their own aims) that shade or block it. Same ray tests as
+    ``shading.shading_blocking`` (finer sampling, so the fractions differ from the solver's by the sampling)."""
+    rec, hel = case.receiver, case.heliostat
+    xyz = np.asarray(xyz, dtype=float)
+    s = sun.sun_vector(snap.sun_elevation, snap.sun_azimuth)
+    aims = surface_point(rec, np.asarray(snap.aim_azimuth, float), np.asarray(snap.aim_z, float))
+    normals, t, _, _ = optics.heliostat_geometry(xyz, aims, s)
+    dz = float(np.ptp(xyz[:, 2])) if len(xyz) > 1 else 0.0
+    t_el = float(np.degrees(np.arcsin(np.clip(t[i, 2], -1.0, 1.0))))
+    radius = min(max(shading.interaction_radius(hel, snap.sun_elevation, dz),
+                     shading.interaction_radius(hel, t_el, dz)), max_radius)
+    d_h = np.hypot(xyz[:, 0] - xyz[i, 0], xyz[:, 1] - xyz[i, 1])
+    nb = np.flatnonzero((d_h <= radius) & (np.arange(len(xyz)) != i))
+    e_w, e_h = shading.mirror_frames(normals[i:i + 1])
+    pts = shading.mirror_points(xyz[i:i + 1], e_w, e_h, hel, shading.grid_offsets(n_points))[0]  # (P, 3)
+    status = np.full(len(pts), "clear", dtype=object)
+    shaders = blockers = np.zeros(0, dtype=int)
+    if nb.size:
+        w_nb, h_nb = shading.mirror_frames(normals[nb])
+        args = (xyz[nb][None], normals[nb][None], w_nb[None], h_nb[None], 0.5 * hel.width, 0.5 * hel.height)
+        hit_s = shading.ray_hits_rect(pts[:, None, :], s[None, None, :], *args)
+        hit_b = shading.ray_hits_rect(pts[:, None, :], t[i][None, None, :], *args)
+        shaders, blockers = nb[hit_s.any(axis=0)], nb[hit_b.any(axis=0)]
+        status[hit_b.any(axis=1)] = "blocked"
+        status[hit_s.any(axis=1)] = "shaded"
+    if case.shading.tower_shadow:
+        status[shading.ray_hits_structure(pts[None], s[None, None, :], rec)[0]] = "tower"
+    if not case.shading.enabled:
+        status[:] = "clear"
+    p = len(pts)
+    return {"points": pts, "status": status.astype(str), "neighbours": nb, "normals": normals[nb],
+            "shaders": shaders, "blockers": blockers, "radius_m": float(radius), "n_points": p,
+            "lost_shading": float(np.isin(status, ("shaded", "tower")).sum() / p),
+            "lost_blocking": float((status == "blocked").sum() / p)}
+
+
+def mirror_detail(case: Case, snap: Snapshot, xyz: np.ndarray, i: int, initial=None) -> dict:
+    """Everything about mirror ``i`` of an evaluated snapshot, for the GUI's mirror inspector.
+
+    Geometry (normal bisecting sun and target, incidence, slant range, compass bearing from the tower), the
+    stage efficiencies and powers of the snapshot (``eta``, ``power``; optical efficiency = product of the
+    stages = intercepted / sun power), the beam and its 2-sigma spot on the receiver, the panel it hits, its
+    share of the receiver power, its rank in the field, and the field means of every stage (active mirrors)
+    to compare with. ``initial`` = (azimuth, z, active) arrays of the initial state add the aim shift and the
+    mirror rotation (``aps.move_stats``)."""
+    from .receiver import panel_of
+
+    rec, hel = case.receiver, case.heliostat
+    xyz = np.asarray(xyz, dtype=float)
+    p = xyz[i]
+    s = sun.sun_vector(snap.sun_elevation, snap.sun_azimuth)
+    aim_az, aim_z = float(snap.aim_azimuth[i]), float(snap.aim_z[i])
+    aim_xyz = surface_point(rec, np.array([aim_az]), np.array([aim_z]))[0]
+    normal, t, slant, cos_inc = optics.heliostat_geometry(p[None], aim_xyz[None], s)
+    sigma = optics.beam_sigma(slant, cos_inc, hel, case.sun)
+    spot = optics.surface_spot(rec, np.array([aim_az]), t, sigma, 2.0)
+    eta = {k: float(snap.eta[k][i]) for k in LOSSES}
+    power = {k: float(snap.power[k][i]) for k in STAGES}
+    total = float(np.prod(list(eta.values())))
+    active = bool(snap.active[i])
+    alpha = float(snap.alpha_eff[i]) if snap.alpha_eff is not None else float(rec.absorptivity)
+    on = np.asarray(snap.active, bool)
+    eta_tot = snap.eta_total
+    lit = on & (snap.power["sun"] > 0)
+    rank = float((eta_tot[lit] < eta_tot[i]).mean()) if lit.any() and active else None
+    rx, ry = p[0] - rec.center[0], p[1] - rec.center[1]
+    n = normal[0]
+    out = {
+        "index": int(i), "xyz": p, "distance_m": float(np.hypot(rx, ry)),
+        "bearing_deg": float(np.degrees(np.arctan2(rx, ry)) % 360.0), "active": active, "dni_w_m2": float(snap.dni[i]),
+        "sun_vector": s, "aim_azimuth_deg": aim_az % 360.0, "aim_z": aim_z, "aim_xyz": aim_xyz,
+        "target_dir": t[0], "normal": n, "normal_azimuth_deg": float(np.degrees(np.arctan2(n[0], n[1])) % 360.0),
+        "normal_elevation_deg": float(np.degrees(np.arcsin(np.clip(n[2], -1.0, 1.0)))),
+        "incidence_deg": float(np.degrees(np.arccos(np.clip(cos_inc[0], -1.0, 1.0)))), "slant_m": float(slant[0]),
+        "eta": eta, "eta_total": total, "power_w": power, "absorbed_w": power["intercept"] * alpha, "alpha": alpha,
+        "sigma_m": float(sigma[0]), "spot_width_m": float(spot["width_m"][0]), "spot_height_m": float(spot["height_m"][0]),
+        "spot_incidence_deg": float(spot["incidence_deg"][0]), "spot_cov": spot["cov"][0],
+        "panel": int(panel_of(rec, aim_az)) + 1,
+        "share": float(power["intercept"] / snap.p_receiver) if snap.p_receiver > 0 else 0.0,
+        "rank": rank, "tower_fraction": float(snap.tower_fraction[i]) if snap.tower_fraction is not None else 0.0,
+        "field_mean": {k: float(snap.eta[k][lit].mean()) if lit.any() else float("nan") for k in LOSSES},
+        "field_mean_total": float(eta_tot[lit].mean()) if lit.any() else float("nan"),
+    }
+    if initial is not None:
+        from .aps import move_stats
+
+        a0, z0, act0 = (np.atleast_1d(np.asarray(v)[i]) for v in initial)
+        per, _ = move_stats(case, p[None], snap.sun_elevation, snap.sun_azimuth, (a0, z0), act0.astype(bool),
+                            (np.array([aim_az]), np.array([aim_z])), np.array([active]))
+        out["initial"] = {"aim_azimuth_deg": float(a0[0]) % 360.0, "aim_z": float(z0[0]), "active": bool(act0[0]),
+                          "aim_xyz": surface_point(rec, a0.astype(float), z0.astype(float))[0],
+                          "shift_m": float(per["shift_m"][0]), "rotation_deg": float(per["rotation_deg"][0])}
+    return out
+
+
 def sun_state(case: Case, time) -> tuple[pd.Timestamp, float, float, float]:
     """(timestamp, elevation, azimuth, clear-sky DNI) at a local time."""
     idx = sun.to_times(time, case.site.timezone)

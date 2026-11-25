@@ -21,7 +21,8 @@ import pandas as pd
 
 from . import __version__, sun
 from .tables import export_name, safe_filename
-from .aps import build_problem, optimize_aims, solve, solve_greedy
+from .aps import (build_problem, initial_plan, move_cost, move_limits, move_stats, optimize_aims, solve,
+                  solve_greedy)
 from .certify import improve_and_certify
 from .clouds import load_dni_map
 from .config import Case, load_case
@@ -142,6 +143,39 @@ def read_aims_csv(path, fld: Field | None = None) -> tuple[tuple[np.ndarray, np.
     return (df["aim_azimuth_deg"].to_numpy(float), df["aim_z"].to_numpy(float)), active
 
 
+INITIAL_STATE_METHODS = ("greedy", "subfield", "milp")  # optimising methods that start from an initial state
+
+
+def initial_state(case: Case, prob, method: str, prev=None, prev_active=None):
+    """Initial state of an offline plan: the uploaded working state, else (optimising methods) the generated
+    initial plan ``aps.initial_aim``. Returns (aims, active, source) with source "working_state", the plan's
+    name, or None (cold start). ``apply_move_limits`` then puts the hard move limits on ``prob.reach``."""
+    source = None
+    if prev is not None:
+        source = "working_state"
+    elif method in INITIAL_STATE_METHODS and case.aps.initial_aim != "none":
+        ch0 = initial_plan(prob, case.aps.initial_aim)
+        prev, prev_active, source = prob.aims(ch0), ch0 >= 0, case.aps.initial_aim
+    return prev, prev_active, source
+
+
+def apply_move_limits(prob, xyz, prev, prev_active) -> None:
+    """``aps.max_aim_shift_m`` / ``max_rotation_deg`` from the initial state as reachability (with any existing one)."""
+    reach = move_limits(prob, xyz, prev, prev_active)
+    if reach is not None:
+        prob.reach = reach if prob.reach is None else prob.reach & reach
+
+
+def _initial_summary(case, fld, el, az, dni_v, grid, ts, prev, prev_active, source) -> tuple[dict, object]:
+    """The initial state evaluated as it stands (same instant and DNI): power, coarse peak and uniformity."""
+    snap0 = evaluate(case, fld, el, az, dni_v, aim=prev, active=prev_active, grid=grid, time=ts)
+    fs = snap0.flux_stats()
+    return ({"source": source, "absorbed_power_mw": round(snap0.p_absorbed / 1e6, 4),
+             "peak_flux_kw_m2": fs["peak_flux_kw_m2"], "peak_to_limit": fs["peak_to_limit"], "cv_2d": fs["cv_2d"],
+             "cv_circumferential": fs["cv_circumferential"], "cv_height": fs["cv_height"],
+             "n_active": int(np.sum(prev_active)), "basis": "coarse grid, initial aims as given"}, snap0)
+
+
 def _dropped_note(fld: Field) -> dict:
     return {"n_dropped": len(fld.dropped), "dropped": fld.dropped[:20]} if fld.dropped else {}
 
@@ -211,6 +245,7 @@ def task_aim(
     grid = build_grid(case.receiver)
     cert = None
     certificate_note = None
+    initial_source = None
     do_certify = case.aps.certify if certify is None else certify
     if method == "center":
         from .receiver import default_aim
@@ -219,6 +254,9 @@ def task_aim(
     else:
         t_solve = _time.perf_counter()
         prob = build_problem(case, fld, el, az, dni_v, dni_con, grid=grid)
+        prev, prev_active, initial_source = initial_state(case, prob, method, prev, prev_active)
+        apply_move_limits(prob, fld.xyz, prev, prev_active)
+        prices = move_cost(prob, surface_point(case.receiver, *prev) if prev is not None else None, prev_active)
         res = solve(prob, method, case.aps, prev, prev_active)
         proposal_check = res.check
         if do_certify and method in ("greedy", "kfactor", "milp", "subfield") and fld.n:
@@ -237,7 +275,8 @@ def task_aim(
                     if progress:
                         progress(f"certificate skipped: {exc}")
             res, cert = search_joint_poses(prob, fld, res, warm=initial,
-                                           tracking_reference=prob.tracking_reference(prev, prev_active))
+                                           tracking_reference=prob.tracking_reference(prev, prev_active),
+                                           move_cost=prices)
         else:
             res.info["global_optimality_proven"] = False
             res.info["solution_class"] = "joint_pose_verification"
@@ -282,6 +321,14 @@ def task_aim(
     extra["dni_w_m2"] = np.round(snap.dni, 2)
     extra["tower_shadow_fraction"] = snap.tower_fraction
     extra["p_receiver_kw"] = np.round(snap.power["intercept"] / 1e3, 4)
+    moves = initial = snap0 = None
+    if prev is not None and res is not None:
+        initial, snap0 = _initial_summary(case, fld, el, az, dni_v, grid, ts, prev, prev_active,
+                                          initial_source or "working_state")
+        per, moves = move_stats(case, fld.xyz, el, az, prev, prev_active, aim, active)
+        extra.update({"initial_active": np.asarray(prev_active, dtype=int),
+                      "initial_aim_azimuth_deg": np.round(prev[0], 6), "initial_aim_z": np.round(prev[1], 6),
+                      "aim_shift_m": np.round(per["shift_m"], 4), "rotation_deg": np.round(per["rotation_deg"], 5)})
     write_aims_csv(files["aims_csv"], fld, case, aim, active, extra)
     check_summary = chk_con.summary()
     check_summary["top_contributors"] = [{"heliostat_id": int(fld.ids[c["heliostat"]]), "flux_kw_m2": c["flux_kw_m2"]}
@@ -306,6 +353,9 @@ def task_aim(
                                       "fine grid, constraint DNI")
     if certificate_note:
         summary["certificate_skipped"] = certificate_note
+    if initial is not None:
+        summary["initial_state"] = initial
+        summary["moves"] = moves
     if res is not None and proposal_check is not None:
         summary["solver_flux_check"] = {"status": proposal_check.status, "peak_flux_kw_m2": round(proposal_check.peak_flux_kw_m2, 2),
                                         "basis": "solver response model (candidate aims)"}
@@ -328,7 +378,7 @@ def task_aim(
                                "forecast_dni_map": forecast_dni_map, "prev_aims": prev_aims,
                                "dni_source": dni_source, "certify": cert is not None}, t_start)
     return {"summary": _clean(summary), "files": files, "snapshot": snap, "aim_result": res, "field": fld,
-            "check": chk_con, "run_dir": out, "certificate": cert}
+            "check": chk_con, "run_dir": out, "certificate": cert, "initial_snapshot": snap0}
 
 
 def existence_statement_aps(case: Case, cert: dict) -> dict:
@@ -430,8 +480,13 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
 
 
 def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str | Path | None = None,
-                certify: bool = True, progress: Progress | None = None, dni_source: str = "site") -> dict:
-    """Power vs uniformity trade-off over the weight lambda at one instant (fixed field and DNI)."""
+                certify: bool = True, progress: Progress | None = None, dni_source: str = "site",
+                prev_aims: str | Path | None = None) -> dict:
+    """Power vs uniformity trade-off over the weight lambda at one instant (fixed field and DNI).
+
+    Every point starts from the same initial state (``prev_aims``, else ``aps.initial_aim``) and pays the
+    same move price, so lambda = 0 is the best plan near that state, not every mirror on its own brightest
+    aim."""
     t0 = _time.perf_counter()
     out = out_dir(base, case, "pareto")
     fld = build_field(case)
@@ -445,7 +500,12 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
     base_case = case.copy()
     base_case.uniformity.enabled = False
     prob = build_problem(base_case, fld, el, az, dni_v, grid=grid)
-    base_choice, _ = solve_greedy(prob, case.aps)
+    prev, prev_active = read_aims_csv(prev_aims, fld) if prev_aims else (None, None)
+    prev, prev_active, initial_source = initial_state(case, prob, "greedy", prev, prev_active)
+    apply_move_limits(prob, fld.xyz, prev, prev_active)
+    prev_xyz = surface_point(case.receiver, *prev) if prev is not None else None
+    prices = move_cost(prob, prev_xyz, prev_active, case.aps)
+    base_choice, _ = solve_greedy(prob, case.aps, prev_xyz, prev_active)
     prob.rs.case = case
     lambdas = list(lambdas) if lambdas is not None else [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
     from .receiver import panel_bounds, panel_flux_table
@@ -458,16 +518,19 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
         c = case.copy()
         c.uniformity.enabled, c.uniformity.mode, c.uniformity.weight = True, "weighted", lam
         prob.rs.case = c
-        res = solve(prob, "greedy", c.aps, init=previous)
+        res = solve(prob, "greedy", c.aps, prev, prev_active, init=previous)
         if certify:
             from .certify import CertificateTooLarge
 
             try:
-                res, _ = improve_and_certify(prob, res, c.aps, rounds=2, max_iter=200, time_limit_s=6.0)
+                res, _ = improve_and_certify(prob, res, c.aps, rounds=2, max_iter=200, time_limit_s=6.0,
+                                             prev=prev, prev_active=prev_active)
             except CertificateTooLarge:  # too large for the free memory: the curve without the rounding step
                 certify = False
-        res, bound = search_joint_poses(prob, fld, res, warm=previous)
+        res, bound = search_joint_poses(prob, fld, res, warm=previous, move_cost=prices,
+                                        tracking_reference=prob.tracking_reference(prev, prev_active))
         previous = res.choice
+        moved = move_stats(c, fld.xyz, el, az, prev, prev_active, res.aim, res.active)[1] if prev is not None else {}
         snap = evaluate(c, fld, el, az, dni_v, aim=res.aim, active=res.active, grid=grid)
         table = panel_flux_table(c.receiver, grid, snap.flux)
         incident.append(snap.flux)
@@ -481,7 +544,9 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
                      "hotspot_z_m": float(chk.hotspot_z), "peak_to_limit": float(chk.peak_ratio),
                      "max_panel_peak_to_limit": max(r["peak_to_limit"] for r in table) if table else None,
                      "upper_bound_mw": bound["upper_bound_mw"] if certify else None,
-                     "gap": bound["gap"] if certify else None})
+                     "gap": bound["gap"] if certify else None,
+                     "n_moved": moved.get("n_moved"), "mean_shift_m": moved.get("mean_shift_m"),
+                     "max_shift_m": moved.get("max_shift_m"), "move_cost_mw": bound.get("move_cost_mw")})
     files = {"summary_json": out / "pareto.json", "curve_csv": out / "pareto_curve.csv",
              "panels_csv": out / "pareto_panels.csv", "flux_npz": out / "pareto_flux.npz"}
     pd.DataFrame(rows).to_csv(files["curve_csv"], index=False)
@@ -491,14 +556,19 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
             "absorbed_kw_m2": np.array(incident) * grid.to_map(grid.alpha)[None] / 1e3,
             "limit_kw_m2": grid.to_map(grid.limit) / 1e3, "panel": grid.to_map(grid.panel) + 1,
             "panel_edges_deg": np.array([a0 for a0, _ in panel_bounds(case.receiver)], float)}
+    initial = None
+    if prev is not None:
+        initial, snap0 = _initial_summary(case, fld, el, az, dni_v, grid, ts, prev, prev_active, initial_source)
+        flux["initial_incident_kw_m2"] = snap0.flux / 1e3
     np.savez_compressed(files["flux_npz"], **flux)
     summary = {"time": ts.isoformat(), "dni_mean_w_m2": float(np.mean(dni_v)), "n_heliostats": fld.n,
+               "initial_state": initial,
                "region_H": {"panels": case.uniformity.panels, "z_range": case.uniformity.z_range},
                "curve": rows, "panels": panels, "flux_basis": "evaluation grid of the receiver (coarse); "
                                                              "verified peaks: peak_flux_kw_m2 / hotspot_*"}
     _json(files["summary_json"], summary)
     finish(out, "pareto", summary, {"time": str(time), "lambdas": lambdas, "dni_map": dni_map,
-                                    "dni_source": dni_source}, t0)
+                                    "dni_source": dni_source, "prev_aims": prev_aims}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out, "flux": flux}
 
 

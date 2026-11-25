@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--forecast-dni-map", default=None, help="CSV x,y,dni: highest DNI expected before the next update")
         sp.add_argument("--prev-aims", default=None, help="aims CSV of the last executed plan (matched by id)")
         if name == "aps":
+            _move_args(sp)
             sp.add_argument("--mode", choices=["fast", "standard", "deep"], default=None,
                             help="depth: fast (one greedy pass) | standard (joint poses + rounding + gap) | "
                                  "deep (denser candidates, more rounds); see `cspaps advise`")
@@ -92,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--lambdas", type=float, nargs="*", default=None)
     sp.add_argument("--dni-map", default=None)
     sp.add_argument("--no-certify", action="store_true")
+    sp.add_argument("--prev-aims", default=None, help="aims CSV of the plant's working state: every point starts from it")
+    _move_args(sp)
     add("realtime", "replay real-time APS under cloud shadows (scenario from the case)")
     sp = add("annual", "annual energy on the receiver")
     sp.add_argument("--method", choices=["sun_bins", "sun_grid", "representative_days", "hourly"], default=None)
@@ -197,6 +200,15 @@ def _safe_console() -> None:
             pass
 
 
+def _move_args(sp) -> None:
+    sp.add_argument("--initial-aim", choices=["spread", "kfactor", "center", "none"], default=None,
+                    help="initial plan without --prev-aims (default from the case: spread)")
+    sp.add_argument("--move-penalty", type=float, default=None,
+                    help="power fraction a mirror must gain per metre of aim shift from its initial aim (default 0.001)")
+    sp.add_argument("--max-shift", type=float, default=None, help="hard limit of the aim shift from the initial state (m)")
+    sp.add_argument("--max-rotation", type=float, default=None, help="hard limit of the mirror rotation (deg)")
+
+
 def main(argv: list[str] | None = None) -> int:
     global _TRACKER
     _safe_console()
@@ -249,6 +261,14 @@ def main(argv: list[str] | None = None) -> int:
         _progress(f"depth: {args.mode} ({task})")
     if getattr(args, "workers", None) is not None:  # scenario-level processes (-1 = all usable CPUs)
         case.annual.workers = case.layout_opt.workers = int(args.workers)
+    for arg, field in (("initial_aim", "initial_aim"), ("move_penalty", "move_penalty_per_m"),
+                       ("max_shift", "max_aim_shift_m"), ("max_rotation", "max_rotation_deg")):
+        if getattr(args, arg, None) is not None:  # initial state and mirror moves of single-instant runs
+            setattr(case.aps, field, args.__dict__[arg])
+    if args.command in ("aps", "pareto"):
+        from .config import _validate
+
+        _validate(case)  # the overrides above obey the same rules as the YAML
     if getattr(args, "land_weight", None) is not None:  # J = E - lambda_L Pi - kappa A
         case.layout_opt.land_weight = float(args.land_weight)
     if getattr(args, "max_land_ha", None) is not None:
@@ -290,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
                                      azimuth_span=args.azimuth_span, dni_map=args.dni_map)
     elif args.command == "pareto":
         res = wf.task_pareto(case, out, args.time, lambdas=args.lambdas, dni_map=args.dni_map,
-                             certify=not args.no_certify, progress=_progress)
+                             certify=not args.no_certify, progress=_progress, prev_aims=args.prev_aims)
     elif args.command == "realtime":
         res = wf.task_realtime(case, out, progress=_progress)
     elif args.command == "annual":

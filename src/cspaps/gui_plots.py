@@ -1228,3 +1228,311 @@ def tradeoff_profiles(flux: dict, selected: int | None = None, height: int = 300
     fig.update_yaxes(title_text="高度 z (m)", row=1, col=2)
     fig.update_annotations(font_size=11)
     return _base_layout(fig, "", height)
+
+
+# --------------------------------------------------------------------------- mirror inspector (dark viewport)
+
+VIEW_BG, VIEW_GRID, VIEW_INK = "#08131d", "#1a2d3b", "#cfe3ee"
+NEON_SUN, NEON_BEAM, NEON_MIRROR, NEON_PREV = "#ffd166", "#ff9f43", "#2ee6c5", "#8fa8ff"
+FACTOR_NAMES = {"cosine": "余弦", "reflectivity": "反射×清洁", "shading": "阴影", "blocking": "遮挡",
+                "attenuation": "大气衰减", "intercept": "截断"}
+
+
+def _viewport(fig, height: int, title: str = ""):
+    """Dark 'control room' look for 3-D scenes (keeps the figure's own title when none is given)."""
+    title = title or (fig.layout.title.text or "")
+    axis = dict(backgroundcolor=VIEW_BG, gridcolor=VIEW_GRID, zerolinecolor=VIEW_GRID, color=VIEW_INK,
+                showspikes=False)
+    fig.update_layout(height=height, paper_bgcolor=VIEW_BG, plot_bgcolor=VIEW_BG, font=dict(family=FONT, color=VIEW_INK, size=12),
+                      title=dict(text=title, font=dict(size=14, color="#e9f5fb"), x=0.02, y=0.97),
+                      margin=dict(l=0, r=0, t=36 if title else 8, b=0),
+                      legend=dict(orientation="h", y=0.02, x=0.02, font=dict(size=11, color=VIEW_INK), bgcolor="rgba(8,19,29,0.6)"),
+                      scene=dict(xaxis=dict(title="东 x (m)", **axis), yaxis=dict(title="北 y (m)", **axis),
+                                 zaxis=dict(title="z (m)", **axis), bgcolor=VIEW_BG))
+    return fig
+
+
+def _mirror_quad(center, normal, width: float, height: float):
+    """Corners (4, 3) of a mirror rectangle: the width axis stays horizontal (azimuth-elevation tracking)."""
+    z = np.array([0.0, 0.0, 1.0])
+    e_w = np.cross(z, normal)
+    e_w = e_w / np.linalg.norm(e_w) if np.linalg.norm(e_w) > 1e-9 else np.array([1.0, 0.0, 0.0])
+    e_h = np.cross(normal, e_w)
+    hw, hh = 0.5 * width, 0.5 * height
+    return np.array([center - hw * e_w - hh * e_h, center + hw * e_w - hh * e_h,
+                     center + hw * e_w + hh * e_h, center - hw * e_w + hh * e_h])
+
+
+def _beam_cone(apex, aim, t, radius: float, n: int = 28):
+    """Mesh of the beam envelope: apex at the mirror, a circle of ``radius`` normal to ``t`` at the aim point."""
+    a = np.cross(t, [0.0, 0.0, 1.0])
+    a = a / np.linalg.norm(a) if np.linalg.norm(a) > 1e-9 else np.array([1.0, 0.0, 0.0])
+    b = np.cross(t, a)
+    th = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    ring = aim[None] + radius * (np.cos(th)[:, None] * a[None] + np.sin(th)[:, None] * b[None])
+    pts = np.vstack([apex[None], ring])
+    i = np.zeros(n, int)
+    j = 1 + np.arange(n)
+    k = 1 + (np.arange(n) + 1) % n
+    return pts, i, j, k
+
+
+def _receiver_surface(fig, case: Case, grid: ReceiverGrid | None, flux_w_m2, name: str = "吸热器"):
+    rec = case.receiver
+    cx, cy, cz = rec.center
+    th = np.linspace(0, 2 * np.pi, 40)
+    s_, c_ = np.sin(th), np.cos(th)
+    fig.add_trace(go.Surface(x=cx + rec.tower_radius * np.outer(s_, [1, 1]), y=cy + rec.tower_radius * np.outer(c_, [1, 1]),
+                             z=np.outer(np.ones_like(th), [0.0, rec.tower_top]), showscale=False, opacity=0.95,
+                             colorscale=[[0, "#4a5d69"], [1, "#4a5d69"]], hoverinfo="skip", name="塔"))
+    if grid is not None and flux_w_m2 is not None:
+        kw = np.asarray(flux_w_m2).reshape(grid.shape) / 1e3
+        az = np.radians(np.concatenate([grid.azimuth_deg, grid.azimuth_deg[:1] + 360.0]))
+        zz, aa = np.meshgrid(grid.z, az, indexing="ij")
+        fig.add_trace(go.Surface(x=cx + rec.radius * np.sin(aa), y=cy + rec.radius * np.cos(aa), z=zz,
+                                 surfacecolor=np.hstack([kw, kw[:, :1]]), colorscale=FLUX_SCALE, cmin=0,
+                                 colorbar=dict(title="全场热流<br>kW/m²", thickness=10, len=0.45, x=0.99, y=0.62,
+                                               tickfont=dict(color=VIEW_INK), title_font=dict(color=VIEW_INK)),
+                                 hovertemplate="%{surfacecolor:.0f} kW/m²<extra>" + name + "</extra>", name=name))
+    else:
+        zr = np.array([cz - 0.5 * rec.height, cz + 0.5 * rec.height])
+        fig.add_trace(go.Surface(x=cx + rec.radius * np.outer(s_, [1, 1]), y=cy + rec.radius * np.outer(c_, [1, 1]),
+                                 z=np.outer(np.ones_like(th), zr), showscale=False, colorscale=[[0, AMBER], [1, AMBER]],
+                                 hoverinfo="skip", name=name))
+
+
+def _quads_mesh(centers, normals, width: float, height: float):
+    """One Mesh3d worth of mirror rectangles (two triangles each)."""
+    centers, normals = np.atleast_2d(centers), np.atleast_2d(normals)
+    corners = np.array([_mirror_quad(c, n, width, height) for c, n in zip(centers, normals)]).reshape(-1, 3)
+    base = 4 * np.arange(len(centers))
+    i = np.concatenate([base, base])
+    j = np.concatenate([base + 1, base + 2])
+    k = np.concatenate([base + 2, base + 3])
+    return corners, i, j, k
+
+
+def _eye_towards(direction, up: float = 0.35, dist: float = 1.9) -> dict:
+    v = np.asarray(direction, float)
+    v = v / max(np.linalg.norm(v), 1e-12)
+    v = v + np.array([0.0, 0.0, up])
+    v = v / np.linalg.norm(v) * dist
+    return dict(x=float(v[0]), y=float(v[1]), z=float(v[2]))
+
+
+def mirror_path_3d(case: Case, d: dict, field_xyz: np.ndarray, grid: ReceiverGrid | None = None, flux_w_m2=None,
+                   mirror_id=None, height: int = 600, title: str = ""):
+    """One mirror's light path at true proportions: incoming sunlight, the mirror (oriented by its normal), the
+    reflected beam with its 2-sigma envelope, the spot on the receiver (the whole field's flux on the
+    cylinder) and, when the plan started from one, the initial aim and the move. The camera looks across the
+    plane of incidence (sun ray and reflected ray side by side, as in the law of reflection); the scene is
+    cropped to the mirror, the tower and the incoming ray (``simulate.mirror_detail`` gives ``d``)."""
+    from .optics import spot_outline
+    from .receiver import surface_point
+
+    rec, hel = case.receiver, case.heliostat
+    cx, cy, _ = rec.center
+    p, aim, t, n, s = d["xyz"], d["aim_xyz"], d["target_dir"], d["normal"], d["sun_vector"]
+    L = max(0.45 * d["slant_m"], 30.0)
+    ends = np.array([p, p + L * s, [cx, cy, 0.0], [cx, cy, rec.top], aim])
+    lo, hi = ends.min(axis=0), ends.max(axis=0)
+    pad = np.maximum(0.12 * (hi - lo), rec.diameter)
+    lo, hi = lo - pad, hi + pad
+    hor = max(hi[0] - lo[0], hi[1] - lo[1])
+    for ax in (0, 1):  # keep the box from collapsing into a sliver
+        if hi[ax] - lo[ax] < 0.3 * hor:
+            mid = 0.5 * (hi[ax] + lo[ax])
+            lo[ax], hi[ax] = mid - 0.15 * hor, mid + 0.15 * hor
+    lo[2] = min(lo[2], 0.0)
+    fig = go.Figure()
+    xyz = np.asarray(field_xyz, float)
+    inside = np.all((xyz >= lo) & (xyz <= hi), axis=1)
+    if inside.sum() > 5000:
+        keep = np.flatnonzero(inside)[np.linspace(0, inside.sum() - 1, 5000).astype(int)]
+        inside = np.zeros(len(xyz), bool)
+        inside[keep] = True
+    fig.add_trace(go.Scatter3d(x=xyz[inside, 0], y=xyz[inside, 1], z=xyz[inside, 2], mode="markers", name="镜场",
+                               marker=dict(size=1.8, color="#3b5566"), hoverinfo="skip"))
+    _receiver_surface(fig, case, grid, flux_w_m2)
+    quad = _mirror_quad(p, n, hel.width, hel.height)
+    sx, sy, sz = [], [], []
+    for q in np.vstack([p[None], quad]):
+        sx += [q[0] + L * s[0], q[0], None]
+        sy += [q[1] + L * s[1], q[1], None]
+        sz += [q[2] + L * s[2], q[2], None]
+    fig.add_trace(go.Scatter3d(x=sx, y=sy, z=sz, mode="lines", name=f"太阳光（入射角 {d['incidence_deg']:.1f}°）",
+                               line=dict(color=NEON_SUN, width=3), hoverinfo="skip"))
+    tip = p + L * s
+    fig.add_trace(go.Scatter3d(x=[tip[0]], y=[tip[1]], z=[tip[2]], mode="markers+text", text=["太阳方向"],
+                               textposition="top center", textfont=dict(size=12, color=NEON_SUN),
+                               marker=dict(size=7, color=NEON_SUN, symbol="circle"), hoverinfo="text",
+                               hovertext=f"太阳 高度角 {case_sun_text(d)}", showlegend=False))
+    fig.add_trace(go.Mesh3d(x=quad[:, 0], y=quad[:, 1], z=quad[:, 2], i=[0, 0], j=[1, 2], k=[2, 3], color=NEON_MIRROR,
+                            opacity=0.95, name="镜面", hovertext=f"镜 {mirror_id}", hoverinfo="text", showlegend=False))
+    fig.add_trace(go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]], mode="markers+text", text=[f"镜 {mirror_id}"],
+                               textposition="bottom center", textfont=dict(size=12, color=NEON_MIRROR),
+                               marker=dict(size=6, color=NEON_MIRROR, symbol="square"),
+                               name=f"镜 {mirror_id}（{hel.width:g} × {hel.height:g} m）", hoverinfo="skip"))
+    nl = 0.12 * L
+    fig.add_trace(go.Scatter3d(x=[p[0], p[0] + nl * n[0]], y=[p[1], p[1] + nl * n[1]], z=[p[2], p[2] + nl * n[2]],
+                               mode="lines", line=dict(color="#ffffff", width=4, dash="dash"),
+                               name=f"镜面法向（方位 {d['normal_azimuth_deg']:.0f}°，仰角 {d['normal_elevation_deg']:.0f}°）",
+                               hoverinfo="skip"))
+    if d["active"]:
+        pts, ci, cj, ck = _beam_cone(p, aim, t, 2.0 * d["sigma_m"])
+        fig.add_trace(go.Mesh3d(x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], i=ci, j=cj, k=ck, color=NEON_BEAM, opacity=0.18,
+                                hoverinfo="skip", name="光束 2σ 包络", showlegend=True))
+        fig.add_trace(go.Scatter3d(x=[p[0], aim[0]], y=[p[1], aim[1]], z=[p[2], aim[2]], mode="lines",
+                                   line=dict(color=NEON_BEAM, width=6),
+                                   name=f"反射光（斜距 {d['slant_m']:.0f} m）", hoverinfo="skip"))
+        ex, ey = spot_outline(rec, np.array([d["aim_azimuth_deg"]]), np.array([d["aim_z"]]), d["spot_cov"][None], 2.0)
+        ring = surface_point(rec, ex[0], ey[0])
+        fig.add_trace(go.Scatter3d(x=ring[:, 0], y=ring[:, 1], z=ring[:, 2], mode="lines", line=dict(color="#ffffff", width=5),
+                                   name=f"光斑 2σ（宽 {d['spot_width_m']:.1f} × 高 {d['spot_height_m']:.1f} m）", hoverinfo="skip"))
+        fig.add_trace(go.Scatter3d(x=[aim[0]], y=[aim[1]], z=[aim[2]], mode="markers", name=f"瞄准点（第 {d['panel']} 管屏）",
+                                   marker=dict(size=5, color="#ffffff", symbol="diamond"),
+                                   hovertext=f"方位 {d['aim_azimuth_deg']:.1f}°，高 {d['aim_z']:.2f} m", hoverinfo="text"))
+    ini = d.get("initial")
+    if ini is not None and ini["shift_m"] > 1e-3:
+        a0 = ini["aim_xyz"]
+        fig.add_trace(go.Scatter3d(x=[p[0], a0[0]], y=[p[1], a0[1]], z=[p[2], a0[2]], mode="lines",
+                                   line=dict(color=NEON_PREV, width=2, dash="dot"), name="初始状态的光路", hoverinfo="skip"))
+        fig.add_trace(go.Scatter3d(x=[a0[0], aim[0]], y=[a0[1], aim[1]], z=[a0[2], aim[2]], mode="lines",
+                                   line=dict(color=NEON_PREV, width=7),
+                                   name=f"瞄准点移动 {ini['shift_m']:.2f} m（镜面转 {ini['rotation_deg']:.2f}°）",
+                                   hoverinfo="skip"))
+    side = np.cross(s, t)
+    if np.linalg.norm(side) < 1e-6:
+        side = np.array([1.0, -1.0, 0.0])
+    if side[2] < 0:
+        side = -side
+    fig.update_layout(scene=dict(aspectmode="data", xaxis=dict(range=[lo[0], hi[0]]), yaxis=dict(range=[lo[1], hi[1]]),
+                                 zaxis=dict(range=[lo[2], hi[2]]), camera=dict(eye=_eye_towards(side, 0.3, 2.3))))
+    return _viewport(fig, height, title)
+
+
+def mirror_closeup_3d(case: Case, d: dict, occ: dict, field_xyz: np.ndarray, mirror_id=None, height: int = 520,
+                      title: str = ""):
+    """The mirror and its neighbours at their actual tracking poses: sun rays coming in, reflected rays going
+    out towards the receiver, the sample points of the mirror coloured by what happens to them (clear,
+    shaded by a neighbour, in the tower's shadow, blocked by a neighbour), and the neighbours that shade or
+    block it highlighted (``simulate.occlusion_detail`` gives ``occ``)."""
+    hel = case.heliostat
+    p, n, s, t = d["xyz"], d["normal"], d["sun_vector"], d["target_dir"]
+    xyz = np.asarray(field_xyz, float)
+    R = max(4.5 * hel.diagonal, 30.0)
+    nb = occ["neighbours"]
+    near = np.hypot(xyz[nb, 0] - p[0], xyz[nb, 1] - p[1]) <= R
+    shaders, blockers = set(occ["shaders"].tolist()), set(occ["blockers"].tolist())
+    groups = {"相邻镜子": "#5f8496", "给本镜投下阴影的镜子": "#ffb547", "挡住本镜反射光的镜子": "#ff6b5e"}
+    fig = go.Figure()
+    for name, color in groups.items():
+        if name == "相邻镜子":
+            sel = near & ~np.isin(nb, list(shaders | blockers))
+        elif name.startswith("给本镜投下"):
+            sel = np.isin(nb, list(shaders))
+        else:
+            sel = np.isin(nb, list(blockers - shaders))
+        if not sel.any():
+            continue
+        pts, i, j, k = _quads_mesh(xyz[nb[sel]], occ["normals"][sel], hel.width, hel.height)
+        fig.add_trace(go.Mesh3d(x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], i=i, j=j, k=k, color=color,
+                                opacity=0.9 if name != "相邻镜子" else 0.55, name=f"{name}（{int(sel.sum())}）",
+                                showlegend=True, hoverinfo="skip"))
+        posts_x, posts_y, posts_z = [], [], []
+        for c in xyz[nb[sel]]:
+            posts_x += [c[0], c[0], None]
+            posts_y += [c[1], c[1], None]
+            posts_z += [c[2] - hel.pivot_height, c[2], None]
+        fig.add_trace(go.Scatter3d(x=posts_x, y=posts_y, z=posts_z, mode="lines", line=dict(color="#2b4250", width=3),
+                                   hoverinfo="skip", showlegend=False))
+    quad, qi, qj, qk = _quads_mesh(p, n, hel.width, hel.height)
+    fig.add_trace(go.Mesh3d(x=quad[:, 0], y=quad[:, 1], z=quad[:, 2], i=qi, j=qj, k=qk, color=NEON_MIRROR, opacity=0.35,
+                            name=f"镜 {mirror_id}", showlegend=True, hoverinfo="skip"))
+    fig.add_trace(go.Scatter3d(x=[p[0], p[0]], y=[p[1], p[1]], z=[p[2] - hel.pivot_height, p[2]], mode="lines",
+                               line=dict(color="#7fa3b3", width=5), hoverinfo="skip", showlegend=False))
+    status = occ["status"]
+    colors = {"clear": "#2ee6a6", "shaded": "#ffb547", "tower": "#b48cff", "blocked": "#ff6b5e"}
+    names = {"clear": "畅通的采样点", "shaded": "被相邻镜挡住阳光", "tower": "在塔影里", "blocked": "反射光被相邻镜挡住"}
+    sp = occ["points"]
+    for key in ("clear", "shaded", "tower", "blocked"):
+        m = status == key
+        if m.any():
+            fig.add_trace(go.Scatter3d(x=sp[m, 0], y=sp[m, 1], z=sp[m, 2], mode="markers",
+                                       marker=dict(size=3.5, color=colors[key]),
+                                       name=f"{names[key]}（{m.mean():.0%}）", hoverinfo="skip"))
+    L = 0.8 * R
+    corners = _mirror_quad(p, n, hel.width, hel.height)
+    lx, ly, lz, rx, ry, rz = [], [], [], [], [], []
+    for q in np.vstack([p[None], corners]):
+        lx += [q[0] + L * s[0], q[0], None]
+        ly += [q[1] + L * s[1], q[1], None]
+        lz += [q[2] + L * s[2], q[2], None]
+        rx += [q[0], q[0] + L * t[0], None]
+        ry += [q[1], q[1] + L * t[1], None]
+        rz += [q[2], q[2] + L * t[2], None]
+    fig.add_trace(go.Scatter3d(x=lx, y=ly, z=lz, mode="lines", line=dict(color=NEON_SUN, width=3), name="入射阳光",
+                               hoverinfo="skip"))
+    fig.add_trace(go.Scatter3d(x=rx, y=ry, z=rz, mode="lines", line=dict(color=NEON_BEAM, width=3), name="反射光（去往吸热器）",
+                               hoverinfo="skip"))
+    nl = 1.2 * max(hel.width, hel.height)
+    fig.add_trace(go.Scatter3d(x=[p[0], p[0] + nl * n[0]], y=[p[1], p[1] + nl * n[1]], z=[p[2], p[2] + nl * n[2]],
+                               mode="lines", line=dict(color="#ffffff", width=4, dash="dash"), name="镜面法向",
+                               hoverinfo="skip"))
+    e_w = np.cross([0.0, 0.0, 1.0], n)
+    e_w = e_w / max(np.linalg.norm(e_w), 1e-9)
+    view = n + 0.45 * e_w  # in front of the reflecting face, slightly to the side
+    zlo = float(min(p[2] - hel.pivot_height, (xyz[nb[near], 2] - hel.pivot_height).min() if near.any() else p[2]))
+    fig.update_layout(scene=dict(aspectmode="data",
+                                 xaxis=dict(range=[p[0] - R, p[0] + R]), yaxis=dict(range=[p[1] - R, p[1] + R]),
+                                 zaxis=dict(range=[zlo - 1.0, p[2] + max(0.6 * R, hel.height * 2)]),
+                                 camera=dict(eye=_eye_towards(view, 0.1, 1.7))))
+    return _viewport(fig, height, title)
+
+
+def case_sun_text(d: dict) -> str:
+    s = d["sun_vector"]
+    return f"{np.degrees(np.arcsin(np.clip(s[2], -1, 1))):.1f}°，方位 {np.degrees(np.arctan2(s[0], s[1])) % 360:.0f}°"
+
+
+def mirror_spot_map(case: Case, grid: ReceiverGrid, flux_w_m2, d: dict, height: int = 360, title: str = ""):
+    """The receiver unrolled with the whole field's flux, this mirror's 2-sigma spot, its aim point and the
+    move from its initial aim."""
+    from .optics import spot_outline
+
+    fig = receiver_map(case, grid, flux_w_m2, title, height=height)
+    if d["active"]:
+        ex, ey = spot_outline(case.receiver, np.array([d["aim_azimuth_deg"]]), np.array([d["aim_z"]]), d["spot_cov"][None], 2.0)
+        fig.add_trace(go.Scatter(x=ex[0] % 360.0, y=ey[0], mode="lines", line=dict(color=NEON_MIRROR, width=2.5),
+                                 name="本镜光斑 2σ", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=[d["aim_azimuth_deg"]], y=[d["aim_z"]], mode="markers", name="本镜瞄准点",
+                                 marker=dict(symbol="diamond", size=11, color=NEON_MIRROR, line=dict(width=1.5, color="white")),
+                                 hovertemplate="方位 %{x:.1f}°，高 %{y:.2f} m<extra>本镜瞄准点</extra>"))
+    ini = d.get("initial")
+    if ini is not None:
+        a0, a1 = ini["aim_azimuth_deg"], d["aim_azimuth_deg"]
+        end = a0 + ((a1 - a0 + 180.0) % 360.0 - 180.0)
+        fig.add_trace(go.Scatter(x=[a0, end], y=[ini["aim_z"], d["aim_z"]], mode="lines+markers", name="自初始瞄准点的移动",
+                                 line=dict(color=NEON_PREV, width=2, dash="dot"),
+                                 marker=dict(size=[9, 0.1], color=NEON_PREV, symbol="circle-open", line=dict(width=2)),
+                                 hovertemplate="初始 方位 %{x:.1f}°，高 %{y:.2f} m<extra></extra>"))
+    return fig
+
+
+def mirror_factor_chart(d: dict, height: int = 300):
+    """This mirror's stage efficiencies against the field mean (active mirrors): why it is better or worse."""
+    keys = list(FACTOR_NAMES)
+    mine = [d["eta"][k] for k in keys]
+    mean = [d["field_mean"][k] for k in keys]
+    names = [FACTOR_NAMES[k] for k in keys]
+    colors = [TEAL if m >= f - 1e-9 else RED for m, f in zip(mine, mean)]
+    fig = go.Figure(go.Bar(y=names, x=mine, orientation="h", marker_color=colors, name="本镜",
+                           text=[f"{v:.3f}" for v in mine], textposition="inside", insidetextanchor="end",
+                           hovertemplate="%{y}：本镜 %{x:.4f}<extra></extra>"))
+    fig.add_trace(go.Scatter(y=names, x=mean, mode="markers", name="全场平均（工作镜）",
+                             marker=dict(symbol="line-ns", size=22, line=dict(width=3, color=NAVY)),
+                             hovertemplate="%{y}：全场平均 %{x:.4f}<extra></extra>"))
+    lo = max(0.0, min(min(mine), min(mean)) - 0.05)
+    fig.update_xaxes(range=[lo, 1.0], title="效率（1 = 无损失）")
+    fig.update_yaxes(autorange="reversed")
+    return _base_layout(fig, "", height)

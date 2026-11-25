@@ -513,6 +513,188 @@ def solve_kfactor(prob: AimProblem, k_max: float = 4.0, iters: int = 14) -> tupl
     return choice_for(lo), lo
 
 
+SPREAD_K_SIGMA = 2.0  # images kept this many vertical standard deviations inside the receiver edge
+TIE_MOVE_STEP_M = 0.25  # aim shifts compared in steps of this size when ties prefer the smaller move
+
+
+def spread_levels(prob: AimProblem, k_sigma: float = SPREAD_K_SIGMA) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """On-axis candidate columns ``ks`` (L,), their heights (L,), and the admissible mask (N, L): the heights
+    at which a mirror's image (``k_sigma`` vertical standard deviations on the surface, i.e. stretched by the
+    beam's incidence, ``optics.surface_spot``) stays on the receiver. The centre height is always admissible."""
+    from .optics import surface_spot
+
+    rec = prob.case.receiver
+    zc, half = rec.center[2], 0.5 * rec.height
+    offs = (prob.cand_az[0] - prob.cand_az[0, prob.center_k] + 180.0) % 360.0 - 180.0
+    ks = np.flatnonzero(np.abs(offs) < 1e-9)
+    ks = ks[np.argsort(prob.cand_z[0, ks], kind="stable")]
+    levels = prob.cand_z[0, ks]
+    c = prob.center_k
+    spot = surface_spot(rec, prob.cand_az[:, c], prob.rs.t[:, c], prob.sigma[:, c], 1.0)
+    sig_v = np.sqrt(spot["cov"][:, 1, 1])
+    room = np.maximum(0.0, half - k_sigma * sig_v)
+    adm = np.abs(levels[None, :] - zc) <= room[:, None] + 1e-9
+    adm[:, int(np.flatnonzero(ks == c)[0])] = True
+    return ks, levels, adm
+
+
+def solve_spread(prob: AimProblem, k_sigma: float = SPREAD_K_SIGMA, sector_deg: float | None = None) -> np.ndarray:
+    """Balanced initial aiming ("spread"): every mirror aims on its own facing azimuth, and in each azimuth
+    sector of the receiver the mirrors' power is shared out over the candidate heights in proportion to the
+    allowed flux at that height (``limit_nom``, so a lower limit near an edge receives less). A mirror may
+    only use heights at which its image stays on the receiver (``spread_levels``): large far-field images
+    aim near mid-height, small near-field images fill the upper and lower bands.
+
+    Assignment, per sector: the most constrained mirrors first (fewest admissible heights, then the larger
+    power), each to the admissible height with the lowest load per capacity (ties: closer to mid-height).
+    Deterministic, no flux model, no optimisation: a reasonable starting state that uses the whole receiver
+    height, not a power-optimal plan (the solver starts from it and prices moves away from it)."""
+    n = prob.n
+    if n == 0:
+        return np.zeros(0, dtype=int)
+    rec = prob.case.receiver
+    ks, levels, adm = spread_levels(prob, k_sigma)
+    zc = rec.center[2]
+    # capacity of each height: the allowed flux there (mean over the receiver circumference)
+    g = prob.rs.grid
+    lim = g.to_map(g.limit)  # (n_z, n_az)
+    cap = np.interp(levels, g.z, lim.mean(axis=1))
+    cap = np.maximum(cap / max(cap.max(), 1e-12), 1e-6)
+    if sector_deg is None:
+        sector_deg = 360.0 / max(2 * rec.n_panels, 8)
+    facing = prob.cand_az[:, prob.center_k] % 360.0
+    sector = np.floor(facing / sector_deg).astype(int)
+    weight = prob.rs.unit_power[:, prob.center_k] * np.maximum(prob.dni_obj, 0.0)
+    weight = np.where(weight > 0, weight, prob.rs.unit_beam[:, prob.center_k])  # dark mirrors still spread
+    n_adm = adm.sum(axis=1)
+    dist_mid = np.abs(levels - zc)
+    choice = np.full(n, prob.center_k)
+    for s in np.unique(sector):
+        members = np.flatnonzero(sector == s)
+        members = members[np.lexsort((-weight[members], n_adm[members]))]
+        load = np.zeros(levels.size)
+        for i in members:
+            score = np.where(adm[i], load / cap, np.inf)
+            best = score.min()
+            pick = np.flatnonzero(score <= best + 1e-12 * max(best, 1.0))
+            j = int(pick[np.argmin(dist_mid[pick])])
+            choice[i] = ks[j]
+            load[j] += weight[i]
+    return np.where(prob.available, choice, -1)
+
+
+def initial_plan(prob: AimProblem, mode: str = "spread") -> np.ndarray | None:
+    """The initial aim plan of an offline solve without a working state: "spread" (``solve_spread``),
+    "kfactor" (``solve_kfactor``), "center", or "none" (no initial plan: cold start, no move pricing)."""
+    if mode == "none":
+        return None
+    if mode == "spread":
+        return solve_spread(prob)
+    if mode == "kfactor":
+        return solve_kfactor(prob)[0]
+    if mode == "center":
+        return solve_center(prob)
+    raise ValueError(f"Unknown initial aim '{mode}' (spread, kfactor, center, none)")
+
+
+def move_cost(prob: AimProblem, prev_xyz: np.ndarray | None, prev_active=None, spec: APSSpec | None = None):
+    """(N, K) price in W of moving each mirror from its initial aim to each candidate, as in the greedy score:
+    ``move_penalty_per_m`` x the mirror's centre-aim absorbed power x the aim shift (m). Mirrors inactive in
+    the initial state move for free. None without an initial state or with a zero price."""
+    spec = spec or prob.case.aps
+    if prev_xyz is None or spec.move_penalty_per_m <= 0:
+        return None
+    p_ref = prob.absorbed_power[:, prob.center_k]
+    move = np.linalg.norm(prob.aim_xyz - prev_xyz[:, None, :], axis=-1)
+    if prev_active is not None:
+        move = move * np.asarray(prev_active)[:, None]
+    return spec.move_penalty_per_m * p_ref[:, None] * move
+
+
+def plan_move_cost(cost: np.ndarray | None, choice: np.ndarray) -> float:
+    """Move price of a plan (W); defocusing is free."""
+    if cost is None:
+        return 0.0
+    on = np.flatnonzero(np.asarray(choice) >= 0)
+    return float(cost[on, np.asarray(choice)[on]].sum())
+
+
+def _normals_towards(xyz, aim_xyz, sun_elevation: float, sun_azimuth: float) -> np.ndarray:
+    normals, *_ = optics.heliostat_geometry(xyz, aim_xyz, sun.sun_vector(sun_elevation, sun_azimuth))
+    return normals
+
+
+def move_limits(prob: AimProblem, xyz: np.ndarray, prev, prev_active=None, spec: APSSpec | None = None):
+    """(N, K) bool: candidates within ``max_aim_shift_m`` (aim shift on the receiver) and ``max_rotation_deg``
+    (mirror-normal rotation at this sun) of the initial state; None without an initial state or limits.
+    The candidate nearest to the initial aim always stays allowed (the initial aim need not be a candidate),
+    and mirrors inactive in the initial state are not limited (their pose is unknown)."""
+    spec = spec or prob.case.aps
+    if prev is None or (spec.max_aim_shift_m <= 0 and spec.max_rotation_deg <= 0):
+        return None
+    rec = prob.case.receiver
+    prev_xyz = surface_point(rec, prev[0], prev[1])
+    shift = np.linalg.norm(prob.aim_xyz - prev_xyz[:, None, :], axis=-1)
+    ok = np.ones((prob.n, prob.k), dtype=bool)
+    if spec.max_aim_shift_m > 0:
+        ok &= shift <= spec.max_aim_shift_m + 1e-9
+    if spec.max_rotation_deg > 0:
+        el, az = prob.rs.sun_elevation, prob.rs.sun_azimuth
+        n_prev = _normals_towards(xyz, prev_xyz, el, az)
+        n_cand = _normals_towards(np.asarray(xyz)[:, None, :], prob.aim_xyz, el, az)
+        ang = np.degrees(np.arccos(np.clip(np.einsum("nkc,nc->nk", n_cand, n_prev), -1.0, 1.0)))
+        ok &= ang <= spec.max_rotation_deg + 1e-9
+    if prev_active is not None:
+        ok |= ~np.asarray(prev_active, dtype=bool)[:, None]
+    ok[np.arange(prob.n), shift.argmin(axis=1)] = True
+    return ok
+
+
+def move_stats(case: Case, xyz: np.ndarray, sun_elevation: float, sun_azimuth: float, prev, prev_active,
+               aim, active, moved_tol_m: float = 0.5) -> tuple[dict, dict]:
+    """How far every mirror moves from its initial state to a plan: (per-mirror arrays, summary).
+
+    ``shift_m`` = distance between the initial and the new aim point on the receiver; ``rotation_deg`` = angle
+    between the mirror normals that track the two aims at this sun (what the drives must turn). A mirror counts
+    as moved above ``moved_tol_m``; switched on / off compares the active flags."""
+    rec = case.receiver
+    xyz = np.asarray(xyz, dtype=float)
+    p_xyz = surface_point(rec, np.asarray(prev[0], float), np.asarray(prev[1], float))
+    a_xyz = surface_point(rec, np.asarray(aim[0], float), np.asarray(aim[1], float))
+    shift = np.linalg.norm(a_xyz - p_xyz, axis=1)
+    n0 = _normals_towards(xyz, p_xyz, sun_elevation, sun_azimuth)
+    n1 = _normals_towards(xyz, a_xyz, sun_elevation, sun_azimuth)
+    rot = np.degrees(np.arccos(np.clip(np.einsum("nc,nc->n", n0, n1), -1.0, 1.0)))
+    was = np.ones(len(shift), bool) if prev_active is None else np.asarray(prev_active, dtype=bool)
+    now = np.asarray(active, dtype=bool)
+    both = was & now
+    moved = both & (shift > moved_tol_m)
+    spec = case.aps
+    within = np.ones(len(shift), bool)
+    if spec.max_aim_shift_m > 0:
+        within &= ~both | (shift <= spec.max_aim_shift_m + 1e-6)
+    if spec.max_rotation_deg > 0:
+        within &= ~both | (rot <= spec.max_rotation_deg + 1e-6)
+
+    def q(v, f):
+        return round(float(f(v)), 4) if v.size else 0.0
+
+    s_both, r_both = shift[both], rot[both]
+    summary = {
+        "n_mirrors": int(len(shift)), "n_moved": int(moved.sum()), "moved_tol_m": moved_tol_m,
+        "n_switched_on": int((~was & now).sum()), "n_switched_off": int((was & ~now).sum()),
+        "mean_shift_m": q(s_both, np.mean), "p95_shift_m": q(s_both, lambda v: np.percentile(v, 95)),
+        "max_shift_m": q(s_both, np.max), "mean_rotation_deg": q(r_both, np.mean),
+        "p95_rotation_deg": q(r_both, lambda v: np.percentile(v, 95)), "max_rotation_deg": q(r_both, np.max),
+        "move_penalty_per_m": spec.move_penalty_per_m, "max_aim_shift_m": spec.max_aim_shift_m,
+        "max_rotation_deg_limit": spec.max_rotation_deg, "within_limits": bool(within.all()),
+        "n_outside_limits": int((~within).sum()),
+    }
+    if case.engine.max_slew_deg_s > 0:
+        summary["max_slew_time_s"] = round(float(r_both.max() / case.engine.max_slew_deg_s), 2) if r_both.size else 0.0
+    return {"shift_m": shift, "rotation_deg": rot, "moved": moved, "within_limits": within}, summary
+
+
 def solve_greedy(
     prob: AimProblem,
     spec: APSSpec,
@@ -546,6 +728,13 @@ def solve_greedy(
     else:
         score_all = objective_power
     tol = spec.tie_tolerance
+    # with an initial state, near-equal candidates (within the tie tolerance) prefer the smaller move first
+    tie_first = None
+    if prev_aim_xyz is not None:
+        stay = np.linalg.norm(prob.aim_xyz - prev_aim_xyz[:, None, :], axis=-1)
+        if prev_active is not None:
+            stay = stay * np.asarray(prev_active)[:, None]
+        tie_first = np.round(stay / TIE_MOVE_STEP_M)
     avail = prob.available
     order = np.argsort(-prob.sigma[:, prob.center_k], kind="stable")  # image-size priority
     stats = {"moves": 0, "flux_limited": 0}
@@ -569,8 +758,11 @@ def solve_greedy(
         score = score_all[i]
         if feasible.any():
             best = score[feasible].max()
-            ties = feasible & (score >= best - tol * max(p_ref[i], 1e-9))
-            return int(np.flatnonzero(ties)[np.argmin(ratio[ties])])
+            ties = np.flatnonzero(feasible & (score >= best - tol * max(p_ref[i], 1e-9)))
+            if tie_first is not None:
+                rank = tie_first[i, ties]
+                ties = ties[rank == rank.min()]
+            return int(ties[np.argmin(ratio[ties])])
         return -1 if spec.allow_defocus else int(np.argmin(ratio))
 
     reach = prob.reach
@@ -596,7 +788,7 @@ def solve_greedy(
     def reassign_all(seq) -> None:
         """``reassign`` over ``seq``: compiled when available (bit-identical), else the loop."""
         if kernels.enabled():
-            kernels.greedy_pass(prob, seq, choice, flux, score_all, p_ref, tol, stats)
+            kernels.greedy_pass(prob, seq, choice, flux, score_all, p_ref, tol, stats, tie_first)
         else:
             for i in seq:
                 reassign(i)
@@ -660,7 +852,8 @@ def subfield_of(prob: AimProblem, n_sub: int) -> np.ndarray:
     return np.minimum((az / (360.0 / max(1, n_sub))).astype(int), max(1, n_sub) - 1)
 
 
-def solve_subfield(prob: AimProblem, spec: APSSpec, n_sub: int | None = None) -> tuple[np.ndarray, dict]:
+def solve_subfield(prob: AimProblem, spec: APSSpec, n_sub: int | None = None, prev_aim_xyz: np.ndarray | None = None,
+                   prev_active: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """Subfield decomposition (HALOS-style): sectors solved independently, so they can run in parallel.
 
     Sector k may use, at every constraint point p, the share
@@ -689,7 +882,7 @@ def solve_subfield(prob: AimProblem, spec: APSSpec, n_sub: int | None = None) ->
             continue
         t0 = _time.perf_counter()
         sub = _SubProblem(prob, members, prob.limit * share[k])
-        ch, _ = solve_greedy(sub, spec)
+        ch, _ = solve_greedy(sub, spec, prev_aim_xyz, prev_active)
         choice[members] = ch[members]
         times.append(_time.perf_counter() - t0)
     return choice, {"subfield_sectors": n_sub, "subfield_sizes": sizes, "subfield_serial_s": float(sum(times)),
@@ -721,8 +914,10 @@ def _milp_matrices(prob: AimProblem):
     return a_flux, a_one
 
 
-def solve_milp(prob: AimProblem, spec: APSSpec, relax: bool = False, max_nnz: int | None = None):
-    """Exact 0/1 programme (or its LP relaxation) with HiGHS. Returns (choice, info)."""
+def solve_milp(prob: AimProblem, spec: APSSpec, relax: bool = False, max_nnz: int | None = None, cost=None):
+    """Exact 0/1 programme (or its LP relaxation) with HiGHS. Returns (choice, info).
+
+    ``cost`` (N, K) W, from ``move_cost``: maximise absorbed power minus the move price."""
     from scipy.optimize import Bounds, LinearConstraint, milp
 
     max_nnz = int(getattr(spec, "milp_max_nnz", 4_000_000) if max_nnz is None else max_nnz)
@@ -739,8 +934,9 @@ def solve_milp(prob: AimProblem, spec: APSSpec, relax: bool = False, max_nnz: in
     ub_x = np.repeat(prob.available.astype(float), k)
     if prob.reach is not None:
         ub_x = ub_x * prob.reach.ravel()
+    gain = prob.absorbed_power if cost is None else prob.absorbed_power - cost
     res = milp(
-        c=-prob.absorbed_power.ravel(),
+        c=-gain.ravel(),
         integrality=np.zeros(n * k) if relax else np.ones(n * k),
         bounds=Bounds(np.zeros(n * k), ub_x),
         constraints=[LinearConstraint(a_one, lb_one, ub_one),
@@ -796,9 +992,9 @@ def solve(
         if method == "greedy":
             return solve_greedy(prob, spec, prev_xyz, prev_active, init=warm, priority=priority)
         if method == "milp":
-            return solve_milp(prob, spec)
+            return solve_milp(prob, spec, cost=move_cost(prob, prev_xyz, prev_active, spec))
         if method == "subfield":
-            return solve_subfield(prob, spec)
+            return solve_subfield(prob, spec, prev_aim_xyz=prev_xyz, prev_active=prev_active)
         raise ValueError(f"Unknown APS method '{method}'")
 
     choice, extra = run(init)

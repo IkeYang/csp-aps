@@ -76,8 +76,13 @@ def _weighted_upper(prob, beam, intercepted, allowed, snap, weight):
 
 
 def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials=None, shading_points=None,
-                       tighten_bound=True, tracking_reference=None):
+                       tighten_bound=True, tracking_reference=None, move_cost=None):
     """Evaluate joint poses with their actual neighbours. Certify the sampled model.
+
+    ``move_cost`` (N, K) W, from ``aps.move_cost``: plans are selected by the objective minus their move price,
+    so the search keeps the plan near its initial state unless a move pays. The certificate stays one of the
+    objective without the price: the exhaustive bound is the best unpriced objective over all joint poses,
+    the gap is that of the selected plan's unpriced objective (what staying near the initial state costs).
 
     The independent, unshaded per-mirror maxima dominate every feasible combination:
     shading factors lie in [0,1], and the uniformity penalty is nonnegative. For small
@@ -115,9 +120,12 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
 
     reference = prob.tracking_reference() if tracking_reference is None else tracking_reference
     best_motion = None
+    best_raw = None  # unpriced objective of the selected plan
+    top_raw = [-np.inf]  # best unpriced objective of any legal, verified joint pose (exhaustive bound)
+    from .aps import plan_move_cost
 
     def consider(ch):
-        nonlocal best, best_value, best_motion, fallback
+        nonlocal best, best_value, best_motion, best_raw, fallback
         ch = np.asarray(ch, dtype=int)
         key = ch.tobytes()
         if key in seen:
@@ -129,11 +137,13 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
         args = dict(aim=prob.aims(ch), active=on, grid=prob.grid, shading_points=shading_points)
         snap = evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_obj, **args)
         value = snap.thermal_objective(uni)
+        priced = value["objective_w"] - plan_move_cost(move_cost, ch)
         # Lexicographic tie-break on commands. The thermal score and its certificate stay in watts.
         motion = (np.count_nonzero(on != (reference >= 0)), np.count_nonzero(ch != reference))
-        better = value["objective_w"] > best_value or (value["objective_w"] == best_value and
-                                                        (best_motion is None or motion < best_motion))
-        if fallback is not None and (not legal or not value["uniformity_met"] or not better):
+        better = priced > best_value or (priced == best_value and (best_motion is None or motion < best_motion))
+        # a pose that may raise the best unpriced objective is still checked: the exhaustive bound needs it
+        raw_better = value["objective_w"] > top_raw[0]
+        if fallback is not None and (not legal or not value["uniformity_met"] or not (better or raw_better)):
             return
         forecast = (evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_con, **args)
                     if separate_forecast else snap)
@@ -142,8 +152,10 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
         entry = (ch.copy(), snap, value, check)
         if fallback is None:
             fallback = entry
-        if legal and value["uniformity_met"] and check.ok and better:
-            best, best_value, best_motion = entry, value["objective_w"], motion
+        if legal and value["uniformity_met"] and check.ok:
+            top_raw[0] = max(top_raw[0], value["objective_w"])
+            if better:
+                best, best_value, best_motion, best_raw = entry, priced, motion, value["objective_w"]
 
     consider(seed.choice)
     if warm is not None:
@@ -201,9 +213,12 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
     feasible = best is not None
     proven_empty = not feasible and (exact or impossible_load)
     energy_upper = upper
+    priced_value = best_value
+    if feasible:
+        best_value = best_raw  # the certificate is one of the unpriced objective
     bound_mode = "exhaustive_joint_poses" if exact and not impossible_load else "unshaded_energy"
     if exact and feasible:
-        upper = best_value
+        upper = top_raw[0]
     elif feasible and tighten_bound and mode == "weighted" and uni.weight > 0:
         supported = _weighted_upper(prob, beam, intercepted, allowed, snap, uni.weight)
         if supported < upper:
@@ -212,7 +227,8 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
     if gap is not None and gap < -1e-8:
         raise ArithmeticError("Joint-pose incumbent exceeds its unshaded energy bound")
     gap = max(0.0, gap) if gap is not None else None
-    proven = feasible and (exact or upper - best_value <= 1e-8)
+    # exhaustive: proven unless a move price made the search keep a plan below the best unpriced pose
+    proven = feasible and ((exact and move_cost is None) or upper - best_value <= 1e-8)
     status = "certified" if feasible else ("certified_infeasible" if proven_empty else "bound_only")
     thermal_status = ("disabled" if not uni.enabled else
                       "below_min_load" if value["power_h_w"] < minimum else
@@ -236,6 +252,10 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
                 model="mixed mirror poses, sampled shading, area-weighted absorbed flux and verified peak",
                 history=[{"iteration": 1, "upper_bound_mw": upper / 1e6}])
     cert["lambda"] = uni.weight if mode == "weighted" else None
+    if move_cost is not None:
+        cert["move_cost_mw"] = (best_value - priced_value) / 1e6 if feasible else None
+        cert["priced_objective_mw"] = priced_value / 1e6 if feasible else None
+        cert["priced_optimum_proven"] = bool(exact and feasible)
     cert["flux_rejections"] = int(flux_rejections[0])  # joint poses refused by the fine-grid flux check
     # From any pivot all receiver targets lie in the angular cone subtended by
     # its enclosing sphere. Cosine is maximal at the cone's edge nearest the sun.

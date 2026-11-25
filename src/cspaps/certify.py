@@ -480,9 +480,13 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
     3. The best plan that improves the objective is verified on the fine grid
        (hotspots added as constraints, repaired); otherwise the input plan is kept.
     4. A second bound run from the final plan; the reported bound is the smaller one.
+    With an initial state (``prev``) and ``aps.move_penalty_per_m`` > 0, plans are compared by the objective
+    minus their move price (``aps.move_cost``): a rounding of the relaxation may not undo the move pricing. The
+    bound stays the bound of the objective without the price (>= the priced optimum, so still valid); the
+    certificate reports the plan's price as ``move_cost_mw``.
     Returns (AimResult, certificate dict).
     """
-    from .aps import finalize, solve_greedy, uniformity_info
+    from .aps import finalize, move_cost, plan_move_cost, solve_greedy, uniformity_info
     from .receiver import surface_point
     from .uniformity import _local_search, _State, region_of_grid
 
@@ -499,7 +503,13 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
     b1 = aps_upper_bound(prob, base_choice, mode, lam, eps, min_load_w, h_mask, mu0=mu,
                          max_iter=max_iter, time_limit_s=time_limit_s)
     relaxed = b1.pop("_relaxed")
-    base_val = _model_value(prob, base_choice, mode, lam, eps, min_load_w, h_mask)
+    cost = move_cost(prob, prev_xyz, prev_active, spec)
+
+    def priced(choice):
+        v = _model_value(prob, choice, mode, lam, eps, min_load_w, h_mask)
+        return None if v is None else v - plan_move_cost(cost, choice)
+
+    base_val = priced(base_choice)
     order = np.argsort(-prob.sigma[:, prob.center_k], kind="stable")
     rng = np.random.default_rng(seed)
 
@@ -524,7 +534,7 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
     for start in tried:
         start = np.where(prob.available, start, -1)
         ch = polish(start)
-        v = _model_value(prob, ch, mode, lam, eps, min_load_w, h_mask)
+        v = priced(ch)
         if v is not None and (best_val is None or v > best_val + 1e-9 * max(abs(best_val), 1.0)):
             best_choice, best_val = ch, v
             n_improved += 1
@@ -539,8 +549,8 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
             choice = polish(choice)
             check = prob.verify(choice)
             rounds_v += 1
-        v = _model_value(prob, choice, mode, lam, eps, min_load_w, h_mask)
-        base_now = _model_value(prob, base_choice, mode, lam, eps, min_load_w, h_mask)
+        v = priced(choice)
+        base_now = priced(base_choice)
         ok = (not spec.verify or check.status in ("ok", "margin_reduced")) and v is not None and \
             (base_now is None or v > base_now)
         if ok:
@@ -564,7 +574,8 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
         cert["status"] = "certified"
     elif mode == "cv_limit" and ub < 0:
         cert["status"], cert["gap"] = "certified_infeasible", None
-    cert["objective_before_mw"] = None if base_val is None else base_val / 1e6
+    cert["objective_before_mw"] = None if base_val is None else (base_val + plan_move_cost(cost, base_choice)) / 1e6
+    cert["move_cost_mw"] = plan_move_cost(cost, final.choice) / 1e6
     cert["improved_by_relaxation"] = bool(accepted)
     cert["roundings_tried"] = len(tried)
     cert["iterations"] = b1["iterations"] + b2["iterations"]
