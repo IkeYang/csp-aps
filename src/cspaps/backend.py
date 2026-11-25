@@ -42,14 +42,41 @@ def enabled() -> bool:
     return os.environ.get("CSPAPS_GPU", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def detected_gpus() -> int:
-    """Visible CUDA devices (0 without CuPy / driver / device), whether or not the backend is on."""
+def gpu_inventory() -> dict:
+    """The visible CUDA devices, whether or not the backend is on (for the interface):
+    ``{"devices": [{"id", "name", "memory_gb"}], "error": None | "no_cupy" | "no_driver" | "no_device",
+    "detail": str}``."""
     try:
         import cupy
+    except Exception as exc:  # noqa: BLE001 - not installed / broken install
+        return {"devices": [], "error": "no_cupy", "detail": repr(exc)}
+    try:
+        n = int(cupy.cuda.runtime.getDeviceCount())
+    except Exception as exc:  # noqa: BLE001 - no driver, driver too old for this CuPy, no device node
+        return {"devices": [], "error": "no_driver", "detail": repr(exc)}
+    devs = []
+    for i in range(n):
+        try:
+            props = cupy.cuda.runtime.getDeviceProperties(i)
+            name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
+            mem = float(props.get("totalGlobalMem", 0)) / 2 ** 30
+        except Exception:  # noqa: BLE001
+            name, mem = "?", 0.0
+        devs.append({"id": i, "name": name, "memory_gb": round(mem, 1)})
+    return {"devices": devs, "error": None if devs else "no_device", "detail": ""}
 
-        return int(cupy.cuda.runtime.getDeviceCount())
-    except Exception:  # noqa: BLE001
-        return 0
+
+def detected_gpus() -> int:
+    """Visible CUDA devices (0 without CuPy / driver / device), whether or not the backend is on."""
+    return len(gpu_inventory()["devices"])
+
+
+def selected_gpus() -> list[int]:
+    """The devices the calculations of this process will use ([] = CPU only)."""
+    if not enabled():
+        return []
+    visible = {d["id"] for d in gpu_inventory()["devices"]}
+    return [d for d in devices() if d in visible]
 
 
 def _cupy():

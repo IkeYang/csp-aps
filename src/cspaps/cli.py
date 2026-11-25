@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -179,6 +180,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("gui", help="open the graphical interface in the browser")
     sp.add_argument("case", nargs="?", default=None)
     sp.add_argument("--port", type=int, help="browser port (auto-select a free port when omitted)")
+    sp.add_argument("--gpus", default=None,
+                    help="GPUs the interface starts with: a number, ids like 0,2,5, 0 (CPU only) or 'all' "
+                         "(changeable in the sidebar under 计算资源)")
+    sp.add_argument("--workers", type=int, default=None, help="parallel worker processes the interface starts with")
     return p
 
 
@@ -200,6 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     _TRACKER = ProgressTracker()  # elapsed / remaining times count from the start of this command
     args = build_parser().parse_args(argv)
     if args.command == "gui":
+        if args.gpus is not None:  # the Streamlit process inherits the environment
+            from .backend import set_resources
+
+            set_resources([int(v) for v in str(args.gpus).split(",") if v.strip()] if "," in str(args.gpus)
+                          else args.gpus)
+        if args.workers is not None:
+            os.environ["CSPAPS_WORKERS"] = str(int(args.workers))
         app = Path(__file__).with_name("gui_app.py")
         cmd = [sys.executable, "-m", "streamlit", "run", str(app),
                "--theme.base", "light", "--theme.primaryColor", "#14806f", "--theme.backgroundColor", "#f4f6f6",

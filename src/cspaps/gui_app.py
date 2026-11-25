@@ -728,12 +728,14 @@ def _job_button(key: str, label: str, fn, *args, cancellable: bool = False, help
     digest = _input_digest(case, args, kwargs) if key in ("lv", "single", "opt", "recalc") else None
     job = st.session_state.get(f"job_{key}")
     if job is None or job.done:
+        st.caption(f"计算设备：{_device_summary()}（在左侧“计算资源”里更改）")
         if st.button(label, key=f"btn_{key}", type="primary", help=help, width="stretch"):
             if cancellable:
                 kwargs["cancel"] = True
             # the chosen depth's time estimate (if a depth was chosen for this task) for the overall remaining time
             expected = st.session_state.get(f"expected_s_{DEPTH_TASK_OF_JOB.get(key, '')}")
             job = Job(fn, case, RESULTS, *args, input_digest=digest, expected_s=expected, **kwargs)
+            job.device = _device_summary()
             if os.environ.get("CSPAPS_GUI_SYNC"):
                 job.collect(key)
             else:
@@ -764,7 +766,7 @@ def _job_status(key: str) -> None:
             st.progress(min(state.elapsed_s / job.tracker.expected_total_s, 0.99), text=f"⏳ {msg}")
         else:
             st.info(f"⏳ {msg}")
-        st.caption(describe_zh(state))
+        st.caption(describe_zh(state) + (f" · 计算设备：{job.device}" if getattr(job, "device", None) else ""))
         if job.cancellable and st.button("取消", key=f"cancel_{key}"):
             job.cancel.set()
         return
@@ -3781,34 +3783,102 @@ def page_runs(case) -> None:
                 st.rerun()
 
 
-@st.cache_resource(show_spinner=False)
-def _detected_gpus() -> int:
-    from cspaps.backend import detected_gpus
+GPU_ERROR_ZH = {
+    "no_cupy": "没有安装 CuPy：在本机运行 pip install -e \".[gpu]\"（CUDA 12 驱动；CUDA 11 驱动装 cupy-cuda11x），然后重启界面。",
+    "no_driver": "CuPy 已安装，但找不到可用的 NVIDIA 驱动（或驱动版本与 CuPy 不匹配）：先确认 nvidia-smi 能列出显卡。",
+    "no_device": "驱动正常，但没有可用的 NVIDIA 显卡（检查 CUDA_VISIBLE_DEVICES 是否把卡都屏蔽了）。",
+}
 
-    return detected_gpus()
+
+def _gpu_model(d: dict) -> str:
+    return f"{d['name'].replace('NVIDIA ', '').replace('GeForce ', '')} · {d['memory_gb']:g} GB"
+
+
+def _gpu_models_text(devs: list[dict]) -> str:
+    """"8 × RTX 2080 Ti · 11 GB" when the cards are alike, else one line per card."""
+    models = [_gpu_model(d) for d in devs]
+    if len(set(models)) == 1:
+        return f"{len(models)} × {models[0]}"
+    return "；".join(f"GPU {d['id']}：{m}" for d, m in zip(devs, models))
+
+
+def _workers_now() -> int:
+    """Parallel processes the scenario-level jobs will use (the case's layout setting, or the depth's choice)."""
+    from cspaps.parallel import n_workers
+
+    try:
+        return n_workers(int(st.session_state["case_dict"].get("layout_opt", {}).get("workers", 1)))
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+def _device_summary() -> str:
+    """What the calculations run on, in one line (sidebar, next to every start button, running jobs)."""
+    from cspaps import backend
+
+    gpus = backend.selected_gpus()
+    w = _workers_now()
+    if gpus:
+        return f"GPU {'、'.join(map(str, gpus))}（{len(gpus)} 张）+ CPU {w} 个进程"
+    return f"仅 CPU，{w} 个进程"
 
 
 def _resources() -> None:
-    """Hardware of this computer: usable CPUs (read from the system) and how many GPUs the calculations use."""
+    """Compute resources: CPU / GPU, which GPUs, how many processes -- always visible in the sidebar."""
     from cspaps import backend
     from cspaps.parallel import cpu_count
 
-    n_gpu = _detected_gpus()
-    with st.expander("计算资源", expanded=False):
-        st.caption(f"本机可用 CPU {cpu_count()} 个（按进程亲和性与容器配额读取）；检测到 GPU {n_gpu} 张。")
-        if n_gpu == 0:
-            st.caption("未检测到可用 GPU（未安装 CuPy 或没有 NVIDIA 显卡），全部在 CPU 上计算。")
-            return
-        current = len(backend.devices()) if backend.enabled() else 0
-        use = st.number_input("使用 GPU 数（0 = 只用 CPU）", min_value=0, max_value=n_gpu, value=min(current, n_gpu),
-                              step=1, key="use_gpus",
-                              help="工作进程按顺序轮流分到这些卡上；并行进程数在参数设置的“并行进程”里设（-1 = 全部 CPU）。")
-        if int(use) != current:
-            backend.set_resources(int(use))
+    inv = backend.gpu_inventory()
+    devs = inv["devices"]
+    cpus = cpu_count()
+    with st.container(border=True):
+        st.markdown("**⚡ 计算资源**")
+        st.caption(f"本机可用 CPU {cpus} 个 · 检测到 NVIDIA GPU {len(devs)} 张")
+        if devs:
+            ids = [d["id"] for d in devs]
+            st.caption(_gpu_models_text(devs))
+            current = backend.selected_gpus()
+            mode = st.radio("计算设备", ["gpu", "cpu"], index=0 if current else 1, horizontal=True, key="compute_device",
+                            format_func={"gpu": "GPU 加速", "cpu": "仅 CPU"}.get,
+                            help="GPU 加速：光斑核、细网格复核、热流图、阴影遮挡和均匀度局部搜索在显卡上算；"
+                                 "结果与 CPU 相差在舍入以内，比较布局时不要混用两种结果。")
+            chosen = []
+            if mode == "gpu":
+                chosen = st.multiselect("使用哪些显卡", ids, default=current or ids, format_func=lambda i: f"GPU {i}",
+                                        key="gpu_ids",
+                                        help="工作进程按顺序轮流分到选中的卡上，同一张卡上的进程平分显存。")
+                if not chosen:
+                    st.warning("没有选中显卡，按仅 CPU 计算。")
+                search = st.checkbox("均匀度局部搜索也在 GPU 上", key="gpu_search",
+                                     value=os.environ.get("CSPAPS_GPU_SEARCH", "1") != "0",
+                                     help="两万面镜时它约占 CPU 时间的三成。显卡同时驱动桌面且有看门狗时可关掉，"
+                                          "其余 GPU 计算不受影响。")
+                os.environ["CSPAPS_GPU_SEARCH"] = "1" if search else "0"
+            if sorted(chosen) != sorted(current):
+                backend.set_resources(sorted(chosen) if chosen else 0)
+                st.rerun()
+        else:
+            st.caption("当前：仅 CPU。" + GPU_ERROR_ZH.get(inv["error"], ""))
+            if inv.get("detail"):
+                with st.expander("检测详情"):
+                    st.code(inv["detail"])
+        w_now = _workers_now()
+        w = st.number_input("并行进程数（同时求解的工况数）", min_value=1, max_value=max(cpus, w_now), value=w_now, step=1,
+                            key=f"n_workers:{st.session_state.get('ver', 0)}",  # follows the loaded case
+                            help=f"建议 = 可用 CPU 数 − 1（{max(1, cpus - 1)}）。串行搜索在 CPU 核上跑，显卡负责各进程的光斑核，"
+                                 "所以进程数按 CPU 核数取，不按显卡数取。")
+        if int(w) != w_now:
+            os.environ["CSPAPS_WORKERS"] = str(int(w))  # the depths use it too
+            data = st.session_state["case_dict"]
+            data.setdefault("layout_opt", {})["workers"] = int(w)
+            data.setdefault("annual", {})["workers"] = int(w)
+            st.session_state["ver"] += 1
             st.rerun()
-        if use:
-            st.caption(f"光斑核、复核、阴影和均匀度局部搜索在前 {int(use)} 张卡上计算。每张卡多个进程时建议先运行 "
-                       "`nvidia-cuda-mps-control -d`。")
+        gpus = backend.selected_gpus()
+        st.caption(f"将使用：{_device_summary()}")
+        if gpus and w > len(gpus):
+            st.caption(f"每张卡约 {-(-int(w) // len(gpus))} 个进程：建议先在本机运行 `nvidia-cuda-mps-control -d`，"
+                       "让它们的显卡计算同时进行。")
 
 
 def main() -> None:
@@ -3841,6 +3911,7 @@ def main() -> None:
             st.download_button("保存当前参数 (YAML)", case.to_yaml().encode("utf-8"), file_name=f"{case.name}.yaml")
         else:
             st.error(err)
+        _resources()
         up = st.file_uploader("载入算例 YAML", type=["yaml", "yml"])
         if up is not None and st.session_state.get("loaded_upload") != (up.name, up.size):
             st.session_state["loaded_upload"] = (up.name, up.size)
@@ -3849,7 +3920,6 @@ def main() -> None:
         if st.button("恢复阿克塞演示算例"):
             _load_into_state(yaml.safe_load(DEFAULT_CASE.read_text(encoding="utf-8")), DEFAULT_CASE.parent)
             st.rerun()
-        _resources()
         st.caption(f"结果目录 {RESULTS}")
     {"总览": page_overview, "瞄准优化": page_aps, "布局优化": page_layout, "云影回放": page_replay,
      "光学校验": page_optics, "参数设置": page_parameters, "运行记录": page_runs, "方法与理论": page_theory}[page](case)

@@ -94,7 +94,7 @@ class _Module(types.ModuleType):
         runtime = types.SimpleNamespace(
             getDeviceCount=lambda: mod.n_devices,
             memGetInfo=lambda: mem,
-            getDeviceProperties=lambda dev: {"name": b"Fake GPU"},
+            getDeviceProperties=lambda dev: {"name": b"NVIDIA GeForce RTX 2080 Ti", "totalGlobalMem": 11 << 30},
         )
         self.cuda = types.SimpleNamespace(Device=Device, runtime=runtime)
         self._pool = MemoryPool()
