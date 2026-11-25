@@ -268,8 +268,17 @@ def solve_instant(case: Case, fld: Field, elevation: float, azimuth: float, dni,
     initial = res.choice.copy()
     dual = None
     if settings.certify_rounds > 0 and (prob.k + 1) ** min(prob.n, 20) > c.aps.coupled_exact_limit:
-        res, dual = improve_and_certify(prob, res, c.aps, rounds=settings.certify_rounds,
-                                        max_iter=settings.certify_iters, time_limit_s=1e9)
+        from .certify import FORMAL_CERTIFY_MAX_BYTES, model_bytes
+
+        # the formal value must be reproducible: skip by a fixed size rule (inputs only), never by the memory free
+        # at the moment; below it, a computer short of memory stops with CertificateTooLarge instead of swapping
+        need = model_bytes(prob)
+        if need > FORMAL_CERTIFY_MAX_BYTES:
+            solver_info["certificate_skipped"] = (f"model of {need / 2 ** 30:.1f} GB above the formal limit of "
+                                                  f"{FORMAL_CERTIFY_MAX_BYTES / 2 ** 30:.0f} GB")
+        else:
+            res, dual = improve_and_certify(prob, res, c.aps, rounds=settings.certify_rounds,
+                                            max_iter=settings.certify_iters, time_limit_s=1e9)
     res, cert = search_joint_poses(prob, fld, res, warm=initial if warm is None else warm,
                                    trials=settings.joint_trials, tighten_bound=True)
     snap = evaluate(c, fld, elevation, azimuth, dni_v, aim=res.aim, active=res.active, grid=grid)

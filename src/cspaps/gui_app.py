@@ -1117,6 +1117,47 @@ def _site_check(case, layouts: dict, key: str, height: int = 500) -> None:
             st.dataframe(pd.DataFrame(rows), hide_index=True)
 
 
+def _default_time(case) -> pd.Timestamp:
+    """The instant a time picker starts at: the case's ``realtime.start``, or -- when the case reads a weather
+    file that does not cover it -- the sunniest record of that file."""
+    from cspaps.sun import weather_coverage
+
+    t = pd.Timestamp(case.realtime.start)
+    try:
+        cov = weather_coverage(case)
+    except Exception:  # noqa: BLE001 - missing file: reported elsewhere
+        cov = None
+    if cov is None:
+        return t
+    local = t.tz_localize(case.site.timezone) if t.tzinfo is None else t
+    if cov["first"] - cov["tolerance"] <= local <= cov["last"] + cov["tolerance"]:
+        return t
+    return cov["suggested"].tz_localize(None)
+
+
+def _weather_window(case, stamp: str) -> None:
+    """Under a time picker: the span of the case's weather file, and a blocking error if ``stamp`` is outside it
+    (the file says nothing about that instant)."""
+    from cspaps.sun import weather_coverage
+
+    try:
+        cov = weather_coverage(case)
+    except Exception:  # noqa: BLE001
+        return
+    if cov is None:
+        return
+    st.caption(f"气象文件 {Path(case.weather.file).name} 覆盖 {cov['first']:%Y-%m-%d %H:%M} – {cov['last']:%Y-%m-%d %H:%M}"
+               f"（{cov['n']} 条，间隔 {cov['step'].total_seconds() / 60:.0f} min）。")
+    t = pd.Timestamp(stamp)
+    t = t.tz_localize(case.site.timezone) if t.tzinfo is None else t
+    if not cov["first"] - cov["tolerance"] <= t <= cov["last"] + cov["tolerance"]:
+        msg = (f"所选时刻 {t:%Y-%m-%d %H:%M} 不在气象文件的时间范围内，无法取得该时刻的 DNI；"
+               f"请选 {cov['first']:%Y-%m-%d %H:%M} 到 {cov['last']:%Y-%m-%d %H:%M} 之间的时刻"
+               f"（例如 {cov['suggested']:%Y-%m-%d %H:%M}），或把气象来源改为晴空模型。")
+        st.error(msg)
+        INPUT_ERRORS.append("所选时刻不在气象文件范围内")
+
+
 @st.cache_data(show_spinner=False)
 def _sun_info(case_yaml: str, base_dir: str, stamp: str):
     try:
@@ -1588,10 +1629,11 @@ def page_aps(case) -> None:
             _templates(["heliostats", "dni_points"], "aps")
         with _card("aps_conditions"):
             _section(1, "运行工况", "选择时刻与镜场 DNI 分布。太阳位置由经纬度和时区计算。")
-            default_time = pd.Timestamp(case.realtime.start)
+            default_time = _default_time(case)
             c1, c2 = st.columns(2)
             date = c1.date_input("日期", value=default_time.date(), key=f"s_date:{case.name}")
             tm = c2.time_input("当地时间", value=default_time.time(), key=f"s_time:{case.name}", step=300)
+            _weather_window(case, f"{date} {tm}")
             with st.expander("镜场坐标、定日镜与吸热器（给定条件）", expanded=bool(case.field.layout_file)):
                 _field_inputs(case)
             info = _sun_info(case.to_yaml(), st.session_state["base_dir"], f"{date} {tm}")
@@ -1819,6 +1861,12 @@ def _aps_results(res: dict) -> None:
         else:
             _callout("warn", "未找到满足均匀度目标的方案", "当前目标下给出最接近目标的方案；上界为 "
                      f"{cert['upper_bound_mw']:.4f} MW。可放宽 CV 上限或增加候选瞄准点。")
+    skipped = s.get("certificate_skipped")
+    if skipped:
+        _callout("info", "未计算最优性证书（上界与松弛取整）",
+                 f"这个规模的证书模型约需 {skipped['needed_gb']:.0f} GB 内存，本机扣除留给系统的余量后只有 "
+                 f"{skipped['free_gb']:.0f} GB 可用，为避免占满内存把电脑卡死，本次跳过。方案本身已按全部镜子的光束在细网格上"
+                 "复核过热流上限。需要证书时可减少候选瞄准点或求解网格（参数设置 → 瞄准策略），或在内存更大的机器上计算。")
     if chk["status"] == "over_limit":
         st.error(f"第 {chk['hotspot']['panel']} 号管屏的复核热点超出设备限值 {chk['exceedance_kw_m2']:.1f} kW/m²。")
     elif s["status"] == "uniformity_infeasible":
@@ -1840,12 +1888,15 @@ def _aps_results(res: dict) -> None:
         "aim_z": "瞄准高度 (m)", "dni_w_m2": "DNI (W/m²)", "p_receiver_kw": "送达功率 (kW)"}), hide_index=True, height=220)
     tabs = st.tabs(["吸热器热流与瞄准点", "三维瞄准示意", "镜场", "最优性证书", "效率与损失", "逐镜方案"])
     with tabs[0]:
+        _full_field_flux(case, snap, chk)
+        _section(None, "瞄准点与光斑（叠加在同一张热流图上）",
+                 "下图只用于定位：在上面这张全场热流图上标出每面镜的瞄准点，并画出部分镜子的光斑轮廓。")
         color_by = st.radio("瞄准点着色", ["该镜 DNI", "镜子到塔的距离", "送达功率"], horizontal=True, key="s_aim_color")
         dist = np.hypot(fld.xyz[:, 0] - case.receiver.center[0], fld.xyz[:, 1] - case.receiver.center[1])
         vals, vlab = {"该镜 DNI": (snap.dni, "DNI (W/m²)"), "镜子到塔的距离": (dist, "距塔 (m)"),
                       "送达功率": (snap.power["intercept"] / 1e3, "送达 (kW)")}[color_by]
         _chart(receiver_aims_map(case, snap.grid, snap.flux, snap.aim_azimuth, snap.aim_z, snap.active, fld.ids, vals, vlab,
-                                 title="吸热器展开图 · 入射热流与每面镜中心的瞄准点（× 为细网格复核热点）",
+                                 title="瞄准点叠加图 · 底图为全部工作镜的叠加热流（× 为细网格复核热点）",
                                  hotspot=chk, height=460,
                                  spots=_spots(case, fld.xyz, snap.aim_azimuth, snap.aim_z, snap.sun_elevation,
                                               snap.sun_azimuth)), "s_rec")
@@ -1983,6 +2034,38 @@ def _certificate_tab(res: dict, cert: dict | None) -> None:
                 st.caption(f"最细网格的方案比默认网格提高 {100 * (lv[-1]['objective_found_mw'] / lv[0]['objective_found_mw'] - 1):+.2f}%；"
                            f"上界逐级增量 " + " → ".join(f"{lv[i + 1]['upper_bound_mw'] - lv[i]['upper_bound_mw']:+.3f}"
                                                    for i in range(len(lv) - 1)) + " MW。")
+
+
+def _full_field_flux(case, snap, chk: dict | None) -> None:
+    """The receiver as the whole field heats it: every active mirror's spot superposed (no markers), with the
+    uniformity numbers, the panels' peaks against their limits and powers, and the flux profiles."""
+    from cspaps.gui_plots import panel_flux_bars, tradeoff_flux_map, tradeoff_profiles
+    from cspaps.receiver import panel_bounds, panel_flux_table
+
+    grid = snap.grid
+    flux = {"lambdas": np.array([0.0]), "azimuth_deg": grid.azimuth_deg, "z_m": grid.z,
+            "incident_kw_m2": (snap.flux / 1e3)[None], "absorbed_kw_m2": (snap.absorbed_flux / 1e3)[None],
+            "limit_kw_m2": grid.to_map(grid.limit) / 1e3, "panel": grid.to_map(grid.panel) + 1,
+            "panel_edges_deg": np.array([a0 for a0, _ in panel_bounds(case.receiver)], float)}
+    on = int(np.sum(snap.active))
+    fs = snap.flux_stats()
+    _section(None, f"全场叠加热流：全部 {on:,} 面工作镜" + (f"（另有 {snap.n - on:,} 面散焦）" if snap.n > on else ""),
+             f"吸热器展开图上每个格子的热流 = 所有工作镜的光斑在这里叠加的结果（评价网格 {grid.azimuth_deg.size} × "
+             f"{grid.z.size}）。这张图用来看整体是否均匀；峰值与热点以细网格复核为准。")
+    peak = (chk or {}).get("peak_flux_kw_m2")
+    st.caption(f"吸收功率 {snap.p_absorbed / 1e6:,.2f} MW · 平均入射热流 {fs['mean_flux_kw_m2']:.0f} kW/m² · "
+               f"评价网格峰值 {fs['peak_flux_kw_m2']:.0f} kW/m²"
+               + (f" · 细网格复核峰值 {peak:.0f} kW/m²" if peak is not None else "")
+               + f" · 二维 CV {fs['cv_2d']:.3f} · 周向 CV {fs['cv_circumferential']:.3f} · 高度 CV {fs['cv_height']:.3f}"
+               "（CV 越小越均匀）")
+    h = (chk or {}).get("hotspot") or {}
+    row = {"hotspot_azimuth_deg": h.get("azimuth_deg"), "hotspot_z_m": h.get("z_m")} if h else None
+    a, b = st.columns([1.5, 1])
+    with a:
+        _chart(tradeoff_flux_map(flux, 0, row, height=420), "s_full_flux")
+    with b:
+        _chart(panel_flux_bars(panel_flux_table(case.receiver, grid, snap.flux), height=420), "s_full_panels")
+    _chart(tradeoff_profiles(flux, 0, labels=["本方案"]), "s_full_profiles")
 
 
 def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
@@ -2640,7 +2723,7 @@ def _planning_compare(case) -> None:
                          format_func=lambda index: (f"复核排名 {int(rank.iloc[index - 1]['final_rank'])} · "
                                                     f"搜索排名 {int(rank.iloc[index - 1]['search_rank'])}"),
                          help="从本次入围的候选镜场中选一个进行均匀度比较。")
-    compare_time = str(case.realtime.start) if case is not None else "2025-06-21 13:40"
+    compare_time = f"{_default_time(case):%Y-%m-%d %H:%M}" if case is not None else "2025-06-21 13:40"
     t_u = u2.text_input("比较工况时刻", compare_time, key="cmp_t")
     eps_txt = u3.text_input("二维 CV 目标序列", "0.75, 0.7, 0.65, 0.6, 0.55", key="cmp_eps",
                             help="逗号分隔的考核区二维 CV 上限。每个目标都会求一个吸收功率方案。")
@@ -3451,10 +3534,11 @@ def _state_numbers(s: dict, ref: dict | None = None) -> None:
 def _cloud_compare_inputs(case) -> None:
     with _card("cloud_inputs"):
         _section(1, "设定时刻与随机云", "云影冻结在所选时刻：先求晴空下的瞄准方案 A，再让云落到镜场上，对比“沿用 A”与“重新 APS”。")
-        default_time = pd.Timestamp(case.realtime.start)
+        default_time = _default_time(case)
         c1, c2, c3, c4 = st.columns(4)
         date = c1.date_input("日期", value=default_time.date(), key=f"cc_date:{case.name}")
         tm = c2.time_input("当地时间", value=default_time.time(), key=f"cc_time:{case.name}", step=300)
+        _weather_window(case, f"{date} {tm}")
         n_cl = c3.number_input("云的数量", 1, 8, 2, key="cc_n")
         seed = c4.number_input("随机种子（换一组云）", 0, 9999, 3, key="cc_seed")
         c1, c2, c3 = st.columns(3)
@@ -3637,10 +3721,12 @@ def page_optics(case) -> None:
         _solver_benchmark(case)
     with t1:
         c1, c2, c3, c4 = st.columns(4)
-        v_default = pd.Timestamp(case.realtime.start if case is not None else "2025-06-21 13:40")
+        v_default = _default_time(case) if case is not None else pd.Timestamp("2025-06-21 13:40")
         v_case_key = case.name if case is not None else "invalid"
         d = c1.date_input("日期", value=v_default.date(), key=f"v_date:{v_case_key}")
         tm = c2.time_input("当地时间", value=v_default.time(), key=f"v_time:{v_case_key}", step=300)
+        if case is not None:
+            _weather_window(case, f"{d} {tm}")
         rays = c3.number_input("每面镜子光线数", value=2000, step=500, key="v_rays")
         seeds = c4.number_input("随机种子数", value=3, step=1, min_value=1, key="v_seeds")
         validation_methods = ["center", "greedy", "kfactor"]

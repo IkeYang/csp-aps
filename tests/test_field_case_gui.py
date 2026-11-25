@@ -249,3 +249,105 @@ def test_tradeoff_colour_option_beside_the_maps(monkeypatch, tmp_path):
     at.selectbox(key="pareto_ref").set_value(0.5).run()
     at.radio(key="pareto_scale").set_value("contrast").run()
     assert not at.exception
+
+
+# ----------------------------------------------------------------------------- weather file span, full-field flux
+
+@needs_field
+def test_instants_outside_the_weather_file_are_refused():
+    """The field case's weather file covers 2026-06-17 .. 06-21; a 2025 instant took its first record (71 W/m2)."""
+    from cspaps.simulate import sun_state
+    from cspaps.sun import weather_coverage
+
+    case = load_case(FIELD / "case.yaml")
+    cov = weather_coverage(case)
+    assert f"{cov['first']:%Y-%m-%d %H:%M}" == "2026-06-17 08:30" and f"{cov['last']:%Y-%m-%d %H:%M}" == "2026-06-21 07:30"
+    _, el, _, dni = sun_state(case, "2026-06-18 12:00:08")
+    assert dni == pytest.approx(863.34) and el > 60
+    with pytest.raises(ValueError, match="outside the weather file"):
+        sun_state(case, "2025-06-21 12:00")  # realtime.start's default
+
+
+@needs_field
+def test_time_pickers_start_inside_the_weather_file(monkeypatch, tmp_path):
+    pytest.importorskip("streamlit")
+    import datetime as dt
+
+    at = _app(monkeypatch, tmp_path)
+    at.session_state["case_dict"] = yaml.safe_load((FIELD / "case.yaml").read_text(encoding="utf-8"))
+    at.session_state["base_dir"] = str(FIELD)
+    at.session_state["case_source"] = {"kind": "folder", "path": str(FIELD / "case.yaml")}
+    at.session_state["ver"] = 1
+    at.session_state["page"] = "瞄准优化"
+    at.run()
+    assert not at.exception
+    date = at.date_input(key="s_date:aksai_field_test_2026")
+    assert date.value == dt.date(2026, 6, 18)  # the sunniest record, not the 2025 default
+    assert any("覆盖 2026-06-17 08:30 – 2026-06-21 07:30" in c.value for c in at.caption)
+    date.set_value(dt.date(2025, 6, 21)).run()
+    assert any("不在气象文件的时间范围内" in e.value for e in at.error)
+    assert at.button(key="btn_single").disabled
+
+
+def test_single_result_shows_the_whole_field_flux(monkeypatch, tmp_path):
+    """The receiver map of an aiming result is every active mirror superposed, shown first and without markers."""
+    pytest.importorskip("streamlit")
+    at = _app(monkeypatch, tmp_path)
+    at.session_state["case_dict"] = small_case_dict()
+    at.session_state["base_dir"] = str(ROOT)
+    at.session_state["ver"] = 1
+    at.run()
+    at.radio(key="page").set_value("瞄准优化").run()
+    at.button(key="btn_single").click().run()
+    assert not at.exception
+    keys = [c.key for c in at.get("plotly_chart")]
+    assert {"s_full_flux", "s_full_panels", "s_full_profiles"} <= set(keys)
+    assert keys.index("s_full_flux") < keys.index("s_rec")  # the clean map comes before the aim-point overlay
+    assert any(t.value.startswith("**") or "全场叠加热流" in t.value for t in at.markdown)
+
+
+# ----------------------------------------------------------------------------- memory guard of the certificate
+
+def test_certificate_that_does_not_fit_is_skipped_not_swapped(monkeypatch, small_case, tmp_path):
+    """The 11,960-mirror field's certificate model (~38 GB) was killed for lack of memory in a 16 GB container;
+    an oversize model is now refused before anything is allocated and the plan is kept."""
+    from cspaps import parallel
+    from cspaps import workflows as wf
+    from cspaps.aps import build_problem
+    from cspaps.certify import CertificateTooLarge, check_model_memory, model_bytes
+    from cspaps.field import build_field
+    from cspaps.simulate import sun_state
+
+    fld = build_field(small_case)
+    _, el, az, dni = sun_state(small_case, "2025-06-21 13:00")
+    prob = build_problem(small_case, fld, el, az, dni)
+    need = model_bytes(prob)
+    gb = 2 ** 30
+    monkeypatch.setattr(parallel, "memory_bytes", lambda: (2 * gb + need // 2, 8 * gb))  # too little room
+    with pytest.raises(CertificateTooLarge) as err:
+        check_model_memory(prob)
+    assert err.value.need_bytes == need
+    res = wf.task_aim(small_case, tmp_path, "2025-06-21 13:00", method="greedy", certify=True)
+    note = res["summary"]["certificate_skipped"]
+    assert note["needed_gb"] >= 0 and res["summary"]["status"] in ("ok", "margin_reduced")
+    monkeypatch.setattr(parallel, "memory_bytes", lambda: (64 * gb, 128 * gb))  # plenty: certified as before
+    res = wf.task_aim(small_case, tmp_path, "2025-06-21 13:00", method="greedy", certify=True)
+    assert "certificate_skipped" not in res["summary"]
+
+
+def test_formal_value_skips_certificates_by_size_only(monkeypatch, small_case):
+    """The formal value stays reproducible: the skip depends on the model size, never on the free memory."""
+    from cspaps import certify
+    from cspaps.field import build_field
+    from cspaps.layout_value import inner_settings, solve_instant
+    from cspaps.simulate import sun_state
+
+    fld = build_field(small_case)
+    _, el, az, dni = sun_state(small_case, "2025-06-21 13:00")
+    st = inner_settings(small_case)
+    from dataclasses import replace
+
+    st = replace(st, certify_rounds=2)
+    monkeypatch.setattr(certify, "FORMAL_CERTIFY_MAX_BYTES", 1)  # every model is "too large"
+    r = solve_instant(small_case, fld, el, az, dni, st)
+    assert "certificate_skipped" in r.info and r.status in ("feasible", "feasible_shutdown")

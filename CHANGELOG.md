@@ -8,6 +8,9 @@
   - “演示数据”标记与数据说明按每次载入的来源判断，不再残留。
   - 权衡曲线：每个 λ 的吸热器热流图（并排、同一色标）、选中 λ 的大图与管屏柱状图、周向与高度分布；`receiver.panel_flux_table`（各管屏功率之和等于热流图总功率，测试检查）；结果另存 `pareto_flux.npz`、`pareto_panels.csv`。
   - 色标：多 λ 对比可选统一 0 – 最大 / 统一增强对比 / 相对参照 λ 的差值（对称发散色标、所有 λ 同一范围）；DNI 色标至少跨 100 W/m² 并注明实际范围（`gui_plots.span_range`）。
+  - 瞄准结果：“全场叠加热流”（全部工作镜叠加的热流图、管屏柱状图、周向与高度分布、CV 与细网格复核峰值）排在第一位，不画瞄准点；瞄准点叠加图的底图同样是全场热流，抽样只用于画瞄准点和光斑圈（`gui_app._full_field_flux`，`gui_plots.tradeoff_profiles(labels=...)`）。
+  - 气象文件范围检查：`sun.weather_coverage`、`sun.weather_dni_at`（超出 max(1 h, 1.5 × 间隔) 即报错），`simulate.sun_state` 不再静默取最近记录；界面时刻默认落在文件内（`_default_time`）、显示覆盖时段、超出时报错并停用开始按钮（`_weather_window`）。
+  - 证书内存保护：`certify.model_bytes` / `check_model_memory` / `CertificateTooLarge`（48 字节 / 非零项，留 max(2 GB, 15%) 内存）；`task_aim` 跳过证书并在结果中说明（`certificate_skipped`），`task_pareto` 关闭证书，通量价格换位改用能量定价；`layout_value.solve_instant` 只按固定的 8 GB 规模判断（`FORMAL_CERTIFY_MAX_BYTES`），与机器无关、结果可复现。
 - **给系统留余量**：默认留约 15% CPU（`CSPAPS_RESERVE_CPUS`、界面“给系统留几个 CPU”），`-1` 与推荐进程数都按留出余量后的核数；工作进程降低优先级（`CSPAPS_WORKER_NICE`）；按可用内存限制进程数（`CSPAPS_WORKER_MEM_GB`，留 max(2 GB, 15%)）；每张显卡留 15% 显存。
 - **占地约束**：布局目标 J(L) = E_abs − λ_L·Π − κ·A(L)，A = 全部镜心的凸包面积（公顷，每套布局算一次），κ 单位 MWhₜₕ／（公顷·年）（`layout_opt.land_weight`，默认 0）。差分进化与贝叶斯搜索的目标、镜位微调、正式换位的接受条件和最终排名都用 J；逐时瞄准不变。硬约束 `layout_opt.max_land_ha`（超出的布局不排名）。推荐 κ（`layout_value.recommend_land_weight`）：有土地年成本与热量价值时取二者之比，否则取参考布局每公顷年吸热量的 5%；排名结果列出每对布局的 κ 切换点。界面：κ 滑块重新计分、占地与土地扣分列、推荐值一键写入；命令行 `--land-weight`、`--max-land-ha`，`rescore --land-weight`。
 - **计算资源由用户指定**：界面左侧栏常驻“⚡ 计算资源”框（GPU 加速 / 仅 CPU、勾选具体显卡并列出型号与显存、局部搜索是否上 GPU、并行进程数；每个开始按钮上方与运行中的任务都显示所用设备；检测不到显卡时写明原因）；`--gpus N | 0,2,5 | 0 | all`（每个算例命令与 `cspaps gui`）、`CSPAPS_GPUS`；可用 CPU 数按进程亲和性与容器配额从系统读取（`parallel.cpu_count`）；`--workers` 设并行进程数。

@@ -252,8 +252,7 @@ def sun_state(case: Case, time) -> tuple[pd.Timestamp, float, float, float]:
     idx = sun.to_times(time, case.site.timezone)
     el, az = sun.solar_position(idx, case.site)
     if case.weather.source == "file":
-        series = sun.load_weather(case)
-        dni_v = float(series.iloc[series.index.get_indexer(idx, method="nearest")[0]])
+        dni_v = sun.weather_dni_at(case, idx)  # raises outside the file's time span
     else:
         dni_v = float(sun.dni(el[0], case.sun, case.site))
     return idx[0], float(el[0]), float(az[0]), dni_v

@@ -1199,8 +1199,9 @@ def panel_flux_bars(panels: list[dict], height: int = 380):
     return _base_layout(fig, "", height)
 
 
-def tradeoff_profiles(flux: dict, selected: int | None = None, height: int = 300):
-    """Height-averaged absorbed flux around the receiver and azimuth-averaged flux over the height, every lambda."""
+def tradeoff_profiles(flux: dict, selected: int | None = None, height: int = 300, labels: list[str] | None = None):
+    """Height-averaged absorbed flux around the receiver and azimuth-averaged flux over the height, every lambda
+    (``labels`` names the curves; default "λ = ...")."""
     from plotly.subplots import make_subplots
 
     q = np.asarray(flux["absorbed_kw_m2"])
@@ -1212,13 +1213,14 @@ def tradeoff_profiles(flux: dict, selected: int | None = None, height: int = 300
         t = k / max(n - 1, 1)
         color = f"rgba({int(20 + t * 204)},{int(128 + t * 27)},{int(111 - t * 66)},{1.0 if k == selected else 0.55})"
         width = 3 if k == selected else 1.4
+        name = labels[k] if labels else f"λ = {lam:g}"
         fig.add_trace(go.Scatter(x=az, y=q[k].mean(axis=0), mode="lines", line=dict(color=color, width=width),
-                                 name=f"λ = {lam:g}", legendgroup=str(k),
-                                 hovertemplate=f"λ = {lam:g}<br>方位 %{{x:.0f}}°：%{{y:.0f}} kW/m²<extra></extra>"),
+                                 name=name, legendgroup=str(k),
+                                 hovertemplate=f"{name}<br>方位 %{{x:.0f}}°：%{{y:.0f}} kW/m²<extra></extra>"),
                       row=1, col=1)
         fig.add_trace(go.Scatter(x=q[k].mean(axis=1), y=z, mode="lines", line=dict(color=color, width=width),
                                  showlegend=False, legendgroup=str(k),
-                                 hovertemplate=f"λ = {lam:g}<br>高度 %{{y:.1f}} m：%{{x:.0f}} kW/m²<extra></extra>"),
+                                 hovertemplate=f"{name}<br>高度 %{{y:.1f}} m：%{{x:.0f}} kW/m²<extra></extra>"),
                       row=1, col=2)
     for e in flux.get("panel_edges_deg", []):
         fig.add_vline(x=float(e) % 360.0, line=dict(color="#c9d3d1", width=0.8, dash="dot"), row=1, col=1)

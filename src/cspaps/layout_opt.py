@@ -1097,7 +1097,14 @@ def formal_ranking(case: Case, evals: list[LayoutEval], hourly: sun.Samples, sam
             predicted, bound_gap = None, None
             if dual:
                 say(f"formal swap round {r + 1}: flux prices of {unused.size} free positions on {len(sset)} scenarios")
-                prices = dual_prices(case, cur, ev.candidates_xyz[unused], sset, settings, progress=say)
+                from .certify import CertificateTooLarge
+
+                try:
+                    prices = dual_prices(case, cur, ev.candidates_xyz[unused], sset, settings, progress=say)
+                except CertificateTooLarge as exc:  # the flux-price bound does not fit: energy pricing instead
+                    say(f"formal swap round {r + 1}: flux prices skipped ({exc}); energy pricing")
+                    dual = False
+                    continue
                 drop, add_u, predicted = price_swaps(prices, m)
                 add, bound_gap = unused[add_u], prices["gap_mwh"]
                 if add.size == 0:

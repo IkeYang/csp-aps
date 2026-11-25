@@ -210,6 +210,7 @@ def task_aim(
     prev, prev_active = read_aims_csv(prev_aims, fld) if prev_aims else (None, None)
     grid = build_grid(case.receiver)
     cert = None
+    certificate_note = None
     do_certify = case.aps.certify if certify is None else certify
     if method == "center":
         from .receiver import default_aim
@@ -225,8 +226,16 @@ def task_aim(
                 progress("certifying: upper bound and relaxation rounding")
             initial = res.choice.copy()
             if (prob.k + 1) ** min(prob.n, 20) > case.aps.coupled_exact_limit and np.any(prob.dni_obj > 0):
-                res, _ = improve_and_certify(prob, res, case.aps, rounds=case.aps.certify_rounds,
-                                             time_limit_s=case.aps.certify_time_s, prev=prev, prev_active=prev_active)
+                from .certify import CertificateTooLarge
+
+                try:
+                    res, _ = improve_and_certify(prob, res, case.aps, rounds=case.aps.certify_rounds,
+                                                 time_limit_s=case.aps.certify_time_s, prev=prev, prev_active=prev_active)
+                except CertificateTooLarge as exc:  # keep the plan, skip the relaxation bound and rounding
+                    certificate_note = {"needed_gb": round(exc.need_bytes / 2 ** 30, 1),
+                                        "free_gb": round(exc.room_bytes / 2 ** 30, 1), "reason": str(exc)}
+                    if progress:
+                        progress(f"certificate skipped: {exc}")
             res, cert = search_joint_poses(prob, fld, res, warm=initial,
                                            tracking_reference=prob.tracking_reference(prev, prev_active))
         else:
@@ -295,6 +304,8 @@ def task_aim(
                                        "status": chk_c.status}
     summary["flux_check"]["basis"] = ("final aim points, shading and blocking re-evaluated for them, full beams, "
                                       "fine grid, constraint DNI")
+    if certificate_note:
+        summary["certificate_skipped"] = certificate_note
     if res is not None and proposal_check is not None:
         summary["solver_flux_check"] = {"status": proposal_check.status, "peak_flux_kw_m2": round(proposal_check.peak_flux_kw_m2, 2),
                                         "basis": "solver response model (candidate aims)"}
@@ -449,7 +460,12 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
         prob.rs.case = c
         res = solve(prob, "greedy", c.aps, init=previous)
         if certify:
-            res, _ = improve_and_certify(prob, res, c.aps, rounds=2, max_iter=200, time_limit_s=6.0)
+            from .certify import CertificateTooLarge
+
+            try:
+                res, _ = improve_and_certify(prob, res, c.aps, rounds=2, max_iter=200, time_limit_s=6.0)
+            except CertificateTooLarge:  # too large for the free memory: the curve without the rounding step
+                certify = False
         res, bound = search_joint_poses(prob, fld, res, warm=previous)
         previous = res.choice
         snap = evaluate(c, fld, el, az, dni_v, aim=res.aim, active=res.active, grid=grid)

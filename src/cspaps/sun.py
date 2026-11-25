@@ -98,6 +98,37 @@ def load_weather(case: Case) -> pd.Series:
     return _WEATHER_CACHE[key]
 
 
+def weather_coverage(case: Case) -> dict | None:
+    """The time span of the case's weather file (None without one): first and last record, the typical step,
+    the tolerance within which an instant may use its nearest record, and a suggested instant inside the file
+    (the record with the highest DNI) for time pickers."""
+    if case.weather.source != "file" or not case.weather.file:
+        return None
+    s = load_weather(case)
+    if s.empty:
+        return None
+    step = pd.Series(s.index).diff().median() if len(s) > 1 else pd.Timedelta(hours=1)
+    step = step if pd.notna(step) and step > pd.Timedelta(0) else pd.Timedelta(hours=1)
+    return {"first": s.index[0], "last": s.index[-1], "step": step, "n": int(len(s)),
+            "tolerance": max(pd.Timedelta(hours=1), 1.5 * step), "suggested": s.idxmax()}
+
+
+def weather_dni_at(case: Case, idx) -> float:
+    """DNI of the weather file at the first instant of ``idx`` (nearest record). An instant further than the
+    coverage tolerance from every record raises: the file holds no information about it (a June 2025 instant
+    must not silently take a 2026 record)."""
+    series = load_weather(case)
+    j = int(series.index.get_indexer(idx, method="nearest")[0])
+    cov = weather_coverage(case)
+    gap = abs(series.index[j] - idx[0])
+    if cov is not None and gap > cov["tolerance"]:
+        raise ValueError(
+            f"{idx[0]:%Y-%m-%d %H:%M} is outside the weather file {case.weather.file} "
+            f"({cov['first']:%Y-%m-%d %H:%M} – {cov['last']:%Y-%m-%d %H:%M}); the nearest record is "
+            f"{gap.total_seconds() / 3600:.1f} h away. Choose a time inside the file, or use clear-sky DNI.")
+    return float(series.iloc[j])
+
+
 def _read_weather(case: Case, path) -> pd.Series:
     if path.suffix.lower() == ".epw":
         data, _ = pvlib.iotools.read_epw(path, coerce_year=case.annual.year)

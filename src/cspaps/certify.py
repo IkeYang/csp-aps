@@ -87,7 +87,45 @@ class _Model:
         return self.a * math.sqrt(max(self.h_idx.size, 1))
 
 
+class CertificateTooLarge(MemoryError):
+    """The bound's sparse model would not fit into the free memory (after the system's reserve)."""
+
+    def __init__(self, message: str, need_bytes: int = 0, room_bytes: int = 0):
+        super().__init__(message)
+        self.need_bytes, self.room_bytes = int(need_bytes), int(max(room_bytes, 0))
+
+
+BYTES_PER_NONZERO = 48  # COO (int64 row, int64 column, float64 value) + CSC copy + per-heliostat pieces
+# the formal layout value skips certificate roundings above this model size (a rule on the inputs alone, so the
+# value stays reproducible whatever memory happens to be free)
+FORMAL_CERTIFY_MAX_BYTES = 8 * 2 ** 30
+
+
+def model_bytes(prob) -> int:
+    """Memory to build the bound's model of ``prob``: every candidate x support cell is one non-zero."""
+    return int(sum(int(c.size) for c in prob.rs.cells) * prob.k * BYTES_PER_NONZERO)
+
+
+def check_model_memory(prob) -> None:
+    """Raise ``CertificateTooLarge`` when building the model would eat into the memory the computer keeps free
+    (``parallel.memory_bytes``: free memory minus max(2 GB, 15 %)); unknown memory: no check."""
+    from .parallel import memory_bytes
+
+    mem = memory_bytes()
+    if mem is None:
+        return
+    avail, total = mem
+    room = avail - max(2 * 2 ** 30, 0.15 * total)
+    need = model_bytes(prob)
+    if need > room:
+        raise CertificateTooLarge(
+            f"the optimality certificate needs about {need / 2 ** 30:.1f} GB ({prob.n} heliostats x {prob.k} candidate "
+            f"aims on {prob.rs.points.shape[0]} constraint points), more than the {max(room, 0) / 2 ** 30:.1f} GB "
+            "free after the system's reserve", need, room)
+
+
 def _build_model(prob, h_mask: np.ndarray) -> _Model:
+    check_model_memory(prob)  # before allocating anything: a too large model must not freeze the computer
     rs = prob.rs
     n, k = prob.n, prob.k
     rows, cols, vals = [], [], []
