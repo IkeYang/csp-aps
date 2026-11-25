@@ -149,9 +149,14 @@ def apply_mode(case: Case, task: str, mode: str, workers: int | None = None, n: 
 
 
 def recommended_workers() -> int:
-    """Parallel workers for scenario-level work: all usable CPUs but one (``parallel.cpu_count``)."""
+    """Parallel workers for scenario-level work: the number chosen in the interface / on the command line
+    (``CSPAPS_WORKERS``, -1 = all usable CPUs), else all usable CPUs but one (``parallel.cpu_count``)."""
     from .parallel import cpu_count
 
+    raw = os.environ.get("CSPAPS_WORKERS", "").strip()
+    if raw:
+        n = int(raw)
+        return cpu_count() if n == -1 else max(1, n)
     return max(1, cpu_count() - 1)
 
 

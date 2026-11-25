@@ -53,7 +53,10 @@ python scripts/gpu_benchmark.py cases/aksai_demo.yaml --plant large --heliostats
 cspaps optimize-layout cases/aksai_demo.yaml --mode deep --gpus 8 --workers -1     # 正式计算
 ```
 
-- **用几张卡由用户指定**：命令行 `--gpus 4`（前 4 张）、`--gpus 0,2,5`（指定编号）、`--gpus 0`（只用 CPU）、`--gpus all`；界面左侧栏“计算资源”里选；也可设环境变量 `CSPAPS_GPUS=4` 或 `CSPAPS_GPU_DEVICES=0,2,5`。
+- **用哪几张卡由用户指定**：
+  - **界面**：左侧栏当前算例下方的“⚡ 计算资源”框。“计算设备”选 **GPU 加速** 或 **仅 CPU**；“使用哪些显卡”勾选具体的卡（上方列出检测到的型号和显存）；“并行进程数”设同时求解的工况数。框底写明“将使用：GPU 0、1、2（3 张）+ CPU 23 个进程”，每个“开始计算”按钮上方和运行中的进度条下方也显示这一行。没检测到显卡时，框里写明原因（没装 CuPy、驱动不可用或没有显卡）和解决办法。
+  - **启动界面时**：`cspaps gui --gpus 0,1,2,3 --workers 23`（Windows：`Start-CSP-APS.cmd --gpus 0,1`），进入界面后仍可在侧栏改。
+  - **命令行计算**：每个算例命令都有 `--gpus 4`（前 4 张）、`--gpus 0,2,5`（指定编号）、`--gpus 0`（只用 CPU）、`--gpus all`；也可设环境变量 `CSPAPS_GPUS=4` 或 `CSPAPS_GPU_DEVICES=0,2,5`。
 - **CPU 数从系统读取**：按进程亲和性（taskset、集群调度器分到的核）和容器 CPU 配额取可用核数，不是整机核数。计算深度三档默认用“可用核数减一”个工作进程；`--workers N` 或参数设置里的“并行进程”可改，`-1` = 全部可用核。进程数按 CPU 核数取，不按显卡数取。
 - **分卡**：工作进程按顺序轮流分到选定的卡上；同一张卡上的进程平分显存（CuPy 内存池上限与分块大小自动调整）。
 - **长时间运行的核函数**：GPU 局部搜索一个工况的核函数要运行数秒。专门计算用的 Linux 显卡没有问题；如果某张卡同时驱动桌面（Windows 或带看门狗的 X 桌面），可能被看门狗中断，这时不要选这张卡，或设 `CSPAPS_GPU_SEARCH=0` 把局部搜索留在 CPU。
