@@ -1,0 +1,95 @@
+{
+  "status": "infeasible",
+  "aps": {
+    "method": "center"
+  },
+  "flux_check": {
+    "status": "over_limit",
+    "peak_flux_kw_m2": 1574.8,
+    "peak_to_limit": 1.5748,
+    "allowed_ratio": 0.95,
+    "margin_to_limit_kw_m2": -574.8,
+    "hotspot": {
+      "azimuth_deg": 340.0,
+      "z_m": 152.072,
+      "panel": 16,
+      "limit_kw_m2": 1000.0
+    },
+    "exceedance_kw_m2": 574.8,
+    "verification_grid": [
+      198,
+      174
+    ],
+    "top_contributors": [
+      {
+        "heliostat_id": 82,
+        "flux_kw_m2": 7.24
+      },
+      {
+        "heliostat_id": 169,
+        "flux_kw_m2": 5.77
+      },
+      {
+        "heliostat_id": 601,
+        "flux_kw_m2": 5.56
+      },
+      {
+        "heliostat_id": 81,
+        "flux_kw_m2": 5.55
+      },
+      {
+        "heliostat_id": 83,
+        "flux_kw_m2": 5.51
+      }
+    ],
+    "basis": "final aim points, shading and blocking re-evaluated for them, full beams, fine grid, constraint DNI"
+  },
+  "time": "2026-06-18T12:00:08+08:00",
+  "sun_elevation_deg": 63.152,
+  "sun_azimuth_deg": 117.67,
+  "dni_mean_w_m2": 914.2,
+  "n_heliostats": 11960,
+  "n_defocused": 0,
+  "power_mw": {
+    "sun": 699.7987,
+    "cosine": 564.1753,
+    "reflectivity": 514.4151,
+    "shading": 513.8223,
+    "blocking": 418.3268,
+    "attenuation": 392.9418,
+    "intercept": 391.9649
+  },
+  "intercepted_power_mw": 391.9649,
+  "absorbed_power_mw": 372.3666,
+  "field_efficiency": {
+    "cosine": 0.8062,
+    "reflectivity": 0.9118,
+    "shading": 0.99885,
+    "blocking": 0.81415,
+    "attenuation": 0.93932,
+    "intercept": 0.99751
+  },
+  "total_optical_efficiency": 0.56011,
+  "peak_flux_kw_m2": 1467.93,
+  "mean_flux_kw_m2": 137.86,
+  "peak_to_limit": 1.4679,
+  "hotspot_panel": 16,
+  "hotspot_azimuth_deg": 340.31,
+  "hotspot_z_m": 152.781,
+  "margin_at_hotspot_kw_m2": -467.93,
+  "cv_2d": 2.3045,
+  "cv_circumferential": 0.2208,
+  "cv_height": 2.2575,
+  "flux_map_power_mw": 391.9648,
+  "flux_basis": "coarse grid; see flux_check for the verified peak",
+  "margin_check": {
+    "allowed_fraction": 0.95,
+    "peak_fraction": 1.5748020639087963,
+    "within_margin": false,
+    "within_limit": false,
+    "hotspot_panel": 16,
+    "hotspot_azimuth_deg": 340.0,
+    "hotspot_z_m": 152.07183908045977
+  },
+  "n_tracking_in_tower_shadow": 0
+}

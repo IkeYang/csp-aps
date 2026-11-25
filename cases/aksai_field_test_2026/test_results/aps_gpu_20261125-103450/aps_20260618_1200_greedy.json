@@ -1,0 +1,131 @@
+{
+  "status": "ok",
+  "aps": {
+    "method": "greedy",
+    "status": "ok",
+    "power_mw": 414.5091,
+    "peak_to_allowed": 0.9551,
+    "feasible": true,
+    "n_defocused": 0,
+    "solve_time_s": 32.917,
+    "build_time_s": 25.9517,
+    "n_candidates": 21,
+    "passes": 2,
+    "repairs": 0,
+    "timed_out": false,
+    "verification_rounds": 0,
+    "repair_rounds": 0,
+    "hotspot_points_added": 0,
+    "final_repair_rounds": 0,
+    "flux_limited": 0,
+    "limits_active": false,
+    "global_optimality_proven": false,
+    "solution_class": "joint_pose_verification",
+    "objective_absorbed_power_w": 392082989.433,
+    "uniformity_met": true,
+    "cv_2d_H": 1.253,
+    "cv_circ_H": 0.221,
+    "cv_height_H": 1.1016,
+    "power_H_mw": 392.083
+  },
+  "flux_check": {
+    "status": "ok",
+    "peak_flux_kw_m2": 906.51,
+    "peak_to_limit": 0.9065,
+    "allowed_ratio": 0.95,
+    "margin_to_limit_kw_m2": 93.49,
+    "hotspot": {
+      "azimuth_deg": 56.14,
+      "z_m": 167.0,
+      "panel": 3,
+      "limit_kw_m2": 1000.0
+    },
+    "exceedance_kw_m2": 0.0,
+    "verification_grid": [
+      210,
+      185
+    ],
+    "top_contributors": [
+      {
+        "heliostat_id": 99,
+        "flux_kw_m2": 4.89
+      },
+      {
+        "heliostat_id": 100,
+        "flux_kw_m2": 4.84
+      },
+      {
+        "heliostat_id": 101,
+        "flux_kw_m2": 4.83
+      },
+      {
+        "heliostat_id": 361,
+        "flux_kw_m2": 4.64
+      },
+      {
+        "heliostat_id": 273,
+        "flux_kw_m2": 4.58
+      }
+    ],
+    "basis": "final aim points, shading and blocking re-evaluated for them, full beams, fine grid, constraint DNI"
+  },
+  "time": "2026-06-18T12:00:08+08:00",
+  "sun_elevation_deg": 63.152,
+  "sun_azimuth_deg": 117.67,
+  "dni_mean_w_m2": 914.2,
+  "n_heliostats": 11960,
+  "n_defocused": 0,
+  "power_mw": {
+    "sun": 699.7987,
+    "cosine": 567.9101,
+    "reflectivity": 517.8204,
+    "shading": 517.262,
+    "blocking": 443.7261,
+    "attenuation": 416.6255,
+    "intercept": 412.7189
+  },
+  "intercepted_power_mw": 412.7189,
+  "absorbed_power_mw": 392.083,
+  "field_efficiency": {
+    "cosine": 0.81153,
+    "reflectivity": 0.9118,
+    "shading": 0.99892,
+    "blocking": 0.85784,
+    "attenuation": 0.93892,
+    "intercept": 0.99062
+  },
+  "total_optical_efficiency": 0.58977,
+  "peak_flux_kw_m2": 902.19,
+  "mean_flux_kw_m2": 145.22,
+  "peak_to_limit": 0.9022,
+  "hotspot_panel": 3,
+  "hotspot_azimuth_deg": 59.06,
+  "hotspot_z_m": 166.844,
+  "margin_at_hotspot_kw_m2": 97.81,
+  "cv_2d": 1.253,
+  "cv_circumferential": 0.221,
+  "cv_height": 1.1016,
+  "flux_map_power_mw": 412.8822,
+  "flux_basis": "coarse grid; see flux_check for the verified peak",
+  "margin_check": {
+    "allowed_fraction": 0.95,
+    "peak_fraction": 0.9065110993867577,
+    "within_margin": true,
+    "within_limit": true,
+    "hotspot_panel": 3,
+    "hotspot_azimuth_deg": 56.14285714285714,
+    "hotspot_z_m": 167.0
+  },
+  "center_reference": {
+    "absorbed_power_mw": 372.3666105158284,
+    "peak_flux_kw_m2": 1574.8020639087981,
+    "peak_fraction": 1.5748020804849572,
+    "status": "over_limit"
+  },
+  "solver_flux_check": {
+    "status": "ok",
+    "peak_flux_kw_m2": 907.3,
+    "basis": "solver response model (candidate aims)"
+  },
+  "n_tracking_in_tower_shadow": 0
+}

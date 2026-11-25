@@ -1,0 +1,25 @@
+{
+  "time_requested_local": "2026-06-18 12:00:00",
+  "time_used_local": "2026-06-18 12:00:08",
+  "nearest_sample_seconds": 8.0,
+  "source": "SW_MAIN and NE_SLAVE measured DNI anchored to NASA POWER ALLSKY_SFC_SW_DNI hourly background",
+  "spatial_model": "linear along SW-NE station axis, Gaussian 600 m perpendicular fade to NASA background",
+  "dni_map": "dni_map_2026-06-18_120008.csv",
+  "heliostat_count": 11960,
+  "nasa_background_dni_w_m2": 857.382,
+  "sw_main_dni_w_m2": 864.99,
+  "ne_slave_dni_w_m2": 988.238,
+  "map_dni_min_w_m2": 874.073,
+  "map_dni_mean_w_m2": 914.244,
+  "map_dni_max_w_m2": 979.456,
+  "stations_enu_m": {
+    "SW_MAIN": [
+      -696.892,
+      -473.763
+    ],
+    "NE_SLAVE": [
+      741.486,
+      743.346
+    ]
+  }
+}

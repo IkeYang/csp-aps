@@ -1,0 +1,71 @@
+name: aksai_field_test_2026
+
+site:
+  latitude: 38.9132
+  longitude: 94.396
+  elevation_m: 2902
+  timezone: Asia/Shanghai
+
+receiver:
+  center: [0, 0, 152]
+  diameter: 18.1
+  height: 50
+  max_flux_kw_m2: 1000
+  n_azimuth: 64
+  n_height: 32
+  tower_diameter: 8
+  tower_height: 127
+  absorptivity: 0.95
+  n_panels: 16
+  panel_start_azimuth_deg: 0
+
+heliostat:
+  width: 8
+  height: 8
+  pivot_height: 5
+  reflectivity: 0.94
+  cleanliness: 0.97
+  slope_error_mrad: 1.5
+  tracking_error_mrad: 1.0
+  focusing: slant_range
+
+sun:
+  shape: gaussian
+  sigma_mrad: 2.51
+  dni_model: meinel
+
+atmosphere:
+  model: vittitoe_biggs_clear
+
+weather:
+  source: file
+  file: nasa_power_dni_2026.csv
+
+shading:
+  enabled: true
+  n_points: 4
+  tower_shadow: true
+
+field:
+  layout_file: layout_full.csv
+  exclusion_radius: 0
+
+aps:
+  method: greedy
+  safety_margin: 0.05
+  n_height_levels: 7
+  height_span: 0.9
+  azimuth_offsets_deg: [-4, 0, 4]
+  passes: 2
+  allow_defocus: true
+  verify: true
+  auto_grid: true
+  verify_max_rounds: 3
+
+annual:
+  year: 2026
+  workers: 1
+
+mcrt:
+  rays_per_heliostat: 1000
+  n_seeds: 1
