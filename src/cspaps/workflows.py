@@ -82,8 +82,9 @@ def out_dir(base: str | Path, case: Case, task: str = "run") -> Path:
             continue
     snapshot = case.copy()
     snapshot.base_dir = out
-    for section, attr in (("weather", "file"), ("field", "layout_file"),
-                          ("scenarios", "file"), ("scenarios", "map_file"), ("scenarios", "validation_file")):
+    from .config import FILE_SETTINGS
+
+    for section, attr in FILE_SETTINGS:
         value = getattr(getattr(case, section), attr)
         if not value:
             continue
@@ -436,7 +437,10 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
     base_choice, _ = solve_greedy(prob, case.aps)
     prob.rs.case = case
     lambdas = list(lambdas) if lambdas is not None else [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+    from .receiver import panel_bounds, panel_flux_table
+
     rows, previous = [], base_choice
+    incident, panels = [], []  # receiver flux map and per-panel summary of every plan on the curve
     for j, lam in enumerate(sorted(lambdas)):
         if progress:
             progress(f"weight {j + 1}/{len(lambdas)}: lambda = {lam:g}")
@@ -448,21 +452,38 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
             res, _ = improve_and_certify(prob, res, c.aps, rounds=2, max_iter=200, time_limit_s=6.0)
         res, bound = search_joint_poses(prob, fld, res, warm=previous)
         previous = res.choice
+        snap = evaluate(c, fld, el, az, dni_v, aim=res.aim, active=res.active, grid=grid)
+        table = panel_flux_table(c.receiver, grid, snap.flux)
+        incident.append(snap.flux)
+        panels += [{"lambda": lam, **r} for r in table]
+        chk = res.check
         rows.append({"lambda": lam, "power_abs_mw": res.info["objective_absorbed_power_w"] / 1e6,
                      "power_h_mw": res.info["power_H_mw"], "cv_2d": res.info["cv_2d_H"],
                      "objective_mw": bound["objective_found_mw"], "status": res.status,
-                     "peak_flux_kw_m2": res.check.peak_flux_kw_m2, "n_defocused": res.n_defocused,
+                     "peak_flux_kw_m2": chk.peak_flux_kw_m2, "n_defocused": res.n_defocused,
+                     "hotspot_panel": int(chk.hotspot_panel), "hotspot_azimuth_deg": float(chk.hotspot_azimuth_deg),
+                     "hotspot_z_m": float(chk.hotspot_z), "peak_to_limit": float(chk.peak_ratio),
+                     "max_panel_peak_to_limit": max(r["peak_to_limit"] for r in table) if table else None,
                      "upper_bound_mw": bound["upper_bound_mw"] if certify else None,
                      "gap": bound["gap"] if certify else None})
-    files = {"summary_json": out / "pareto.json", "curve_csv": out / "pareto_curve.csv"}
+    files = {"summary_json": out / "pareto.json", "curve_csv": out / "pareto_curve.csv",
+             "panels_csv": out / "pareto_panels.csv", "flux_npz": out / "pareto_flux.npz"}
     pd.DataFrame(rows).to_csv(files["curve_csv"], index=False)
+    pd.DataFrame(panels).to_csv(files["panels_csv"], index=False)
+    flux = {"lambdas": np.array(sorted(lambdas), float), "azimuth_deg": grid.azimuth_deg, "z_m": grid.z,
+            "incident_kw_m2": np.array(incident) / 1e3,
+            "absorbed_kw_m2": np.array(incident) * grid.to_map(grid.alpha)[None] / 1e3,
+            "limit_kw_m2": grid.to_map(grid.limit) / 1e3, "panel": grid.to_map(grid.panel) + 1,
+            "panel_edges_deg": np.array([a0 for a0, _ in panel_bounds(case.receiver)], float)}
+    np.savez_compressed(files["flux_npz"], **flux)
     summary = {"time": ts.isoformat(), "dni_mean_w_m2": float(np.mean(dni_v)), "n_heliostats": fld.n,
                "region_H": {"panels": case.uniformity.panels, "z_range": case.uniformity.z_range},
-               "curve": rows}
+               "curve": rows, "panels": panels, "flux_basis": "evaluation grid of the receiver (coarse); "
+                                                             "verified peaks: peak_flux_kw_m2 / hotspot_*"}
     _json(files["summary_json"], summary)
     finish(out, "pareto", summary, {"time": str(time), "lambdas": lambdas, "dni_map": dni_map,
                                     "dni_source": dni_source}, t0)
-    return {"summary": _clean(summary), "files": files, "run_dir": out}
+    return {"summary": _clean(summary), "files": files, "run_dir": out, "flux": flux}
 
 
 def task_realtime(case: Case, base: str | Path, progress: Progress | None = None) -> dict:

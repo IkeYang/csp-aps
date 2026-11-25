@@ -122,6 +122,11 @@ class Atmosphere:
     extinction_per_km: float = 0.1
 
 
+# settings holding input file paths, resolved against the YAML's folder (``Case.resolve``)
+FILE_SETTINGS = (("weather", "file"), ("field", "layout_file"), ("scenarios", "file"), ("scenarios", "map_file"),
+                 ("scenarios", "validation_file"))
+
+
 @dataclass
 class Weather:
     source: str = "clear_sky"  # "clear_sky" (uses sun.dni_model) or "file"
@@ -396,6 +401,25 @@ class Case:
         """Resolve a path from the YAML relative to the YAML file's folder."""
         p = Path(path)
         return p if p.is_absolute() else (self.base_dir / p)
+
+    def referenced_files(self) -> list[tuple[str, str, Path]]:
+        """The input files this case reads: (``section.attr``, value as written, resolved path), only settings in
+        use (the weather file with ``weather.source: file``, the scenario table with ``scenarios.source: file``)."""
+        out = []
+        for section, attr in FILE_SETTINGS:
+            value = getattr(getattr(self, section), attr, None)
+            if not value:
+                continue
+            if (section, attr) == ("weather", "file") and self.weather.source != "file":
+                continue
+            if (section, attr) == ("scenarios", "file") and self.scenarios.source != "file":
+                continue
+            out.append((f"{section}.{attr}", str(value), self.resolve(value)))
+        return out
+
+    def missing_files(self) -> list[tuple[str, str, Path]]:
+        """``referenced_files`` that do not exist (e.g. a YAML moved or uploaded without its CSVs)."""
+        return [r for r in self.referenced_files() if not r[2].is_file()]
 
     def copy(self) -> "Case":
         return copy.deepcopy(self)

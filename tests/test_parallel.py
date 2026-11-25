@@ -124,8 +124,62 @@ def test_pool_workers_cap_blas_threads(monkeypatch):
     from cspaps.parallel import pool, worker_threads
 
     monkeypatch.delenv("CSPAPS_WORKER_THREADS", raising=False)
-    assert worker_threads(2) == max(1, (__import__("os").cpu_count() or 1) // 2)
+    from cspaps.parallel import available_cpus
+
+    assert worker_threads(2) == max(1, available_cpus() // 2)  # the share of the CPUs left after the reserve
     monkeypatch.setenv("CSPAPS_WORKER_THREADS", "1")
     with pool(2) as p:
         rows = p.map(_blas_threads, range(4))
     assert all(r in ([], [1]) for r in rows)  # [] when the BLAS library is not loaded in the worker
+
+
+
+def test_a_reserve_of_cpus_stays_free(monkeypatch):
+    """The calculations leave CPUs to the system so the computer stays responsive."""
+    from cspaps import advisor, parallel
+
+    monkeypatch.delenv("CSPAPS_RESERVE_CPUS", raising=False)
+    monkeypatch.delenv("CSPAPS_WORKERS", raising=False)
+    assert [parallel.reserved_cpus(n) for n in (1, 2, 4, 8, 24, 64)] == [0, 1, 1, 1, 4, 10]
+    monkeypatch.setattr(parallel, "cpu_count", lambda: 24)
+    assert parallel.available_cpus() == 20 and parallel.n_workers(-1) == 20 and advisor.recommended_workers() == 20
+    assert parallel.n_workers(23) == 23  # an explicit number is the user's choice
+    monkeypatch.setenv("CSPAPS_RESERVE_CPUS", "2")
+    assert parallel.available_cpus() == 22
+    monkeypatch.setenv("CSPAPS_RESERVE_CPUS", "99")
+    assert parallel.available_cpus() == 1  # never all of them
+
+
+def test_memory_caps_the_number_of_processes(monkeypatch):
+    from cspaps import parallel
+
+    gb = 2 ** 30
+    monkeypatch.setattr(parallel, "memory_bytes", lambda: (10 * gb, 16 * gb))
+    monkeypatch.delenv("CSPAPS_WORKER_MEM_GB", raising=False)
+    assert parallel.memory_cap(23) == 5  # (10 - 2.4 GB kept free) / 1.5 GB
+    monkeypatch.setenv("CSPAPS_WORKER_MEM_GB", "4")
+    assert parallel.memory_cap(23) == 1
+    monkeypatch.setattr(parallel, "memory_bytes", lambda: None)
+    assert parallel.memory_cap(23) == 23  # unknown: no guard
+
+
+def _niceness(_):
+    import os
+
+    return os.nice(0)
+
+
+def test_pool_workers_run_at_lower_priority(monkeypatch):
+    import os
+
+    import pytest
+
+    if not hasattr(os, "nice"):
+        pytest.skip("POSIX priority")
+    from cspaps.parallel import pool
+
+    monkeypatch.delenv("CSPAPS_WORKER_NICE", raising=False)
+    parent = os.nice(0)
+    with pool(2) as p:
+        nice = set(p.map(_niceness, range(4)))
+    assert all(n >= min(parent + 10, 19) for n in nice)

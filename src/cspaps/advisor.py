@@ -150,14 +150,15 @@ def apply_mode(case: Case, task: str, mode: str, workers: int | None = None, n: 
 
 def recommended_workers() -> int:
     """Parallel workers for scenario-level work: the number chosen in the interface / on the command line
-    (``CSPAPS_WORKERS``, -1 = all usable CPUs), else all usable CPUs but one (``parallel.cpu_count``)."""
-    from .parallel import cpu_count
+    (``CSPAPS_WORKERS``, -1 = all CPUs the calculations may use), else ``parallel.available_cpus`` -- the usable
+    CPUs minus a reserve for the system, so the computer stays responsive."""
+    from .parallel import available_cpus
 
     raw = os.environ.get("CSPAPS_WORKERS", "").strip()
     if raw:
         n = int(raw)
-        return cpu_count() if n == -1 else max(1, n)
-    return max(1, cpu_count() - 1)
+        return available_cpus() if n == -1 else max(1, n)
+    return available_cpus()
 
 
 # --------------------------------------------------------------------------- time model
@@ -233,9 +234,9 @@ def estimate_seconds(case: Case, task: str, mode: str, cal: Calibration | None =
     n = int(n if n is not None else _field_size(case, task))
     workers = int(workers or recommended_workers())
     c = apply_mode(case, task, mode, workers, n)
-    from .parallel import cpu_count
+    from .parallel import available_cpus
 
-    eff = max(1.0, 0.8 * min(workers, cpu_count()))  # scenario-level parallel efficiency
+    eff = max(1.0, 0.8 * min(workers, available_cpus()))  # scenario-level parallel efficiency
     parts = {}
     if task == "aim":
         parts["solve"] = cal.t_aim(mode, n)

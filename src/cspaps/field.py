@@ -333,7 +333,12 @@ def build_field(case: Case) -> Field:
     """Field from the case; heliostats removed by the site checks are listed in ``Field.dropped``."""
     spec = case.field
     if spec.layout_file:
-        xyz, ids = read_layout(case.resolve(spec.layout_file), case.heliostat.pivot_height)
+        path = case.resolve(spec.layout_file)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"field.layout_file '{spec.layout_file}' not found: looked for {path}. Paths in a case YAML are "
+                "relative to the YAML's own folder -- keep the CSV next to the YAML (or give an absolute path).")
+        xyz, ids = read_layout(path, case.heliostat.pivot_height)
         ids = np.arange(1, len(xyz) + 1) if ids is None else ids
     elif spec.generator:
         gen = dict(spec.generator)

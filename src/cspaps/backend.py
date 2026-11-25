@@ -185,19 +185,20 @@ def _share() -> int:
 
 
 _CONFIGURED: set = set()
+GPU_MEMORY_FRACTION = 0.85  # of each GPU's memory for all calculation processes on it: the rest stays free
 
 
 @contextlib.contextmanager
 def _device(cp):
-    """This process's device as the current one; on first use caps the memory pool at its share."""
+    """This process's device as the current one; on first use caps the memory pool at its share of
+    ``GPU_MEMORY_FRACTION`` of the GPU's memory."""
     dev = device_for_this_process() or 0
     with cp.cuda.Device(dev):
         if dev not in _CONFIGURED:
             _CONFIGURED.add(dev)
-            share = _share()
-            if share > 1:
-                with contextlib.suppress(Exception):
-                    cp.get_default_memory_pool().set_limit(fraction=0.9 / share)
+            share = _share()  # also with one process per GPU: the display and other programs keep some memory
+            with contextlib.suppress(Exception):
+                cp.get_default_memory_pool().set_limit(fraction=GPU_MEMORY_FRACTION / share)
         yield dev
 
 

@@ -155,7 +155,7 @@ def test_memory_share_caps_the_pool_and_blocks(monkeypatch, gpu):
     monkeypatch.setenv("CSPAPS_GPU_SHARE", "4")
     with backend._device(fake) as dev:
         assert dev == 1
-    assert state["limits"] == {1: pytest.approx(0.9 / 4)}
+    assert state["limits"] == {1: pytest.approx(backend.GPU_MEMORY_FRACTION / 4)}
     assert backend.block_elements(fake) == 8_000_000  # default block, below the memory cap
     monkeypatch.setenv("CSPAPS_GPU_BLOCK", "1e9")
     # 8 GiB free of 11 GiB, 4 processes on the device: 0.8 * 11/4 GiB / 40 bytes per element

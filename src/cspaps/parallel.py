@@ -46,9 +46,68 @@ def cpu_count() -> int:
     return max(1, n)
 
 
+def reserved_cpus(total: int | None = None) -> int:
+    """CPUs left to the system and the user's other programs (the desktop, the browser running the GUI):
+    ``CSPAPS_RESERVE_CPUS``, else about 15 % of the usable CPUs (at least one when there are two or more)."""
+    raw = os.environ.get("CSPAPS_RESERVE_CPUS", "").strip()
+    total = cpu_count() if total is None else int(total)
+    if raw:
+        return min(max(0, int(raw)), max(0, total - 1))
+    return 0 if total <= 1 else max(1, round(0.15 * total))
+
+
+def available_cpus() -> int:
+    """CPUs the calculations may use: the usable CPUs minus the reserve (at least one)."""
+    total = cpu_count()
+    return max(1, total - reserved_cpus(total))
+
+
 def n_workers(setting: int) -> int:
-    """-1 = all usable CPUs (``cpu_count``), otherwise at least 1."""
-    return cpu_count() if setting == -1 else max(1, int(setting))
+    """-1 = all CPUs the calculations may use (``available_cpus``: a reserve stays free), otherwise at least 1."""
+    return available_cpus() if setting == -1 else max(1, int(setting))
+
+
+def memory_bytes() -> tuple[int, int] | None:
+    """(available, total) physical memory in bytes, None when unknown (Linux /proc/meminfo, Windows API)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return int(st.ullAvailPhys), int(st.ullTotalPhys)
+        info = {}
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                key, value = line.split(":", 1)
+                info[key] = int(value.split()[0]) * 1024
+        return info["MemAvailable"], info["MemTotal"]
+    except Exception:  # noqa: BLE001 - macOS and others: no guard
+        return None
+
+
+def memory_cap(workers: int) -> int:
+    """At most as many worker processes as the free memory carries: each is assumed to need
+    ``CSPAPS_WORKER_MEM_GB`` (default 1.5; large fields need more), and max(2 GB, 15 % of RAM) stays free, so
+    the computer does not start swapping and freeze."""
+    mem = memory_bytes()
+    if mem is None:
+        return workers
+    avail, total = mem
+    try:
+        per = float(os.environ.get("CSPAPS_WORKER_MEM_GB", "1.5")) * 2 ** 30
+    except ValueError:
+        per = 1.5 * 2 ** 30
+    reserve = max(2 * 2 ** 30, 0.15 * total)
+    return max(1, min(int(workers), int((avail - reserve) // max(per, 1.0))))
 
 
 def start_method() -> str:
@@ -89,6 +148,7 @@ def pool(workers: int, probe=None):
         if forced != "process" and (probe is None or not _picklable(probe)):
             return ThreadPool(workers)
     ctx = mp.get_context(start_method())
+    workers = memory_cap(workers)  # leave memory to the system: no swapping
     # the parent's CSPAPS_* settings as they are now: a fork server keeps the environment it was started with
     env = {k: v for k, v in os.environ.items() if k.startswith("CSPAPS_") and k not in _PER_WORKER}
     return ctx.Pool(workers, initializer=_worker_init,
@@ -108,7 +168,7 @@ def worker_threads(workers: int) -> int:
     raw = os.environ.get("CSPAPS_WORKER_THREADS", "").strip()
     if raw:
         return max(1, int(raw))
-    return max(1, cpu_count() // max(1, int(workers)))
+    return max(1, available_cpus() // max(1, int(workers)))
 
 
 def limit_threads(n: int) -> None:
@@ -123,6 +183,28 @@ def limit_threads(n: int) -> None:
         pass
 
 
+def lower_priority() -> None:
+    """Run this (worker) process below normal priority, so the desktop and the GUI stay responsive while every
+    worker is busy: nice + ``CSPAPS_WORKER_NICE`` (default 10; 0 = off) on Linux / macOS, "below normal" on
+    Windows."""
+    try:
+        nice = int(os.environ.get("CSPAPS_WORKER_NICE", "10"))
+    except ValueError:
+        nice = 10
+    if nice <= 0:
+        return
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
+        else:
+            os.nice(nice)
+    except Exception:  # noqa: BLE001 - priority is a courtesy, never a failure
+        pass
+
+
 def _worker_init(env: dict, counter, n_workers: int, threads: int = 1) -> None:
     """Pool-worker initializer: the parent's CSPAPS_* settings (stale ones removed), this worker's share of the
     cores for BLAS / OpenMP, and with the GPU backend on the next device round-robin and its share of it."""
@@ -130,6 +212,7 @@ def _worker_init(env: dict, counter, n_workers: int, threads: int = 1) -> None:
         del os.environ[key]
     os.environ.update(env)
     limit_threads(threads)
+    lower_priority()
     from .backend import enabled, worker_init
 
     if enabled():

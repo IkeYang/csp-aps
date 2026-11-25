@@ -179,3 +179,25 @@ def default_aim(rec: Receiver, xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     """Single-point aiming: the surface point facing each heliostat, mid-height."""
     az = heliostat_azimuth(rec, xyz)
     return az, np.full(az.shape, rec.center[2])
+
+
+def panel_flux_table(rec: Receiver, grid: ReceiverGrid, flux_w_m2: np.ndarray) -> list[dict]:
+    """Per panel, from an incident flux map (n_height, n_azimuth) on ``grid``: azimuth range, peak incident flux,
+    the allowed limit at the hottest cell and the largest flux / limit ratio, mean absorbed flux and absorbed
+    power (absorbed flux x cell area; the panels add up to the whole map). Coarse-grid values: the verified
+    peak comes from ``verify.verify_beams``."""
+    inc = np.asarray(flux_w_m2, dtype=float).reshape(grid.z.size, grid.azimuth_deg.size)
+    absorbed = inc * grid.to_map(grid.alpha)
+    panel, limit = grid.to_map(grid.panel), grid.to_map(grid.limit)
+    rows = []
+    for p, (a0, a1) in enumerate(panel_bounds(rec)):
+        m = panel == p
+        if not m.any():
+            continue
+        ratio = inc[m] / limit[m]
+        j = int(np.argmax(ratio))
+        rows.append({"panel": p + 1, "azimuth_from_deg": float(a0), "azimuth_to_deg": float(a1),
+                     "peak_kw_m2": float(inc[m].max()) / 1e3, "limit_kw_m2": float(limit[m][j]) / 1e3,
+                     "peak_to_limit": float(ratio[j]), "mean_absorbed_kw_m2": float(absorbed[m].mean()) / 1e3,
+                     "absorbed_mw": float(absorbed[m].sum()) * grid.cell_area / 1e6})
+    return rows

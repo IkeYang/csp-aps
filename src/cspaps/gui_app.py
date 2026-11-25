@@ -347,7 +347,15 @@ def _initial_case_path() -> Path:
     return Path(args.case) if args.case else DEFAULT_CASE
 
 
-def _load_into_state(data: dict, base_dir: Path) -> None:
+def _load_into_state(data: dict, base_dir: Path, source: dict | None = None) -> None:
+    """Make ``data`` the current case; ``base_dir`` = the folder its relative file paths are read from.
+
+    ``source`` says where it came from ({"kind": "demo" | "folder" | "upload" | "run", "path": ...}); the "演示数据"
+    mark and the data note follow it, so loading another case always clears them (default: keep the current
+    source, e.g. for an edited YAML)."""
+    src = source or st.session_state.get("case_source") or {"kind": "folder", "path": str(base_dir)}
+    st.session_state["case_source"] = src
+    st.session_state["demo_data"] = src.get("kind") == "demo"
     st.session_state["case_dict"] = data
     st.session_state["base_dir"] = str(base_dir)
     site, weather = data.get("site") or {}, data.get("weather") or {}
@@ -552,6 +560,7 @@ button[data-testid="stNumberInputStepUp"],button[data-testid="stNumberInputStepD
 div[data-testid="stHorizontalBlock"]{flex-wrap:wrap;row-gap:.6rem}
 div[data-testid="stColumn"]{min-width:min(340px,100%)}
 div[data-testid="stColumn"] div[data-testid="stColumn"]{min-width:min(118px,100%)}
+.st-key-tradeoff_row div[data-testid="stColumn"]{min-width:min(200px,100%)}
 @media(max-width:760px){.stMainBlockContainer{padding:3.2rem .8rem 2rem}.cs-hero .title{font-size:1.3rem}}
 </style>""", unsafe_allow_html=True)
 
@@ -649,9 +658,10 @@ def _input_digest(case, args, options):
         p = Path(path)
         return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
 
+    from cspaps.config import FILE_SETTINGS
+
     settings = case.to_dict()
-    for section, attr in (("weather", "file"), ("field", "layout_file"), ("scenarios", "file"),
-                          ("scenarios", "map_file"), ("scenarios", "validation_file")):
+    for section, attr in FILE_SETTINGS:
         path = settings[section].get(attr)
         if path:
             settings[section][attr] = file_hash(case.resolve(path))
@@ -990,29 +1000,77 @@ def _templates(keys: list[str], key: str) -> None:
 
 
 def _start_example(task: str) -> None:
+    """Load the built-in demo for the task (replaces the current case)."""
     from cspaps.resources import example_path
 
     if task == "aps":
         path = DEFAULT_CASE
-        _load_into_state(yaml.safe_load(path.read_text(encoding="utf-8")), path.parent)
+        _load_into_state(yaml.safe_load(path.read_text(encoding="utf-8")), path.parent,
+                         {"kind": "demo", "path": str(path)})
         st.session_state["page"] = "瞄准优化"
     else:
         path = example_path("wrong_site/wrong_site.yaml")
-        _load_into_state(yaml.safe_load(path.read_text(encoding="utf-8")), path.parent)
+        _load_into_state(yaml.safe_load(path.read_text(encoding="utf-8")), path.parent,
+                         {"kind": "demo", "path": str(path)})
         st.session_state["page"] = "布局优化"
         st.session_state["layout_mode"] = "compare"
         st.session_state["vc_A"] = "case:layout_A.csv"
         st.session_state["vc_B"] = "case:layout_B.csv"
-    st.session_state["demo_data"] = True
     st.session_state.pop("own_data", None)
 
 
-def _start_own(task: str) -> None:
+def _start_current(task: str) -> None:
+    """Go to the task's workspace with the case that is loaded now (nothing replaced)."""
     st.session_state["page"] = "瞄准优化" if task == "aps" else "布局优化"
-    st.session_state["own_data"] = task
-    st.session_state["demo_data"] = False
+    st.session_state.pop("own_data", None)
     if task == "layout":
         st.session_state["layout_mode"] = "compare"
+
+
+def _start_own(task: str) -> None:
+    """The task's workspace with the templates for importing one's own data (the loaded case is kept)."""
+    st.session_state["page"] = "瞄准优化" if task == "aps" else "布局优化"
+    st.session_state["own_data"] = task
+    if task == "layout":
+        st.session_state["layout_mode"] = "compare"
+
+
+def _task_buttons(task: str, case) -> None:
+    """Start buttons of a home task card: the loaded case first, the demo only on request."""
+    key = "aps" if task == "aps" else "layout"
+    if case is not None and not st.session_state.get("demo_data"):
+        st.button(f"▶ 用当前算例开始：{case.name}", key=f"home_{key}_current", type="primary", on_click=_start_current,
+                  args=(task,), width="stretch", help="进入工作区，使用左侧已经载入的算例和它的镜场、气象文件。")
+        a, b = st.columns(2)
+        a.button("使用我的数据（模板）", key=f"home_{key}_own", on_click=_start_own, args=(task,), width="stretch",
+                 help="进入工作区并显示数据模板；当前算例保持不变。")
+        b.button("改用演示算例试算", key=f"home_{key}_demo", on_click=_start_example, args=(task,), width="stretch",
+                 help=f"载入内置演示算例，替换当前的 {case.name}（之后可在左侧“载入算例”重新打开）。")
+    else:
+        a, b = st.columns(2)
+        a.button("用示例试算", key=f"home_{key}_demo", type="primary", on_click=_start_example, args=(task,),
+                 width="stretch", help="载入内置演示算例并进入工作区。")
+        b.button("使用我的数据", key=f"home_{key}_own", on_click=_start_own, args=(task,), width="stretch",
+                 help="进入工作区并显示数据模板；自己的算例可在左侧“载入算例”打开。")
+
+
+FILE_LABEL_ZH = {"weather.file": "气象数据", "field.layout_file": "镜场坐标", "scenarios.file": "工况表",
+                 "scenarios.map_file": "DNI 地图", "scenarios.validation_file": "复核工况表"}
+
+
+def _data_note(case) -> str:
+    """Where the loaded case and its data come from (follows the case, never a stale flag)."""
+    src = st.session_state.get("case_source") or {}
+    origin = {"demo": "内置演示算例：镜场与吸热器为模拟设计输入", "upload": "上传的算例",
+              "run": f"运行记录 {Path(src.get('path', '')).name} 的输入"}.get(src.get("kind"))
+    if origin is None:
+        origin = f"本机文件 {src.get('path', st.session_state.get('base_dir', ''))}"
+    fld = case.field
+    field = (f"镜场坐标 {Path(fld.layout_file).name}" if fld.layout_file
+             else f"镜场由生成器 {(fld.generator or {}).get('type', 'radial_staggered')} 生成")
+    weather = (f"气象文件 {Path(case.weather.file).name}" if case.weather.source == "file" and case.weather.file
+               else f"晴空 DNI 模型（{case.sun.dni_model}）")
+    return f"当前算例 {case.name}：{origin} · {field} · {weather}。"
 
 
 def _demo_chip() -> list[str]:
@@ -1470,19 +1528,14 @@ def page_overview(case) -> None:
         _task_card("任务一 · 镜子已经装好", "计算瞄准点",
                    ["镜位表（编号与坐标）、镜面尺寸", "接收器位置和尺寸", "一个时刻的日照条件（站址气象或 DNI 测点）"],
                    ["逐镜瞄准点", "吸收功率", "接收器热点位置", "距离允许热流上限还有多少"])
-        a, b = st.columns(2)
-        a.button("用示例试算", key="home_aps_demo", type="primary", on_click=_start_example, args=("aps",), width="stretch")
-        b.button("使用我的数据", key="home_aps_own", on_click=_start_own, args=("aps",), width="stretch")
+        _task_buttons("aps", case)
     with c2:
         _task_card("任务二 · 镜子尚未安装", "比较全年布局",
                    ["场地边界、镜数与规格", "接收器与站址", "两套布局，或让软件搜索", "全年代表工况（可带 DNI 地图）"],
                    ["布局 A / B 的全年吸热量", "均匀性扣分与综合得分", "哪些工况决定了胜负"])
-        a, b = st.columns(2)
-        a.button("用示例试算", key="home_layout_demo", type="primary", on_click=_start_example, args=("layout",),
-                 width="stretch")
-        b.button("使用我的数据", key="home_layout_own", on_click=_start_own, args=("layout",), width="stretch")
-    if st.session_state.get("demo_data"):
-        st.caption("当前载入的是演示数据（标记“演示数据”）。镜场与吸热器为模拟设计输入，气象为 NASA POWER 2024 年逐时 DNI。")
+        _task_buttons("layout", case)
+    if case is not None:
+        st.caption(_data_note(case))
     if case is None:
         st.warning("当前算例参数无效，请在「参数设置」中修正。")
         return
@@ -1970,6 +2023,65 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now) -> None:
                 best = min(rows, key=lambda r: r["cv_2d"])
                 st.caption(f"从 λ = {rows[0]['lambda']:g} 到 λ = {best['lambda']:g}：CV {rows[0]['cv_2d']:.3f} → "
                            f"{best['cv_2d']:.3f}，吸收功率 {100 * (best['power_abs_mw'] / p0 - 1):+.1f}%。")
+        _pareto_flux(res, rows, sel)
+
+
+def _pareto_flux(res: dict, rows: list[dict], sel) -> None:
+    """The receiver of every plan on the trade-off curve: panel heat-flux maps, per-panel peaks and powers."""
+    from cspaps.gui_plots import panel_flux_bars, tradeoff_flux_grid, tradeoff_flux_map, tradeoff_profiles
+
+    flux = res.get("flux")
+    if flux is None:
+        st.caption("这份结果没有吸热器热流分布（旧版本算的），重新计算一次即可看到各管屏的热流。")
+        return
+    from cspaps.gui_plots import FLUX_MODES
+
+    _section(None, "吸热器管屏热流分布",
+             "每个 λ 的方案在吸热器展开图上的入射热流（横轴为周向方位，虚线为管屏分界）。所有 λ 用同一个色标，"
+             "颜色差别就是热流差别。λ 越大热流越摊平：峰值降低、各管屏之间更接近，吸收功率略减。")
+    lams = [float(v) for v in flux["lambdas"]]
+    row_box = st.container(key="tradeoff_row")  # the colour option sits beside the maps (narrow column allowed)
+    g, opt = row_box.columns([5, 1.35])
+    with opt:
+        mode = st.radio("色标", list(FLUX_MODES), format_func=FLUX_MODES.get, key="pareto_scale",
+                        help="多个 λ 对比时统一色标。0 – 最大：真实大小；增强对比：从受光区的低值拉到最大值，"
+                             "仍是同一色标；差值：每个方案减去参照方案，红 = 变热、蓝 = 变冷，色标对所有 λ 相同，"
+                             "差别大颜色深、差别小颜色浅，色标上的数字就是真实的 kW/m²。")
+        ref = 0
+        if mode == "diff":
+            ref = lams.index(st.selectbox("参照 λ", lams, format_func=lambda v: f"λ = {v:g}", key="pareto_ref"))
+        st.caption({"shared": "颜色对应真实热流大小，便于看峰值和上限。",
+                    "contrast": "同一色标拉到受光区的范围，细小的高低差更清楚；色标数字仍是真实热流。",
+                    "diff": "看各 λ 相对参照方案把热流从哪里挪到了哪里；颜色深浅就是变化大小。"}[mode])
+    with g:
+        _chart(tradeoff_flux_grid(flux, rows, mode=mode, ref=ref), "pareto_flux_grid")
+    start = sel if sel in lams else lams[0]
+    pick = st.select_slider("查看哪个 λ 的方案", options=lams, value=start, format_func=lambda v: f"λ = {v:g}",
+                            key="pareto_pick")
+    k = lams.index(pick)
+    row = next((r for r in rows if float(r["lambda"]) == pick), {})
+    panels = [r for r in res["summary"].get("panels", []) if float(r["lambda"]) == pick]
+    a, b = st.columns([1.5, 1])
+    with a:
+        _chart(tradeoff_flux_map(flux, k, row, mode=mode, ref=ref), "pareto_flux_map")
+    with b:
+        if panels:
+            _chart(panel_flux_bars(panels), "pareto_panel_bars")
+    if row:
+        tight = max(panels, key=lambda r: r["peak_to_limit"]) if panels else None
+        st.caption(f"λ = {pick:g}：吸收功率 {row['power_abs_mw']:.2f} MW，二维 CV {row['cv_2d']:.3f}，"
+                   f"细网格复核峰值 {row['peak_flux_kw_m2']:.0f} kW/m²"
+                   + (f"（第 {row['hotspot_panel']} 号管屏）" if row.get("hotspot_panel") else "")
+                   + (f"；最接近上限的是第 {tight['panel']} 号管屏，评价网格峰值为允许值的 {100 * tight['peak_to_limit']:.0f}%"
+                      if tight else "") + "。展开图与管屏柱状图用评价网格，热点位置与峰值以细网格复核为准。")
+    _chart(tradeoff_profiles(flux, k), "pareto_profiles")
+    if panels:
+        with st.expander(f"λ = {pick:g} 各管屏明细"):
+            st.dataframe(pd.DataFrame([{
+                "管屏": r["panel"], "方位范围 (°)": f"{r['azimuth_from_deg']:.1f} – {r['azimuth_to_deg']:.1f}",
+                "峰值 (kW/m²)": round(r["peak_kw_m2"], 0), "允许 (kW/m²)": round(r["limit_kw_m2"], 0),
+                "峰值 / 允许": f"{100 * r['peak_to_limit']:.0f}%", "平均吸收热流 (kW/m²)": round(r["mean_absorbed_kw_m2"], 0),
+                "吸收功率 (MW)": round(r["absorbed_mw"], 3)} for r in panels]), hide_index=True, width="stretch")
 
 # --------------------------------------------------------------------------- problem 2: layout
 
@@ -3731,7 +3843,7 @@ def page_parameters(case) -> None:
         text = st.text_area("算例 YAML", yaml.safe_dump(st.session_state["case_dict"], allow_unicode=True, sort_keys=False),
                             height=400, key=f"yaml_{st.session_state['ver']}")
         if st.button("应用 YAML"):
-            _load_into_state(yaml.safe_load(text), Path(st.session_state["base_dir"]))
+            _load_into_state(yaml.safe_load(text), Path(st.session_state["base_dir"]))  # same source, edited
             st.rerun()
 
 
@@ -3779,7 +3891,8 @@ def page_runs(case) -> None:
                 st.caption(f"复算结果目录 {replay['run_dir']}")
         if (d / "inputs_case.yaml").exists():
             if st.button("载入这次运行的输入参数"):
-                _load_into_state(yaml.safe_load((d / "inputs_case.yaml").read_text(encoding="utf-8")), d)
+                _load_into_state(yaml.safe_load((d / "inputs_case.yaml").read_text(encoding="utf-8")), d,
+                                 {"kind": "run", "path": str(d)})
                 st.rerun()
 
 
@@ -3826,14 +3939,16 @@ def _device_summary() -> str:
 def _resources() -> None:
     """Compute resources: CPU / GPU, which GPUs, how many processes -- always visible in the sidebar."""
     from cspaps import backend
-    from cspaps.parallel import cpu_count
+    from cspaps.parallel import available_cpus, cpu_count, memory_bytes, memory_cap, reserved_cpus
 
     inv = backend.gpu_inventory()
     devs = inv["devices"]
     cpus = cpu_count()
+    mem = memory_bytes()
     with st.container(border=True):
         st.markdown("**⚡ 计算资源**")
-        st.caption(f"本机可用 CPU {cpus} 个 · 检测到 NVIDIA GPU {len(devs)} 张")
+        st.caption(f"本机可用 CPU {cpus} 个" + (f" · 内存可用 {mem[0] / 2 ** 30:.0f} / {mem[1] / 2 ** 30:.0f} GB" if mem else "")
+                   + f" · 检测到 NVIDIA GPU {len(devs)} 张")
         if devs:
             ids = [d["id"] for d in devs]
             st.caption(_gpu_models_text(devs))
@@ -3862,11 +3977,24 @@ def _resources() -> None:
             if inv.get("detail"):
                 with st.expander("检测详情"):
                     st.code(inv["detail"])
+        reserve = st.number_input("给系统留几个 CPU", min_value=0, max_value=max(0, cpus - 1), value=reserved_cpus(cpus),
+                                  step=1, key="reserve_cpus",
+                                  help="这些核留给桌面、浏览器和其他程序，计算时电脑不会卡死。默认约 15%。")
+        if int(reserve) != reserved_cpus(cpus):
+            os.environ["CSPAPS_RESERVE_CPUS"] = str(int(reserve))
+            st.rerun()
+        avail = available_cpus()
         w_now = _workers_now()
         w = st.number_input("并行进程数（同时求解的工况数）", min_value=1, max_value=max(cpus, w_now), value=w_now, step=1,
                             key=f"n_workers:{st.session_state.get('ver', 0)}",  # follows the loaded case
-                            help=f"建议 = 可用 CPU 数 − 1（{max(1, cpus - 1)}）。串行搜索在 CPU 核上跑，显卡负责各进程的光斑核，"
-                                 "所以进程数按 CPU 核数取，不按显卡数取。")
+                            help=f"建议不超过 {avail}（可用 CPU 减去留给系统的 {int(reserve)} 个）。串行搜索在 CPU 核上跑，"
+                                 "显卡负责各进程的光斑核，所以进程数按 CPU 核数取，不按显卡数取。")
+        if int(w) > avail:
+            st.warning(f"{int(w)} 个进程超过了留出余量后的 {avail} 个 CPU，计算时电脑可能变卡。")
+        cap = memory_cap(int(w))
+        if cap < int(w):
+            st.caption(f"按当前可用内存，最多同时启动 {cap} 个进程（每个按 1.5 GB 估计，留出 15% 内存；"
+                       "环境变量 CSPAPS_WORKER_MEM_GB 可改估计值）。")
         if int(w) != w_now:
             os.environ["CSPAPS_WORKERS"] = str(int(w))  # the depths use it too
             data = st.session_state["case_dict"]
@@ -3875,10 +4003,164 @@ def _resources() -> None:
             st.session_state["ver"] += 1
             st.rerun()
         gpus = backend.selected_gpus()
-        st.caption(f"将使用：{_device_summary()}")
+        st.caption(f"将使用：{_device_summary()}。计算进程以较低优先级运行，前台操作不受影响"
+                   + ("；每张显卡留出 15% 显存。" if gpus else "。"))
         if gpus and w > len(gpus):
             st.caption(f"每张卡约 {-(-int(w) // len(gpus))} 个进程：建议先在本机运行 `nvidia-cuda-mps-control -d`，"
                        "让它们的显卡计算同时进行。")
+
+
+def _rel(path: Path) -> str:
+    for base in (ROOT, Path.cwd()):
+        try:
+            return str(path.resolve().relative_to(base.resolve()))
+        except ValueError:
+            continue
+    return str(path)
+
+
+def _case_candidates() -> list[Path]:
+    """Case YAMLs on this computer: the ``cases`` folders of the repository and of the working directory."""
+    roots, seen, out = [ROOT / "cases", Path.cwd() / "cases"], set(), []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for p in sorted(root.rglob("*.y*ml")):
+            r = p.resolve()
+            if p.suffix.lower() in (".yaml", ".yml") and r not in seen and "test_results" not in p.parts:
+                seen.add(r)
+                out.append(p)
+    return out[:300]
+
+
+def _case_in(folder: Path) -> Path | None:
+    """The case YAML of a folder: case.yaml, else the only YAML (shallowest first)."""
+    found = sorted((p for p in folder.rglob("*.y*ml") if p.suffix.lower() in (".yaml", ".yml")),
+                   key=lambda p: (len(p.parts), p.name != "case.yaml", str(p)))
+    named = [p for p in found if p.name == "case.yaml"]
+    return named[0] if named else (found[0] if found else None)
+
+
+def _open_case_file(path: Path, kind: str = "folder") -> str | None:
+    """Load a case YAML from disk with its own folder as the base of its relative paths; error text or None."""
+    path = Path(path).expanduser()
+    if path.is_dir():
+        found = _case_in(path)
+        if found is None:
+            return f"{path} 里没有算例 YAML"
+        path = found
+    if not path.is_file():
+        return f"找不到文件 {path}"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return f"无法读取 {path}：{exc}"
+    if not isinstance(data, dict):
+        return f"{path} 不是算例 YAML"
+    _load_into_state(data, path.parent, {"kind": kind, "path": str(path)})
+    return None
+
+
+def _safe_extract(zip_path: Path, dest: Path) -> None:
+    """Extract a ZIP into ``dest``; members that would land outside it are skipped."""
+    import zipfile
+
+    root = dest.resolve()
+    with zipfile.ZipFile(zip_path) as zf:
+        for m in zf.infolist():
+            target = (dest / m.filename).resolve()
+            if m.is_dir() or not str(target).startswith(str(root) + os.sep):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(m) as src, open(target, "wb") as out:
+                out.write(src.read())
+
+
+def _save_case_upload(files) -> Path:
+    """Uploaded case files (YAML + CSVs, or ZIPs of a case folder) into one folder; returns the folder."""
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.name.encode("utf-8"))
+        h.update(f.getvalue())
+    folder = UPLOADS / f"case_{h.hexdigest()[:16]}"
+    folder.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        path = folder / Path(f.name).name
+        path.write_bytes(f.getvalue())
+        if path.suffix.lower() == ".zip":
+            _safe_extract(path, folder)
+    return folder
+
+
+def _case_loader() -> None:
+    """Open a case so that the files it refers to are found: from a folder on this computer, or uploaded together
+    with its files (paths in a case YAML are relative to the YAML's folder)."""
+    with st.container(border=True):
+        st.markdown("**📂 载入算例**")
+        cands = _case_candidates()
+        labels = {str(p): _rel(p) for p in cands}
+        pick = st.selectbox("本机已有的算例", ["", *labels], key="case_pick",
+                            format_func=lambda v: "选择一个算例…" if not v else labels[v],
+                            help="从算例所在的文件夹打开：YAML 里引用的镜场坐标、气象等相对路径都能找到。")
+        typed = st.text_input("或输入算例 YAML（或所在文件夹）的完整路径", key="case_path",
+                              placeholder="/data/aksai_field_test_2026/case.yaml")
+        if st.button("打开", key="open_case", disabled=not (pick or typed.strip()), width="stretch"):
+            err = _open_case_file(Path(typed.strip()) if typed.strip() else Path(pick))
+            if err:
+                st.error(err)
+            else:
+                st.rerun()
+        ups = st.file_uploader("或上传：YAML 连同它引用的 CSV 一起选中，或整个算例文件夹的 ZIP",
+                               type=["yaml", "yml", "csv", "json", "zip", "epw", "txt"], accept_multiple_files=True,
+                               key="case_upload")
+        sig = tuple((u.name, u.size) for u in ups or [])
+        if sig and st.session_state.get("loaded_upload") != sig:
+            st.session_state["loaded_upload"] = sig
+            folder = _save_case_upload(ups)
+            target = _case_in(folder)
+            if target is None:
+                st.error("上传的文件里没有算例 YAML。")
+            else:
+                err = _open_case_file(target, kind="upload")
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
+        if st.button("恢复阿克塞演示算例", key="restore_demo", width="stretch"):
+            _load_into_state(yaml.safe_load(DEFAULT_CASE.read_text(encoding="utf-8")), DEFAULT_CASE.parent,
+                             {"kind": "demo", "path": str(DEFAULT_CASE)})
+            st.rerun()
+
+
+def _missing_files_panel() -> None:
+    """Files the case refers to that are not there: say which and where, and take them as an upload."""
+    try:
+        case = case_from_dict(copy.deepcopy(st.session_state["case_dict"]), base_dir=st.session_state["base_dir"])
+    except Exception:  # noqa: BLE001 - an invalid case is reported elsewhere
+        return
+    missing = case.missing_files()
+    if not missing:
+        return
+    base = Path(st.session_state["base_dir"])
+    lines = "；".join(f"{FILE_LABEL_ZH.get(k, k)} `{v}`（应在 {p}）" for k, v, p in missing)
+    st.error(f"算例 {case.name} 引用的文件找不到：{lines}。算例 YAML 里的相对路径按 YAML 所在的文件夹查找，"
+             "单独上传 YAML 时这些文件没有一起上传。")
+    uploaded = base.resolve().is_relative_to(UPLOADS.resolve()) if base.exists() else True
+    if uploaded:
+        extra = st.file_uploader("补充缺少的文件（文件名与 YAML 里写的一致）", accept_multiple_files=True,
+                                 key=f"missing_{st.session_state['ver']}")
+        if extra:
+            want = {p.name: p for _, _, p in missing}
+            for f in extra:
+                dest = want.get(Path(f.name).name, base / Path(f.name).name)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(f.getvalue())
+            st.session_state["ver"] += 1
+            st.rerun()
+        st.caption("也可以：在左侧“载入算例”里直接打开本机的算例文件夹；或把 YAML 和这些文件一起选中重新上传；"
+                   "或把整个算例文件夹压缩成 ZIP 上传。")
+    else:
+        st.caption(f"把这些文件放到 {base}，或在「参数设置」里改成正确的路径（可写绝对路径）。")
 
 
 def main() -> None:
@@ -3887,7 +4169,9 @@ def main() -> None:
     _apply_theme()
     if "case_dict" not in st.session_state:
         path = _initial_case_path()
-        _load_into_state(yaml.safe_load(path.read_text(encoding="utf-8")), path.parent)
+        demo = path.resolve() == DEFAULT_CASE.resolve()
+        _load_into_state(yaml.safe_load(path.read_text(encoding="utf-8")), path.parent,
+                         {"kind": "demo" if demo else "folder", "path": str(path)})
     if st.session_state.get("page") not in PAGES:
         st.session_state["page"] = PAGES[0]
     with st.sidebar:
@@ -3911,16 +4195,10 @@ def main() -> None:
             st.download_button("保存当前参数 (YAML)", case.to_yaml().encode("utf-8"), file_name=f"{case.name}.yaml")
         else:
             st.error(err)
+        _case_loader()
         _resources()
-        up = st.file_uploader("载入算例 YAML", type=["yaml", "yml"])
-        if up is not None and st.session_state.get("loaded_upload") != (up.name, up.size):
-            st.session_state["loaded_upload"] = (up.name, up.size)
-            _load_into_state(yaml.safe_load(up.getvalue().decode("utf-8")), UPLOADS)
-            st.rerun()
-        if st.button("恢复阿克塞演示算例"):
-            _load_into_state(yaml.safe_load(DEFAULT_CASE.read_text(encoding="utf-8")), DEFAULT_CASE.parent)
-            st.rerun()
         st.caption(f"结果目录 {RESULTS}")
+    _missing_files_panel()
     {"总览": page_overview, "瞄准优化": page_aps, "布局优化": page_layout, "云影回放": page_replay,
      "光学校验": page_optics, "参数设置": page_parameters, "运行记录": page_runs, "方法与理论": page_theory}[page](case)
 

@@ -494,11 +494,45 @@ def _cylinder(rec, n: int = 48):
     return th, np.sin(th), np.cos(th)
 
 
-def _mirror_colors(values, cmin=None, cmax=None):
+DNI_MIN_SPAN = 100.0  # W/m2: a DNI colour bar spans at least this much, so near-uniform DNI is not painted as a pattern
+
+
+def span_range(values, cmin=None, cmax=None, min_span: float = 0.0, lower: float | None = None):
+    """Colour range (lo, hi, widened) of a map: the data's range, but at least ``min_span`` wide (centred on the
+    data, not below ``lower``). Auto-ranging alone stretches a 0.5 W/m2 ripple over the whole colour bar and
+    makes it look like a strong pattern; with a minimum span small differences look small (and stay visible),
+    large ones keep the full range. An explicit ``cmin`` / ``cmax`` wins."""
     v = np.asarray(values, dtype=float)
-    lo = float(np.nanmin(v)) if cmin is None else cmin
-    hi = float(np.nanmax(v)) if cmax is None else cmax
-    return v, lo, hi if hi > lo else lo + 1.0
+    v = v[np.isfinite(v)]
+    lo = float(v.min()) if cmin is None and v.size else (cmin if cmin is not None else 0.0)
+    hi = float(v.max()) if cmax is None and v.size else (cmax if cmax is not None else 1.0)
+    widened = False
+    if cmin is None and cmax is None and min_span and hi - lo < min_span:
+        mid = 0.5 * (lo + hi)
+        lo, hi = mid - 0.5 * min_span, mid + 0.5 * min_span
+        if lower is not None and lo < lower:
+            lo, hi = lower, lower + min_span
+        widened = True
+    return lo, (hi if hi > lo else lo + 1.0), widened
+
+
+def _range_note(values, widened: bool, fmt: str | None = None) -> str:
+    """Colour-bar subtitle with the data's actual range when the bar was widened (enough decimals to show it)."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if not widened or not v.size:
+        return ""
+    if fmt is None:
+        span = float(v.max() - v.min())
+        fmt = "{:.0f}" if span >= 10 else ("{:.1f}" if span >= 1 else "{:.2f}")
+    return f"<br><sub>实际 {fmt.format(v.min())}–{fmt.format(v.max())}</sub>"
+
+
+def _mirror_colors(values, cmin=None, cmax=None):
+    """DNI colours of the mirrors: (values, lo, hi, colour-bar note); at least ``DNI_MIN_SPAN`` wide."""
+    v = np.asarray(values, dtype=float)
+    lo, hi, widened = span_range(v, cmin, cmax, DNI_MIN_SPAN, lower=0.0)
+    return v, lo, hi, _range_note(v, widened)
 
 
 def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_lines: int = 140,
@@ -510,12 +544,12 @@ def aim_scene_3d(case: Case, xyz: np.ndarray, dni, aim_az, aim_z, active, max_li
     cx, cy, cz = rec.center
     xyz = np.asarray(xyz, float)
     act = np.asarray(active, bool)
-    v, lo, hi = _mirror_colors(dni, cmin, cmax)
+    v, lo, hi, note = _mirror_colors(dni, cmin, cmax)
     fig = go.Figure()
     _tower_shadow(fig, case, xyz, sun_angles, scene=True)
     fig.add_trace(go.Scatter3d(x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers", name="定日镜（按 DNI 着色）",
                                marker=dict(size=2.8, color=v, colorscale=DNI_SCALE, cmin=lo, cmax=hi, showscale=True,
-                                           colorbar=dict(title="DNI<br>W/m²", thickness=10, len=0.55, x=1.0)),
+                                           colorbar=dict(title="DNI<br>W/m²" + note, thickness=10, len=0.55, x=1.0)),
                                hovertemplate="x %{x:.0f} m, y %{y:.0f} m<br>DNI %{marker.color:.0f} W/m²<extra></extra>"))
     if (~act).any():
         k = np.flatnonzero(~act)
@@ -681,8 +715,10 @@ def receiver_aims_map(case: Case, grid: ReceiverGrid, flux_w_m2, aim_az, aim_z, 
             marker["size"] = 5 + 10 * ((sg - sg.min()) / span if span > 1e-9 else np.full(sg.size, 0.5))
         if values is not None:
             v = np.asarray(values, float)[on]
-            marker.update(color=v, colorscale=DNI_SCALE, showscale=True, cmin=cmin, cmax=cmax,
-                          colorbar=dict(title=value_label, thickness=10, len=0.42, y=0.2))
+            # DNI: a minimum colour span, so a fraction of a W/m2 does not look like a strong difference
+            lo, hi, widened = span_range(v, cmin, cmax, DNI_MIN_SPAN if "DNI" in value_label else 0.0, lower=0.0)
+            marker.update(color=v, colorscale=DNI_SCALE, showscale=True, cmin=lo, cmax=hi,
+                          colorbar=dict(title=value_label + _range_note(v, widened), thickness=10, len=0.42, y=0.2))
         else:
             marker.update(color="#4fc3f7")
         txt = [f"镜 {ids[i]}<br>方位 {az[i]:.1f}°，高 {zz[i]:.2f} m" +
@@ -715,7 +751,7 @@ def field_dni_map(case: Case, xyz, ids, dni, dni_map=None, clouds=None, inactive
     """Mirrors coloured by their DNI over an optional site raster (DNI map) and cloud outlines."""
     rec, spec = case.receiver, case.field
     fig = go.Figure()
-    v, lo, hi = _mirror_colors(dni, cmin, cmax)
+    v, lo, hi, note = _mirror_colors(dni, cmin, cmax)
     if dni_map is not None:
         fig.add_trace(go.Heatmap(x=dni_map.x, y=dni_map.y, z=dni_map.values * map_scale, colorscale=DNI_SCALE,
                                  zmin=lo, zmax=hi, showscale=False, opacity=0.32, name="DNI 地图", hoverinfo="skip"))
@@ -735,8 +771,8 @@ def field_dni_map(case: Case, xyz, ids, dni, dni_map=None, clouds=None, inactive
                                marker=dict(size=size, color=v, colorscale=DNI_SCALE, cmin=lo, cmax=hi, showscale=True,
                                            line=dict(width=0.5 if dni_map is not None else 0.3,
                                                      color="#16232b" if dni_map is not None else "white"),
-                                           colorbar=dict(title="DNI (W/m²)", thickness=12)),
-                               customdata=ids, text=[f"镜 {i}<br>DNI {d:.0f} W/m²" for i, d in zip(ids, v)],
+                                           colorbar=dict(title="DNI (W/m²)" + note, thickness=12)),
+                               customdata=ids, text=[f"镜 {i}<br>DNI {d:.1f} W/m²" for i, d in zip(ids, v)],
                                hovertemplate="%{text}<extra></extra>"))
     if shadow_fraction is not None:
         fraction = np.asarray(shadow_fraction)
@@ -856,8 +892,11 @@ def scenario_sky_chart(table, height: int = 340):
 
 def dni_map_chart(case: Case, dni_map, title: str = "", height: int = 330, xyz=None):
     rec, spec = case.receiver, case.field
-    fig = go.Figure(go.Heatmap(x=dni_map.x, y=dni_map.y, z=dni_map.values, colorscale=DNI_SCALE,
-                               colorbar=dict(title="倍数" if dni_map.unit == "factor" else "W/m²", thickness=10),
+    factor = dni_map.unit == "factor"
+    lo, hi, widened = span_range(dni_map.values, min_span=0.1 if factor else DNI_MIN_SPAN, lower=0.0)
+    note = _range_note(dni_map.values, widened, "{:.3f}" if factor else None)
+    fig = go.Figure(go.Heatmap(x=dni_map.x, y=dni_map.y, z=dni_map.values, colorscale=DNI_SCALE, zmin=lo, zmax=hi,
+                               colorbar=dict(title=("倍数" if factor else "W/m²") + note, thickness=10),
                                hovertemplate="x %{x:.0f} m, y %{y:.0f} m<br>%{z:.3f}<extra></extra>"))
     if spec.boundary is not None:
         b = np.asarray(list(spec.boundary) + [spec.boundary[0]], dtype=float)
@@ -984,11 +1023,12 @@ def dni_points_preview(case: Case, points: np.ndarray, values: np.ndarray, xyz: 
                        inside: np.ndarray, bad_points: np.ndarray | None = None, height: int = 460):
     """Measured DNI points, the DNI interpolated to every mirror and the mirrors outside the measured area."""
     fig = go.Figure()
-    lo = float(min(np.min(values) if len(values) else 0, np.min(dni_at_mirrors) if len(dni_at_mirrors) else 0))
-    hi = float(max(np.max(values) if len(values) else 1, np.max(dni_at_mirrors) if len(dni_at_mirrors) else 1))
+    both = np.concatenate([np.asarray(values, float).ravel(), np.asarray(dni_at_mirrors, float).ravel()])
+    lo, hi, widened = span_range(both, min_span=DNI_MIN_SPAN, lower=0.0)
     fig.add_trace(go.Scatter(x=xyz[:, 0], y=xyz[:, 1], mode="markers", name="定日镜（插值 DNI）",
                              marker=dict(size=6, color=dni_at_mirrors, colorscale=DNI_SCALE, cmin=lo, cmax=hi,
-                                         showscale=True, colorbar=dict(title="DNI (W/m²)", thickness=11)),
+                                         showscale=True,
+                                         colorbar=dict(title="DNI (W/m²)" + _range_note(both, widened), thickness=11)),
                              text=[f"插值 DNI {d:.0f} W/m²" + ("" if ok else "<br>测点范围外：取最近测点值")
                                    for d, ok in zip(dni_at_mirrors, inside)], hovertemplate="%{text}<extra></extra>"))
     out = np.flatnonzero(~np.asarray(inside, bool))
@@ -1025,4 +1065,164 @@ def ab_compare_chart(rows: list[dict], height: int = 300):
                          text=[f"{r['value_mwh']:,.1f}" for r in rows], textposition="outside"))
     fig.update_layout(barmode="group")
     fig.update_yaxes(title="MWh / MWh 等效")
+    return _base_layout(fig, "", height)
+
+
+# --------------------------------------------------------------------------- receiver flux along a trade-off curve
+
+_COMPASS = dict(tickvals=[0, 90, 180, 270, 360], ticktext=["北", "东", "南", "西", "北"])
+
+
+def _flux_heatmap(az, z, kw, zmax, showscale, limit_kw=None, panel=None, zmin=0.0, scale=None, unit="kW/m²",
+                  diff=False):
+    custom = None
+    hover = ("方位 %{x:.1f}°，高度 %{y:.1f} m<br>" +
+             ("热流变化 %{z:+.1f} kW/m²" if diff else "入射热流 %{z:.0f} kW/m²"))
+    if limit_kw is not None and panel is not None:
+        custom = np.dstack([limit_kw, kw / np.maximum(limit_kw, 1e-9), panel])
+        hover += "<br>允许 %{customdata[0]:.0f} kW/m²（占 %{customdata[1]:.0%}）· 管屏 %{customdata[2]:.0f}"
+    return go.Heatmap(x=az, y=z, z=kw, colorscale=scale or FLUX_SCALE, zmin=zmin, zmax=zmax, showscale=showscale,
+                      customdata=custom, colorbar=dict(title=unit, thickness=10, len=0.9),
+                      hovertemplate=hover + "<extra></extra>")
+
+
+DIFF_SCALE = [[0.0, "#1d4f91"], [0.25, "#6fa0d2"], [0.5, "#f7f7f5"], [0.75, "#e8956b"], [1.0, "#b2271e"]]
+FLUX_MODES = {"shared": "统一色标 0 – 最大", "contrast": "统一色标·增强对比", "diff": "与参照 λ 的差值"}
+
+
+def tradeoff_scale(flux: dict, mode: str = "shared", ref: int = 0):
+    """How the receiver maps of a trade-off curve are coloured, the same for every lambda (comparable):
+
+    * ``shared``: 0 to the largest flux of all plans -- true magnitudes;
+    * ``contrast``: from the 2nd percentile of the lit cells of all plans to the largest flux -- more contrast
+      where the heat is, still one scale for all;
+    * ``diff``: each plan minus the reference plan ``ref``, diverging colours symmetric about 0 with one limit for
+      all (the largest change anywhere): big changes are strong, small ones pale but visible, and the colour bar
+      gives their real size in kW/m2.
+    Returns (maps to draw, zmin, zmax, colorscale, colour-bar title)."""
+    maps = np.asarray(flux["incident_kw_m2"], float)
+    if mode == "diff":
+        d = maps - maps[ref][None]
+        m = float(np.abs(d).max()) or 1.0
+        return d, -m, m, DIFF_SCALE, f"相对 λ = {float(flux['lambdas'][ref]):g}<br>Δ kW/m²"
+    zmax = float(maps.max()) if maps.size else 1.0
+    if mode == "contrast":
+        lit = maps[maps > 0.01 * zmax]
+        return maps, float(np.percentile(lit, 2)) if lit.size else 0.0, zmax, FLUX_SCALE, "kW/m²"
+    return maps, 0.0, zmax, FLUX_SCALE, "kW/m²"
+
+
+def tradeoff_flux_grid(flux: dict, rows: list[dict], cols: int = 4, row_height: int = 230, mode: str = "shared",
+                       ref: int = 0):
+    """One unrolled receiver map per weight lambda on one colour scale (``tradeoff_scale``): how the heat spreads
+    as lambda grows."""
+    from plotly.subplots import make_subplots
+
+    maps, zmin, zmax, scale, unit = tradeoff_scale(flux, mode, ref)
+    lams = list(flux["lambdas"])
+    n = len(lams)
+    cols = max(1, min(cols, n))
+    nrows = -(-n // cols)
+    by_lam = {r["lambda"]: r for r in rows}
+    titles = []
+    for lam in lams:
+        r = by_lam.get(lam, {})
+        titles.append(f"λ = {lam:g} · CV {r.get('cv_2d', float('nan')):.3f} · {r.get('power_abs_mw', float('nan')):.1f} MW")
+    fig = make_subplots(rows=nrows, cols=cols, subplot_titles=titles, shared_yaxes=True,
+                        horizontal_spacing=0.025, vertical_spacing=0.16 if nrows > 1 else 0.1)
+    az, z = np.asarray(flux["azimuth_deg"]), np.asarray(flux["z_m"])
+    for k in range(n):
+        r, c = k // cols + 1, k % cols + 1
+        fig.add_trace(_flux_heatmap(az, z, maps[k], zmax, k == 0, None if mode == "diff" else np.asarray(flux["limit_kw_m2"]),
+                                    np.asarray(flux["panel"]), zmin=zmin, scale=scale, unit=unit,
+                                    diff=mode == "diff"), row=r, col=c)
+        for e in flux.get("panel_edges_deg", []):
+            fig.add_vline(x=float(e) % 360.0, line=dict(color="white", width=0.6, dash="dot"), row=r, col=c)
+    fig.update_xaxes(range=[0, 360], **_COMPASS)
+    fig.update_yaxes(title_text="高度 z (m)", col=1)
+    fig.update_annotations(font_size=11)
+    return _base_layout(fig, "", row_height * nrows + 30)
+
+
+def tradeoff_flux_map(flux: dict, k: int, row: dict | None = None, height: int = 380, mode: str = "shared",
+                      ref: int = 0):
+    """The receiver of one plan on the curve: incident flux (or its change against the reference plan), panel
+    edges, limit contour and verified hotspot -- on the same colour scale as ``tradeoff_flux_grid``."""
+    maps, zmin, zmax, scale, unit = tradeoff_scale(flux, mode, ref)
+    az, z, lim = np.asarray(flux["azimuth_deg"]), np.asarray(flux["z_m"]), np.asarray(flux["limit_kw_m2"])
+    kw = np.asarray(flux["incident_kw_m2"], float)[k]
+    fig = go.Figure(_flux_heatmap(az, z, maps[k], zmax, True, None if mode == "diff" else lim,
+                                  np.asarray(flux["panel"]), zmin=zmin, scale=scale, unit=unit, diff=mode == "diff"))
+    ratio = kw / np.maximum(lim, 1e-9)
+    if ratio.max() > 0.9:
+        fig.add_trace(go.Contour(x=az, y=z, z=ratio, showscale=False, hoverinfo="skip", name="允许热流 90% / 100%",
+                                 contours=dict(start=0.9, end=1.0, size=0.1, coloring="none"),
+                                 line=dict(color="cyan", width=1.5)))
+    edges = [float(e) % 360.0 for e in flux.get("panel_edges_deg", [])]
+    for e in edges:
+        fig.add_vline(x=e, line=dict(color="white", width=1, dash="dot"))
+    if len(edges) > 1:  # panel numbers along the top
+        width = 360.0 / len(edges)
+        for p, e in enumerate(edges):
+            fig.add_annotation(x=(e + 0.5 * width) % 360.0, y=1.0, yref="paper", yanchor="bottom", showarrow=False,
+                               text=str(p + 1), font=dict(size=10, color=MUTED))
+    if row and row.get("hotspot_azimuth_deg") is not None:
+        fig.add_trace(go.Scatter(x=[row["hotspot_azimuth_deg"]], y=[row["hotspot_z_m"]], mode="markers",
+                                 name="细网格复核热点", hovertemplate="细网格复核热点<extra></extra>",
+                                 marker=dict(symbol="x", size=13, color="cyan", line=dict(width=2))))
+    fig.update_xaxes(title="吸热器周向方位（°，北 0° / 东 90°；上方数字为管屏号）", range=[0, 360], **_COMPASS)
+    fig.update_yaxes(title="高度 z (m)")
+    return _base_layout(fig, "", height)
+
+
+def panel_flux_bars(panels: list[dict], height: int = 380):
+    """Per panel: peak incident flux against its allowed flux, and the absorbed power."""
+    from plotly.subplots import make_subplots
+
+    p = [r["panel"] for r in panels]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12, row_heights=[0.55, 0.45],
+                        subplot_titles=["各管屏峰值热流与允许热流 (kW/m²)", "各管屏吸收功率 (MW)"])
+    colors = [RED if r["peak_to_limit"] > 1.0 + 1e-9 else (AMBER if r["peak_to_limit"] > 0.9 else TEAL) for r in panels]
+    fig.add_trace(go.Bar(x=p, y=[r["peak_kw_m2"] for r in panels], marker_color=colors, name="峰值热流",
+                         customdata=[[r["limit_kw_m2"], r["peak_to_limit"], r["mean_absorbed_kw_m2"]] for r in panels],
+                         hovertemplate="管屏 %{x}<br>峰值 %{y:.0f} kW/m²<br>允许 %{customdata[0]:.0f}（占 %{customdata[1]:.0%}）"
+                                       "<br>平均吸收热流 %{customdata[2]:.0f} kW/m²<extra></extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=p, y=[r["limit_kw_m2"] for r in panels], mode="markers", name="允许热流",
+                             marker=dict(symbol="line-ew", size=22, line=dict(color=INK, width=2)),
+                             hovertemplate="管屏 %{x} 允许 %{y:.0f} kW/m²<extra></extra>"), row=1, col=1)
+    fig.add_trace(go.Bar(x=p, y=[r["absorbed_mw"] for r in panels], marker_color=NAVY, name="吸收功率",
+                         hovertemplate="管屏 %{x}<br>吸收 %{y:.2f} MW<extra></extra>"), row=2, col=1)
+    fig.update_xaxes(dtick=1, range=[min(p) - 0.6, max(p) + 0.6] if p else None)
+    fig.update_xaxes(title_text="管屏号", row=2, col=1)
+    fig.update_layout(showlegend=False, bargap=0.25)
+    fig.update_annotations(font_size=11)
+    return _base_layout(fig, "", height)
+
+
+def tradeoff_profiles(flux: dict, selected: int | None = None, height: int = 300):
+    """Height-averaged absorbed flux around the receiver and azimuth-averaged flux over the height, every lambda."""
+    from plotly.subplots import make_subplots
+
+    q = np.asarray(flux["absorbed_kw_m2"])
+    az, z, lams = np.asarray(flux["azimuth_deg"]), np.asarray(flux["z_m"]), list(flux["lambdas"])
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.68, 0.32], horizontal_spacing=0.08,
+                        subplot_titles=["周向分布：沿高度平均的吸收热流 (kW/m²)", "高度分布：沿周向平均"])
+    n = len(lams)
+    for k, lam in enumerate(lams):
+        t = k / max(n - 1, 1)
+        color = f"rgba({int(20 + t * 204)},{int(128 + t * 27)},{int(111 - t * 66)},{1.0 if k == selected else 0.55})"
+        width = 3 if k == selected else 1.4
+        fig.add_trace(go.Scatter(x=az, y=q[k].mean(axis=0), mode="lines", line=dict(color=color, width=width),
+                                 name=f"λ = {lam:g}", legendgroup=str(k),
+                                 hovertemplate=f"λ = {lam:g}<br>方位 %{{x:.0f}}°：%{{y:.0f}} kW/m²<extra></extra>"),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=q[k].mean(axis=1), y=z, mode="lines", line=dict(color=color, width=width),
+                                 showlegend=False, legendgroup=str(k),
+                                 hovertemplate=f"λ = {lam:g}<br>高度 %{{y:.1f}} m：%{{x:.0f}} kW/m²<extra></extra>"),
+                      row=1, col=2)
+    for e in flux.get("panel_edges_deg", []):
+        fig.add_vline(x=float(e) % 360.0, line=dict(color="#c9d3d1", width=0.8, dash="dot"), row=1, col=1)
+    fig.update_xaxes(range=[0, 360], **_COMPASS, row=1, col=1)
+    fig.update_yaxes(title_text="高度 z (m)", row=1, col=2)
+    fig.update_annotations(font_size=11)
     return _base_layout(fig, "", height)
