@@ -11,6 +11,11 @@
   - 瞄准结果：“全场叠加热流”（全部工作镜叠加的热流图、管屏柱状图、周向与高度分布、CV 与细网格复核峰值）排在第一位，不画瞄准点；瞄准点叠加图的底图同样是全场热流，抽样只用于画瞄准点和光斑圈（`gui_app._full_field_flux`，`gui_plots.tradeoff_profiles(labels=...)`）。
   - 气象文件范围检查：`sun.weather_coverage`、`sun.weather_dni_at`（超出 max(1 h, 1.5 × 间隔) 即报错），`simulate.sun_state` 不再静默取最近记录；界面时刻默认落在文件内（`_default_time`）、显示覆盖时段、超出时报错并停用开始按钮（`_weather_window`）。
   - 证书内存保护：`certify.model_bytes` / `check_model_memory` / `CertificateTooLarge`（48 字节 / 非零项，留 max(2 GB, 15%) 内存）；`task_aim` 跳过证书并在结果中说明（`certificate_skipped`），`task_pareto` 关闭证书，通量价格换位改用能量定价；`layout_value.solve_instant` 只按固定的 8 GB 规模判断（`FORMAL_CERTIFY_MAX_BYTES`），与机器无关、结果可复现。
+- **运行记录与历史回放（学生分支 feature/aksai-field-test-2026，审计后合并）**
+  - 运行记录页：按任务筛选、选择一次运行即可浏览它的交互图表（结果页显示过的图表按运行保存在 `visualizations/`，每次运行每张图只存第一次的版本；用 Streamlit 自带的 plotly 显示，离线可用）、静态图、全部 CSV / JSON / YAML / NPZ 数据与下载、输入参数；云影回放可从保存的文件完整恢复时间轴和逐镜方案（`workflows.load_realtime_run`）；其他任务可按冻结参数复算为一次新运行（`workflows.replay_run`，各任务的 `run.json` 记录了复算所需的全部参数）。单时刻结果另存逐镜数组 `*_snapshot.npz`，云影对比另存 `cloud_compare_states.npz`。
+  - 导入镜场的默认值（`layout_opt.imported_layout_defaults` / `resolve_layout_opt_case`）：`layout_opt.n_heliostats` 未设时取导入镜数；未设最小间距时取导入镜场最近两面镜的中心距（不超过 1.1 × 对角线，不低于镜面长边）。布局页写入算例并说明，小于对角线时提示需现场防碰撞措施。
+  - 正式排名只有一套可排名布局时不再出错，改为显示它的逐工况结果。
+  - 审计修正：现场算例 `case.yaml` 恢复相对路径（分支里是学生机器上的绝对路径）；回放恢复的时长按单一策略的保持时段计（原来把各策略的行加在一起，3 个策略时是 3 倍）；回放帧另存细网格复核结果，恢复后的热点位置与原来一致（原来取粗网格最大值）；运行状态恢复中文。
 - **第二轮现场反馈**
   - 初始状态与移动：单时刻计算从初始状态出发（上传的运行方案，否则 `aps.initial_aim`，默认 `spread` 均布瞄准：`aps.solve_spread`、`spread_levels`）；移动代价 `aps.move_penalty_per_m` 默认 0.001（原 0）；硬约束 `aps.max_aim_shift_m`、`aps.max_rotation_deg`（`aps.move_limits`，写入 `prob.reach`）；贪心平局先比移动距离（`TIE_MOVE_STEP_M`，编译内核同步）。计价进入贪心、子场分解、MILP（`solve_milp(cost=…)`）、松弛取整的接受、联合姿态搜索（`search_joint_poses(move_cost=…)`，穷举上界取最大不计价目标）。结果 `initial_state`、`moves`（`aps.move_stats`：移动、转角、上限）、`certificate.move_cost_mw`；逐镜 CSV 增加初始瞄准、`aim_shift_m`、`rotation_deg`；`task_pareto(prev_aims=…)`。全年布局价值不变。
   - 单镜详情（`simulate.mirror_detail`、`occlusion_detail`，`gui_plots.mirror_path_3d`、`mirror_closeup_3d`、`mirror_spot_map`、`mirror_factor_chart`）：点镜场图或输入编号，看全光路（真实比例、视线垂直于入射面）、镜面近景（相邻镜按各自姿态、8×8 采样点的遮挡状态、挡它的镜子）、效率链与全场平均、功率链、光斑与移动。

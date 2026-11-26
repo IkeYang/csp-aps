@@ -62,6 +62,9 @@ def test_saved_realtime_run_restores_full_frame_data(small_case, tmp_path):
         saved = replayed.table[column].astype(object).where(replayed.table[column].notna(), "").astype(str)
         source = original.table[column].astype(object).where(original.table[column].notna(), "").astype(str)
         assert saved.tolist() == source.tolist()
+    # sample-and-hold time base of one strategy, not the sum over every row of the table
+    assert replayed.duration_s == pytest.approx(original.duration_s)
+    assert replayed.summary() == original.summary()
     for source, target in zip(original.frames, replayed.frames):
         np.testing.assert_array_equal(target["dni"], source["dni"])
         assert target["time"] == source["time"]
@@ -72,3 +75,4 @@ def test_saved_realtime_run_restores_full_frame_data(small_case, tmp_path):
             np.testing.assert_array_equal(restored_plan["active"], plan["active"])
             np.testing.assert_array_equal(restored_plan["tower_fraction"], plan["tower_fraction"])
             np.testing.assert_array_equal(restored_plan["flux"], plan["flux"])
+            assert restored_plan["check"] == plan["check"]  # the verified check, hotspot included

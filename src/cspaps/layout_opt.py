@@ -392,31 +392,46 @@ def design_spacing(case: Case) -> float:
     return case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
 
 
-def resolve_layout_opt_case(case: Case) -> Case:
-    """Use an imported field's count and tightest existing pitch as unspecified search defaults."""
+def imported_layout_defaults(case: Case) -> dict | None:
+    """Search defaults taken from an imported field (``field.layout_file``) when the case leaves them open:
+    its mirror count (``layout_opt.n_heliostats`` unset) and its tightest centre distance as the minimum
+    spacing (no ``min_spacing_factor`` and no ``fixed.spacing_factor``), capped at the usual 1.1 x diagonal and
+    never below the mirror's longer side (closer centres would overlap: a data error, reported by
+    ``validate_layout``). None when nothing is inferred."""
     spec = case.layout_opt
-    infer_count = spec.n_heliostats is None
     fixed = dict(spec.fixed or {})
+    infer_count = spec.n_heliostats is None
     infer_spacing = spec.min_spacing_factor is None and "spacing_factor" not in fixed
     if not case.field.layout_file or not (infer_count or infer_spacing):
-        return case
-
+        return None
     fld = build_field(case)
-    target_count = fld.n if infer_count and fld.n else None
-    spacing_factor = None
+    hel = case.heliostat
+    out = {"n_heliostats": int(fld.n) if infer_count and fld.n else None, "spacing_factor": None}
     if infer_spacing and fld.n > 1:
         nearest = cKDTree(fld.xyz[:, :2]).query(fld.xyz[:, :2], k=2)[0][:, 1]
         min_spacing = float(nearest.min())
         if np.isfinite(min_spacing) and min_spacing > 0:
-            spacing_factor = min(1.1, min_spacing / case.heliostat.diagonal)
-    if target_count is None and spacing_factor is None:
-        return case
+            floor = max(hel.width, hel.height)
+            used = max(min_spacing, floor)
+            out.update(spacing_factor=min(1.1, used / hel.diagonal), min_spacing_m=min_spacing,
+                       spacing_m=min(1.1 * hel.diagonal, used), floored=bool(min_spacing < floor),
+                       below_diagonal=bool(used < hel.diagonal), diagonal_m=float(hel.diagonal))
+    if out["n_heliostats"] is None and out["spacing_factor"] is None:
+        return None
+    return out
 
+
+def resolve_layout_opt_case(case: Case) -> Case:
+    """The case with ``imported_layout_defaults`` filled in (a copy; the caller's case is not changed)."""
+    found = imported_layout_defaults(case)
+    if found is None:
+        return case
     resolved = case.copy()
-    if target_count is not None:
-        resolved.layout_opt.n_heliostats = target_count
-    if spacing_factor is not None:
-        fixed["spacing_factor"] = spacing_factor
+    if found["n_heliostats"] is not None:
+        resolved.layout_opt.n_heliostats = found["n_heliostats"]
+    if found["spacing_factor"] is not None:
+        fixed = dict(resolved.layout_opt.fixed or {})
+        fixed["spacing_factor"] = found["spacing_factor"]
         resolved.layout_opt.fixed = fixed
     return resolved
 

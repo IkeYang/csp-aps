@@ -50,6 +50,31 @@ def test_imported_field_defaults_to_same_count_and_ranks_initial_layout(tmp_path
     assert set(ranked["values"]) == {"search_1", "initial"}
 
 
+def test_inferred_spacing_never_below_the_mirror_side(tmp_path):
+    """Two imported centres closer than the mirror's side (overlapping mirrors: a data error) do not shrink the
+    search's minimum spacing below the side; the overlap is reported by the site check."""
+    from cspaps.layout_opt import imported_layout_defaults
+
+    data = small_case_dict()
+    side = max(data["heliostat"]["width"], data["heliostat"]["height"])
+    layout_path = tmp_path / "overlapping.csv"
+    pd.DataFrame({"id": [1, 2, 3], "x": [50.0, 50.0 + 0.4 * side, 80.0], "y": [0.0, 0.0, 0.0],
+                  "z": [4.0, 4.0, 4.0]}).to_csv(layout_path, index=False)
+    data["field"]["layout_file"] = str(layout_path)
+    data["layout_opt"].update({"n_heliostats": None, "min_spacing_factor": None, "fixed": {}})
+    case = case_from_dict(data, base_dir=tmp_path)
+    found = imported_layout_defaults(case)
+    assert found["floored"] and found["spacing_m"] == pytest.approx(side)
+    assert found["min_spacing_m"] == pytest.approx(0.4 * side)
+    resolved = resolve_layout_opt_case(case)
+    assert design_spacing(resolved) == pytest.approx(side)
+    fld = build_field(resolved)
+    assert validate_layout(resolved, fld.xyz, 3, design_spacing(resolved), fld.ids)["status"] == "constraint_violation"
+    # set explicitly: nothing is inferred
+    data["layout_opt"].update({"n_heliostats": 3, "min_spacing_factor": 1.0})
+    assert imported_layout_defaults(case_from_dict(data, base_dir=tmp_path)) is None
+
+
 def test_formal_dedup_keeps_xy_pairing():
     case = load_case(ROOT / "cases/wrong_site/wrong_site.yaml")
     case.layout_opt.baseline = "none"

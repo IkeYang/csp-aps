@@ -27,7 +27,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 import yaml
 
 from cspaps import workflows as wf
@@ -375,6 +374,7 @@ def _load_into_state(data: dict, base_dir: Path, source: dict | None = None) -> 
     st.session_state["demo_data"] = src.get("kind") == "demo"
     st.session_state["case_dict"] = data
     st.session_state["base_dir"] = str(base_dir)
+    st.session_state.pop("layout_defaults_note", None)  # belongs to the previous case
     site, weather = data.get("site") or {}, data.get("weather") or {}
     st.session_state["weather_site"] = (site.get("latitude"), site.get("longitude"), weather.get("file"))
     st.session_state["ver"] = st.session_state.get("ver", 0) + 1
@@ -687,8 +687,15 @@ def _capture_chart_run(result: dict | None) -> None:
 
 
 def _archive_chart(fig, key: str) -> None:
+    """Save the first version of every chart of a result into the run's ``visualizations`` folder (once per run
+    and chart key in a session: serialising every figure again on each rerun would slow every click)."""
     if _CHART_ARCHIVE_RUN_DIR is None:
         return
+    done = st.session_state.setdefault("_charts_archived", set())
+    mark = (str(_CHART_ARCHIVE_RUN_DIR), str(key))
+    if mark in done:
+        return
+    done.add(mark)
     try:
         payload = fig.to_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -2859,13 +2866,28 @@ def page_layout(case) -> None:
     if mode == "compare":
         _compare_workspace(case)
         return
-    from cspaps.layout_opt import resolve_layout_opt_case
+    from cspaps.layout_opt import imported_layout_defaults, resolve_layout_opt_case
 
-    resolved_case = resolve_layout_opt_case(case)
-    if resolved_case is not case:
-        st.session_state["case_dict"] = resolved_case.to_dict()
+    found = imported_layout_defaults(case)
+    if found is not None:  # written into the case once, so the form shows the values the search will use
+        parts = []
+        if found["n_heliostats"] is not None:
+            parts.append(f"镜数 {found['n_heliostats']:,} 面（与导入镜场相同）")
+        if found["spacing_factor"] is not None:
+            parts.append(f"最小镜距 {found['spacing_m']:.2f} m（= {found['spacing_factor']:.3f} × 镜面对角线；导入镜场最近的两面镜相距 "
+                         f"{found['min_spacing_m']:.2f} m）")
+        note = "；".join(parts) + "。"
+        if found.get("below_diagonal"):
+            note += (f"这个间距小于镜面对角线 {found['diagonal_m']:.2f} m：相邻镜子在某些姿态下可能相碰，"
+                     "沿用的是现场已有的排布密度，需要现场的防碰撞措施。")
+        if found.get("floored"):
+            note += "导入镜场里有两面镜的中心距小于镜面边长（坐标可能有误），最小镜距按镜面边长取。"
+        st.session_state["layout_defaults_note"] = note + "可在“全部参数 → 布局优化”里改。"
+        case = resolve_layout_opt_case(case)
+        st.session_state["case_dict"] = case.to_dict()
         st.session_state["ver"] += 1
-        case = resolved_case
+    if st.session_state.get("layout_defaults_note"):
+        _callout("info", "布局搜索沿用了导入镜场的镜数和间距", st.session_state["layout_defaults_note"])
     res = st.session_state.get("res_opt")
     if res is None:
         _layout_search_preview(case)
@@ -4397,6 +4419,18 @@ def page_parameters(case) -> None:
             st.rerun()
 
 
+CHART_NAMES = {  # readable names of archived charts without their own title
+    "s_full_flux": "全场叠加热流", "s_full_panels": "各管屏峰值与功率", "s_full_profiles": "周向与高度热流分布",
+    "s_rec": "瞄准点叠加图", "s_scene3d": "三维瞄准示意", "s_rec3d": "吸热器近景", "s_field": "镜场与效率",
+    "s_waterfall": "功率损失瀑布图", "insp_map": "单镜详情 · 镜场", "insp_3d": "单镜详情 · 全光路",
+    "insp_close": "单镜详情 · 镜面近景", "insp_factors": "单镜详情 · 效率链", "insp_spot": "单镜详情 · 光斑位置",
+    "mv_flux0": "初始状态的热流", "mv_flux1": "本方案的热流", "mv_aims": "瞄准点移动", "mv_hist": "移动距离分布",
+    "pareto_chart": "功率–均匀度权衡曲线", "replay_site_preview": "镜场预览",
+}
+CHART_PREFIXES = (("ops_field_", "回放 · 镜场 DNI"), ("ops_rec_", "回放 · 吸热器热流"), ("tl_", "回放 · 峰值时间线"),
+                  ("pareto_", "权衡曲线"), ("cert_", "最优性证书"), ("fv_", "正式排名"), ("cc_", "云影对比"))
+
+
 def _history_payload(path: Path):
     suffix = path.suffix.lower()
     if suffix == ".json":
@@ -4439,7 +4473,7 @@ def _history_run_detail(run: pd.Series, task_names: dict[str, str]) -> None:
             _ops_replay(load_case(directory / "inputs_case.yaml"), historical=restored)
     elif replayable:
         job_key = f"history_replay_{run_key}"
-        if st.button("按冻结参数重新计算并补齐全部图表", key=f"start_{job_key}",
+        if st.button("按冻结参数重新计算（结果另存为一次新运行）", key=f"start_{job_key}",
                      disabled=st.session_state.get(f"job_{job_key}") is not None):
             st.session_state[f"job_{job_key}"] = Job(wf.replay_run, directory, RESULTS, progress=True, cancel=True)
             st.rerun()
@@ -4448,7 +4482,7 @@ def _history_run_detail(run: pd.Series, task_names: dict[str, str]) -> None:
         _job_error(job_key)
         replay = st.session_state.get(f"res_{job_key}")
         if replay:
-            st.success(f"完整复算已保存为新运行：{replay['run_dir']}")
+            st.success(f"已按冻结参数复算，结果另存为新运行：{replay['run_dir']}。在列表里选它即可查看。")
 
     charts_dir = directory / "visualizations"
     index_path = charts_dir / "index.json"
@@ -4459,7 +4493,14 @@ def _history_run_detail(run: pd.Series, task_names: dict[str, str]) -> None:
         except (OSError, ValueError):
             st.warning("交互图目录索引损坏，可以从冻结输入重新计算以恢复图表。")
     if charts:
-        labels = [f"{entry.get('title', entry['key'])} · {entry['key']}" for entry in charts]
+        def chart_label(entry):
+            key = str(entry["key"])
+            name = CHART_NAMES.get(key) or next((v for k, v in CHART_PREFIXES if key.startswith(k)), None)
+            title = str(entry.get("title") or "")
+            text = name or (title if title and title != key else key)
+            return text + (f" · {title}" if name and title and title != key else "")
+
+        labels = [chart_label(entry) for entry in charts]
         selected = st.selectbox("交互图表", range(len(charts)), format_func=lambda index: labels[index],
                                 key=f"history_chart_{run_key}")
         entry = charts[selected]
@@ -4469,10 +4510,9 @@ def _history_run_detail(run: pd.Series, task_names: dict[str, str]) -> None:
                 figure_json = stream.read()
             import plotly.io as pio
 
-            figure = pio.from_json(figure_json)
-            html = pio.to_html(figure, include_plotlyjs="cdn", full_html=True,
-                               config={"responsive": True, "displaylogo": False})
-            components.html(html, height=int(figure.layout.height or 520), scrolling=True)
+            # Streamlit's own plotly bundle: works without internet (a CDN script would not on a plant network)
+            st.plotly_chart(pio.from_json(figure_json), theme=None, config=PLOTLY_CONFIG,
+                            key=f"history_figure_{run_key}_{selected}")
         except (OSError, ValueError, KeyError) as exc:
             st.error(f"无法读取交互图：{exc}")
         with st.expander("交互图表归档"):
@@ -4532,6 +4572,9 @@ def page_runs(case) -> None:
                   "aps_refinement": "瞄准点加密", "scenario_aps": "年度工况 APS", "cloud_compare": "云影对比",
                   "validation_suite": "压力工况复核", "solver_benchmark": "求解器对比", "layout_tradeoff": "布局权衡",
                   "scenarios": "年度工况生成", "fetch_weather": "下载气象数据", "preference_trial": "偏好试算"}
+    status_names = {"done": "已完成", "ok": "约束通过", "margin_reduced": "用到安全裕度", "infeasible": "不可执行",
+                    "uniformity_infeasible": "均匀度未达标", "capacity_shortfall": "场地容量不足",
+                    "constraint_violation": "几何约束不满足"}
     task_filter = st.multiselect("仿真任务", sorted(runs["task"].dropna().unique()),
                                  format_func=lambda task: task_names.get(task, task),
                                  default=sorted(runs["task"].dropna().unique()), key="history_task_filter")
@@ -4542,6 +4585,8 @@ def page_runs(case) -> None:
     shown = visible.drop(columns=["path"]).rename(
         columns={"case": "算例", "run": "运行编号", "task": "仿真任务", "status": "状态", "finished": "完成时间"})
     shown["仿真任务"] = shown["仿真任务"].map(lambda value: task_names.get(value, value))
+    shown["状态"] = shown["状态"].map(lambda value: status_names.get(value, value))
+    shown["完成时间"] = shown["完成时间"].map(lambda value: str(value)[:19].replace("T", " ") if value else "—")
     selected = st.selectbox("选择要回看的仿真", range(len(visible)),
                             format_func=lambda index: f"{shown.iloc[index]['完成时间']} · "
                                                        f"{shown.iloc[index]['算例']} · {shown.iloc[index]['仿真任务']} · "

@@ -635,6 +635,8 @@ def save_frames(path: Path, res, fld: Field) -> None:
         arrays[f"{strat}__tower_fraction"] = np.array([
             plan["tower_fraction"] if plan["tower_fraction"] is not None else np.zeros(fld.n) for plan in plans])
         arrays[f"{strat}__flux"] = np.array([f["plans"][strat]["flux"] for f in res.frames])
+        # the verified (fine-grid, full-beam) check of every plan, so a restored replay shows the same hotspot
+        arrays[f"{strat}__check_json"] = np.array([json.dumps(plan["check"], default=float) for plan in plans])
     np.savez_compressed(path, **arrays)
 
 
@@ -669,15 +671,18 @@ def load_realtime_run(folder: str | Path) -> dict:
                 tower_key = f"{strategy}__tower_fraction"
                 tower_fraction = archive[tower_key][i] if tower_key in archive else np.zeros(fld.n)
                 row = table[(table["time"] == timestamp) & (table["strategy"] == strategy)].iloc[0]
-                hotspot_idx = np.unravel_index(int(np.argmax(flux)), flux.shape)
-                hotspot = {"panel": int(row["hotspot_panel"]),
-                           "azimuth_deg": float(grid.azimuth_deg[hotspot_idx[1]]),
-                           "z_m": float(grid.z[hotspot_idx[0]])}
-                check = {"status": "over_limit" if bool(row["over_limit"]) else "ok",
-                         "peak_flux_kw_m2": float(row["peak_flux_kw_m2"]),
-                         "peak_ratio": float(row["peak_to_limit"]), "hotspot_panel": hotspot["panel"],
-                         "hotspot_azimuth_deg": hotspot["azimuth_deg"], "hotspot_z_m": hotspot["z_m"],
-                         "hotspot": hotspot}
+                check_key = f"{strategy}__check_json"
+                if check_key in archive:  # the verified check as it was computed
+                    check = json.loads(str(archive[check_key][i]))
+                else:  # older archives: status and peak from the table, hotspot location only from the coarse map
+                    hotspot_idx = np.unravel_index(int(np.argmax(flux)), flux.shape)
+                    hotspot = {"panel": int(row["hotspot_panel"]),
+                               "azimuth_deg": float(grid.azimuth_deg[hotspot_idx[1]]),
+                               "z_m": float(grid.z[hotspot_idx[0]])}
+                    check = {"status": "over_limit" if bool(row["over_limit"]) else "ok",
+                             "peak_flux_kw_m2": float(row["peak_flux_kw_m2"]),
+                             "peak_to_limit": float(row["peak_to_limit"]), "hotspot": hotspot,
+                             "hotspot_basis": "coarse flux map (archive without the verified check)"}
                 frame["plans"][strategy] = {
                     "aim_azimuth": aim_azimuth, "aim_z": aim_z, "active": active,
                     "tower_fraction": tower_fraction, "flux": flux, "check": check,
@@ -685,7 +690,8 @@ def load_realtime_run(folder: str | Path) -> dict:
                     "operational_feasible": bool(row["operational_feasible"])}
             frames.append(frame)
     start = pd.Timestamp(times[0])
-    duration_s = float(table["interval_s"].sum())
+    # sample-and-hold time base of one strategy (the table has one row per strategy and instant)
+    duration_s = float(table.drop_duplicates("time")["interval_s"].sum())
     clouds = cloud_field(case, fld, start)
     result = RealtimeResult(table, {}, clouds, case.realtime.step_s, duration_s, frames,
                             {"engine_stats": summary.get("engine")})

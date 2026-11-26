@@ -109,3 +109,26 @@ def test_without_initial_state_the_page_says_so(solved):
     assert "没有初始状态" in text
     assert "mv_flux0" not in _charts(at)
     assert "initial_state" not in at.session_state["res_single"]["summary"]
+
+
+def test_charts_are_archived_once_and_shown_offline_in_the_history(solved):
+    import json
+
+    at = solved()
+    run_dir = Path(at.session_state["res_single"]["run_dir"])
+    charts = run_dir / "visualizations"
+    keys = {c["key"] for c in json.loads((charts / "index.json").read_text(encoding="utf-8"))["charts"]}
+    assert {"s_full_flux", "insp_3d", "mv_flux0"} <= keys
+    files = sorted(p.name for p in charts.glob("*.json.gz"))
+    at.button(key="insp_pick_0").click().run()  # another mirror: an interaction, not a new result
+    assert sorted(p.name for p in charts.glob("*.json.gz")) == files
+    at.radio(key="page").set_value("运行记录").run()
+    assert not at.exception
+    pick = at.selectbox(key="history_run_pick")
+    aps = next(i for i, label in enumerate(pick.options) if "APS 瞄准优化" in label)
+    pick.set_value(aps).run()
+    assert not at.exception
+    assert any(str(c.key).startswith("history_figure_") for c in at.get("plotly_chart"))  # Streamlit's plotly
+    table = at.dataframe[0].value
+    assert "状态" in table and set(table["状态"]) <= {"已完成", "约束通过", "用到安全裕度", "不可执行", "均匀度未达标",
+                                                    "场地容量不足", "几何约束不满足"}
