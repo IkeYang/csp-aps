@@ -11,6 +11,10 @@
   - 瞄准结果：“全场叠加热流”（全部工作镜叠加的热流图、管屏柱状图、周向与高度分布、CV 与细网格复核峰值）排在第一位，不画瞄准点；瞄准点叠加图的底图同样是全场热流，抽样只用于画瞄准点和光斑圈（`gui_app._full_field_flux`，`gui_plots.tradeoff_profiles(labels=...)`）。
   - 气象文件范围检查：`sun.weather_coverage`、`sun.weather_dni_at`（超出 max(1 h, 1.5 × 间隔) 即报错），`simulate.sun_state` 不再静默取最近记录；界面时刻默认落在文件内（`_default_time`）、显示覆盖时段、超出时报错并停用开始按钮（`_weather_window`）。
   - 证书内存保护：`certify.model_bytes` / `check_model_memory` / `CertificateTooLarge`（48 字节 / 非零项，留 max(2 GB, 15%) 内存）；`task_aim` 跳过证书并在结果中说明（`certificate_skipped`），`task_pareto` 关闭证书，通量价格换位改用能量定价；`layout_value.solve_instant` 只按固定的 8 GB 规模判断（`FORMAL_CERTIFY_MAX_BYTES`），与机器无关、结果可复现。
+- **云来云去：回放讲清楚发生了什么**
+  - 子采样（`realtime.substep_s`，默认 15 s；`realtime.replay_samples`）：两个控制时刻之间方案保持、按真实 DNI 重算并在细网格上复核；控制时刻的决策与旧实现逐位相同（先按控制时刻算出各策略全部方案，再并行评价全部采样，`annual.workers`）。每行新增 `control`、`control_index`、`dni_clear_w_m2`、`cloud_cover`、`p_absorbed_clear_mw`（同一方案、晴空 DNI，按逐镜效率精确换算）；帧里保存云影几何（`realtime.cloud_shapes`）；汇总新增晴空参考热量、云损失、换瞄准点与散焦指令总数（只计控制时刻）。
+  - `replay_story`：记分卡、云影时段、事件（云进入 / 离开 / 最大、日照骤降 / 骤升、重新瞄准、散焦、回退、超限 / 回到上限内、用到安全裕度、最高峰值）、云散瞬间（风险窗口 = 云散后仍在执行云散前所定方案的采样）、管屏 × 时间。`task_realtime` 的 JSON 带上这些内容，另存 `realtime_events.csv`；保存 / 恢复新增字段，旧记录可恢复（云影几何按算例重算）。
+  - 界面：结论与记分卡、浏览器端播放（云影、移动方向、预报位置、三种策略并排）、时间轴（云、功率与晴空参考、峰值与裕度）与事件表（点选跳转）、云散瞬间、管屏热力带；单时刻云影对比的“一图看懂”；回放开始时间与气象文件范围检查。
 - **运行记录与历史回放（学生分支 feature/aksai-field-test-2026，审计后合并）**
   - 运行记录页：按任务筛选、选择一次运行即可浏览它的交互图表（结果页显示过的图表按运行保存在 `visualizations/`，每次运行每张图只存第一次的版本；用 Streamlit 自带的 plotly 显示，离线可用）、静态图、全部 CSV / JSON / YAML / NPZ 数据与下载、输入参数；云影回放可从保存的文件完整恢复时间轴和逐镜方案（`workflows.load_realtime_run`）；其他任务可按冻结参数复算为一次新运行（`workflows.replay_run`，各任务的 `run.json` 记录了复算所需的全部参数）。单时刻结果另存逐镜数组 `*_snapshot.npz`，云影对比另存 `cloud_compare_states.npz`。
   - 导入镜场的默认值（`layout_opt.imported_layout_defaults` / `resolve_layout_opt_case`）：`layout_opt.n_heliostats` 未设时取导入镜数；未设最小间距时取导入镜场最近两面镜的中心距（不超过 1.1 × 对角线，不低于镜面长边）。布局页写入算例并说明，小于对角线时提示需现场防碰撞措施。

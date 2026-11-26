@@ -133,7 +133,8 @@ LABELS = {
     "engine.response_refresh_deg": "光斑缓存刷新角 (°)", "engine.reshade_below_elevation_deg": "复核重算遮挡的高度角上限 (°)",
     "engine.max_slew_deg_s": "镜面转速 (°/s，0 = 不限)", "engine.timeout_s": "求解时限 (s)",
     "engine.priority_dni_change": "优先重算的 DNI 变化比例", "engine.fallback": "复核失败时的回退策略",
-    "realtime.start": "开始时间", "realtime.duration_min": "时长 (min)", "realtime.step_s": "刷新周期 (s)",
+    "realtime.start": "开始时间", "realtime.duration_min": "时长 (min)", "realtime.step_s": "控制周期 (s)",
+    "realtime.substep_s": "云影动画与复核间隔 (s，0 = 只在控制时刻)",
     "realtime.forecast_horizon_s": "预报时长 (s)", "realtime.forecast_step_s": "预报快照间隔 (s)",
     "realtime.clouds": "云列表 (YAML)", "realtime.random_clouds": "随机云设置 (YAML)",
     "realtime.scenario": "场景", "realtime.dni_delay_s": "DNI 数据延迟 (s)", "realtime.dni_dropout_s": "DNI 丢失时段 [起, 止] (s)",
@@ -287,6 +288,8 @@ HELP = {
     "layout_opt.search_aiming": "中心瞄准按理论吸热量扣除均匀度惩罚复排。选用 APS 时按运行可行能量和实际姿态的均匀度复排。",
     "layout_opt.refine_top": "对搜索阶段排名靠前的布局运行完整 APS 年收益复核。",
     "engine.max_slew_deg_s": "镜面法向最大转速，用于排除本控制周期内物理上来不及到达的瞄准点。",
+    "realtime.step_s": "在线引擎每隔这么久算一次新方案；新方案下一个控制时刻才生效（一个周期的延迟）。",
+    "realtime.substep_s": "两个控制时刻之间，方案保持不变而云在移动：每隔这么久按真实 DNI 重新计算一次热流并在细网格上复核，云散、云来的瞬间不会被漏掉，动画也更连贯。间隔越小越准、越慢；0 = 只在控制时刻计算。",
     "annual.method": "选用代表工况快速估算，或用全年的逐时天气数据复算。",
     "annual.aiming": "中心瞄准用于快速基准；APS 算法会在每个太阳工况下重新分配瞄准点。",
     "layout_opt.search_sampling": "搜索工况越多通常越准确，但每次布局评估也越慢。",
@@ -608,6 +611,17 @@ div.stButton>button:hover{border-color:var(--cs-cyan)}
   box-shadow:inset 0 -1px 0 #22c7d826,inset -1px 0 0 #22c7d826}
 .cs-spec .r b{color:#ecfbff;font:600 .82rem var(--cs-mono);text-align:right;overflow-wrap:anywhere}
 div[data-testid="stPlotlyChart"]{border-radius:14px;overflow:hidden}
+.cs-scores{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(260px,100%),1fr));gap:12px;margin:.3rem 0 .8rem}
+.cs-score{background:linear-gradient(150deg,#0a1b26 0%,#0f2b36 60%,#123a40 100%);border:1px solid #22c7d82e;border-radius:14px;
+  padding:.75rem 1rem .6rem;box-shadow:0 8px 22px -14px #06121bcc}
+.cs-score .h{display:flex;justify-content:space-between;align-items:center;color:#ecfbff;font-weight:700;margin-bottom:.35rem}
+.cs-score .h span{font-size:.72rem;padding:.12rem .55rem;border-radius:999px;font-weight:650}
+.cs-score.good .h span{background:#2ee6a622;color:#2ee6a6;border:1px solid #2ee6a666}
+.cs-score.bad .h span{background:#ff6b5e22;color:#ff8a80;border:1px solid #ff6b5e66}
+.cs-score .r{display:flex;justify-content:space-between;gap:.8rem;padding:.22rem 0;border-top:1px solid #22c7d81a;
+  font-size:.8rem;color:#9fbcc6}
+.cs-score .r b{font:600 .8rem var(--cs-mono);color:#ecfbff}
+.cs-score .r b.good{color:#2ee6a6}.cs-score .r b.bad{color:#ff8a80}.cs-score .r b.warn{color:#ffb547}
 div[data-testid="stExpander"] details{border-radius:10px;background:#fff}
 .katex{font-size:1.06em}
 button[data-testid="stNumberInputStepUp"],button[data-testid="stNumberInputStepDown"]{display:none}
@@ -3739,6 +3753,229 @@ def res_case(res: dict):
 
 # --------------------------------------------------------------------------- replay
 
+EVENT_ZH = {"cloud_enter": "云进入镜场", "cloud_max": "云影最大", "cloud_leave": "云离开镜场", "dni_drop": "云来 · 日照骤降",
+            "dni_rise": "云散 · 日照骤升", "replan": "重新瞄准", "defocus": "散焦指令", "fallback": "引擎回退",
+            "over_limit": "超过设备上限", "back_within_limit": "回到上限以内", "margin_used": "用到安全裕度",
+            "worst_peak": "本策略最高峰值"}
+EVENT_GROUPS = {"云与日照": ("cloud_enter", "cloud_max", "cloud_leave", "dni_drop", "dni_rise"),
+                "安全": ("over_limit", "back_within_limit", "margin_used", "worst_peak", "fallback"),
+                "镜场指令": ("replan", "defocus")}
+
+
+def _replay_story(rr, case, run_key: str) -> dict:
+    """Scorecard, cloud episodes, events, the clearing moment and the panel timeline of a replay (per run)."""
+    from cspaps.replay_story import clearing_spotlight, cloud_episodes, events, panel_timeline, scorecard
+
+    cache = st.session_state.setdefault("_replay_story", {})
+    if run_key not in cache:
+        cache.clear()
+        cache[run_key] = {"score": scorecard(rr, case), "episodes": cloud_episodes(rr.table),
+                          "events": events(rr, case), "spot": clearing_spotlight(rr, case),
+                          "panels": panel_timeline(rr, case)}
+    return cache[run_key]
+
+
+def _event_text(e) -> str:
+    kind, v, det = e["kind"], e["value"], str(e["detail"] or "")
+    if kind in ("cloud_enter", "cloud_max"):
+        return f"云影下最多 {100 * float(v):.0f}% 的镜子"
+    if kind in ("dni_drop", "dni_rise"):
+        a, _, b = det.partition("->")
+        return f"全场平均 DNI 从晴空的 {100 * float(a):.0f}% 变为 {100 * float(b):.0f}%" if b else ""
+    if kind == "replan":
+        why = {"dni_changed": "DNI 变化", "dni_missing": "DNI 缺失", "stale_dni": "DNI 过期", "solve_timeout": "求解超时"}
+        reasons = "、".join(why.get(r, r) for r in det.split(";") if r)
+        return f"{int(v)} 面镜子换瞄准点" + (f"（{reasons}）" if reasons else "")
+    if kind == "defocus":
+        return f"{int(v)} 面镜子散焦"
+    if kind == "fallback":
+        return det
+    if kind in ("over_limit", "margin_used"):
+        return f"最高 {float(v):.2f} × 上限，持续 {float(det or 0):.0f} s"
+    if kind == "back_within_limit":
+        return f"峰值 {float(v):.2f} × 上限"
+    if kind == "worst_peak":
+        return f"{float(v):.2f} × 上限（{det} kW/m²）"
+    return det
+
+
+def _replay_verdict(case, rr, story) -> tuple[str, str]:
+    """(tone, sentence) answering: what did the clouds do, was every strategy safe, what did it cost."""
+    score, eps, spot = story["score"], story["episodes"], story["spot"]
+    dur = float(rr.table.drop_duplicates("time")["interval_s"].sum()) / 60.0
+    parts = [f"回放 {dur:.0f} 分钟。"]
+    if eps:
+        def span(e):
+            return f"{pd.Timestamp(e['start']):%H:%M:%S}–" + ("回放结束" if e["until_end"] else f"{pd.Timestamp(e['end']):%H:%M:%S}")
+
+        e = max(eps, key=lambda x: x["max_cover"])
+        when = (f"云影在 {span(e)} 经过镜场" if len(eps) == 1 else
+                f"云影 {len(eps)} 次经过镜场（{'、'.join(span(x) for x in eps[:4])}{' 等' if len(eps) > 4 else ''}）")
+        parts.append(f"{when}，最多遮住 {100 * e['max_cover']:.0f}% 的镜子"
+                     + (f"，{pd.Timestamp(spot['time']):%H:%M:%S} 突然散开（全场 DNI 从晴空的 {100 * spot['dni_ratio_before']:.0f}% "
+                        f"升到 {100 * spot['dni_ratio_at']:.0f}%）" if spot else "") + "。")
+    else:
+        parts.append("这段时间没有云影经过镜场。")
+    tone = "ok"
+    for _, r in score.iterrows():
+        name = STRAT_ZH.get(r["strategy"], r["strategy"])
+        if r["time_over_limit_s"] > 0:
+            tone = "bad" if r["strategy"] != "center" else ("warn" if tone == "ok" else tone)
+            parts.append(f"{name}超限 {r['time_over_limit_s'] / 60:.1f} 分钟（最高 {r['max_peak_to_limit']:.2f} × 上限）；")
+        else:
+            parts.append(f"{name}全程在上限内（最高 {r['max_peak_to_limit']:.2f} × 上限）；")
+    loss = score["cloud_loss_fraction"].dropna()
+    if len(loss):
+        parts.append(f"与同一方案在晴空下相比，云使吸热减少约 {100 * float(loss.mean()):.0f}%。")
+    safe = score[score["time_over_limit_s"] <= 0].sort_values("feasible_absorbed_mwh", ascending=False)
+    if len(safe):
+        best = safe.iloc[0]
+        parts.append(f"安全且吸热最多的是{STRAT_ZH.get(best['strategy'], best['strategy'])}"
+                     f"（{best['feasible_absorbed_mwh']:.3f} MWhₜₕ）")
+        if len(safe) > 1 and best["feasible_absorbed_mwh"] > 0:
+            second = safe.iloc[1]
+            diff = 1 - second["feasible_absorbed_mwh"] / best["feasible_absorbed_mwh"]
+            if diff < 0.005:
+                parts.append(f"，与{STRAT_ZH.get(second['strategy'], second['strategy'])}只差 {100 * diff:.2f}%")
+        parts.append("。")
+    else:
+        tone = "bad"
+        parts.append("没有一种策略全程在上限内。")
+    return tone, "".join(parts).replace("；。", "。")
+
+
+def _replay_scorecard(story) -> None:
+    score = story["score"]
+    cards = []
+    for _, r in score.iterrows():
+        over = r["time_over_limit_s"] > 0
+        rows = [("超限时长", f"{r['time_over_limit_s'] / 60:.1f} min" if over else "0", "bad" if over else "good"),
+                ("最高峰值", f"{r['max_peak_to_limit']:.2f} × 上限", "bad" if r["max_peak_to_limit"] > 1 else ""),
+                ("用到安全裕度", f"{r['time_in_margin_s'] / 60:.1f} min", "warn" if r["time_in_margin_s"] > 0 else ""),
+                ("吸收热量", f"{r['absorbed_mwh']:.3f} MWhₜₕ", ""),
+                ("可行时段的热量", f"{r['feasible_absorbed_mwh']:.3f} MWhₜₕ", ""),
+                ("云造成的损失", "—" if r["cloud_loss_fraction"] is None or r["cloud_loss_fraction"] != r["cloud_loss_fraction"]
+                 else f"{100 * r['cloud_loss_fraction']:.1f}%", ""),
+                ("镜子换瞄准点", f"{int(r['heliostat_moves']):,} 次", ""),
+                ("散焦指令", f"{int(r['defocus_commands']):,} 次", "warn" if r["defocus_commands"] else "")]
+        body = "".join(f'<div class="r"><span>{escape(k)}</span><b class="{c}">{escape(v)}</b></div>' for k, v, c in rows)
+        tone = "bad" if over else "good"
+        cards.append(f'<div class="cs-score {tone}"><div class="h">{escape(STRAT_ZH.get(r["strategy"], r["strategy"]))}'
+                     f'<span>{"超限" if over else "全程安全"}</span></div>{body}</div>')
+    st.markdown(f'<div class="cs-scores">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def _replay_overview(case, rr, fld, story, run_key: str, labels: list[str], slider_key: str) -> None:
+    """The story of the replay, top to bottom: verdict and scorecard, the player, the timeline with its events,
+    the moment the clouds clear, the panels over time."""
+    from cspaps.gui_plots import panel_strip, replay_player, replay_story_timeline
+
+    times = [f["time"] for f in rr.frames]
+    tone, text = _replay_verdict(case, rr, story)
+    _section(None, "这次过云发生了什么")
+    _callout(tone, "结论", text)
+    _replay_scorecard(story)
+    sub = rr.extra.get("substep_s") or 0.0
+    st.caption(f"每 {case.realtime.step_s:g} s 一个控制时刻（引擎算新方案，下一个控制时刻生效）"
+               + (f"；两次控制之间每 {sub:g} s 按真实 DNI 重算热流并在细网格上复核一次" if sub else "")
+               + "。“云造成的损失”和虚线的“晴空参考”：同一方案在没有这片云影时的吸收热量（DNI 取算例的站址气象或晴空模型）。")
+
+    cur = labels.index(st.session_state.get(slider_key, labels[0])) if st.session_state.get(slider_key) in labels else 0
+    _section(None, "播放：云怎么走，三种策略怎么应对",
+             "左边是镜场 DNI 和云影（实线是此刻的云影，箭头是移动方向，虚线是预报时长之后的位置），右边是同一时刻三种策略的吸热器"
+             "热流（同一色标）。点“播放”在浏览器里连续播放；标题里 ● 表示控制时刻、新方案生效。")
+    _chart(replay_player(case, fld.xyz, rr.frames, rr.table, horizon_s=case.realtime.forecast_horizon_s, start=cur),
+           f"rp_player_{run_key}")
+
+    _section(None, "时间轴与事件", "灰色阴影是云影经过镜场的时段，橙色带是安全裕度。点曲线上的一个点或下表中的一个事件，下方“逐时刻细节”就跳到那一刻。")
+    ev = _chart(replay_story_timeline(rr.table, story["episodes"], story["events"], case.aps.safety_margin,
+                                      selected_time=times[cur]), f"rp_timeline_{run_key}",
+                on_select="rerun", selection_mode=("points",))
+    try:
+        pts = ev["selection"]["points"] if ev else []
+    except (KeyError, TypeError):
+        pts = []
+    if pts and pts[0].get("x") is not None:
+        sig = repr((pts[0].get("curve_number"), pts[0].get("point_index")))
+        if st.session_state.get(f"_rp_tl_sig_{run_key}") != sig:
+            st.session_state[f"_rp_tl_sig_{run_key}"] = sig
+            when = pd.Timestamp(pts[0]["x"])
+            when = when.tz_localize(times[0].tz) if when.tzinfo is None and times[0].tzinfo is not None else when
+            j = int(np.argmin([abs((t - when).total_seconds()) for t in times]))
+            st.session_state[slider_key] = labels[j]
+            st.rerun()
+    evs = story["events"]
+    if len(evs):
+        groups = st.multiselect("显示的事件", list(EVENT_GROUPS), default=["云与日照", "安全"], key=f"rp_ev_groups_{run_key}")
+        kinds = {k for g in groups for k in EVENT_GROUPS[g]}
+        shown = evs[evs["kind"].isin(kinds)].reset_index(drop=True)
+        view = pd.DataFrame({"时间": [f"{pd.Timestamp(t):%H:%M:%S}" for t in shown["time"]],
+                             "对象": [STRAT_ZH.get(s, s) if isinstance(s, str) else "全场" for s in shown["strategy"]],
+                             "事件": shown["kind"].map(EVENT_ZH), "说明": [_event_text(e) for _, e in shown.iterrows()]})
+        sel = st.dataframe(view, hide_index=True, height=min(38 + 35 * len(view), 320), on_select="rerun",
+                           selection_mode="single-row", key=f"rp_events_{run_key}_{'-'.join(sorted(groups))}")
+        rows = getattr(getattr(sel, "selection", None), "rows", None) or []
+        if rows:
+            sig = f"{groups}:{rows[0]}"
+            if st.session_state.get(f"_rp_ev_sig_{run_key}") != sig:
+                st.session_state[f"_rp_ev_sig_{run_key}"] = sig
+                t = f"{pd.Timestamp(shown['time'].iloc[rows[0]]):%H:%M:%S}"
+                if t in labels:
+                    st.session_state[slider_key] = t
+                    st.rerun()
+
+    spot = story["spot"]
+    if spot:
+        _replay_spotlight(case, rr, fld, spot, labels, slider_key)
+    _section(None, "各管屏随时间", "每块管屏的最高热流与允许热流之比（评价网格），青色线圈出达到上限的时段；整台吸热器的复核峰值见时间轴。")
+    _chart(panel_strip(times, story["panels"]), f"rp_panels_{run_key}")
+
+
+def _replay_spotlight(case, rr, fld, spot, labels, slider_key) -> None:
+    """The moment the clouds clear: the plan made under the shadow meets the full DNI."""
+    grid = build_grid(case.receiver)
+    t_at = pd.Timestamp(spot["time"])
+    t_end = pd.Timestamp(spot["window_end"])
+    over = [STRAT_ZH.get(s, s) for s, v in spot["strategies"].items() if v["over_limit"]]
+    _section(None, f"云散瞬间 · {t_at:%H:%M:%S}",
+             f"全场 DNI 在一个采样间隔内从晴空的 {100 * spot['dni_ratio_before']:.0f}% 升到 {100 * spot['dni_ratio_at']:.0f}%。"
+             f"到 {t_end:%H:%M:%S} 为止，镜子执行的还是云散之前定下的方案（新方案要到下一个控制时刻才生效），云散时的风险就在这段时间里。"
+             + (f"这一次 {'、'.join(over)} 在这段时间里超过了设备上限。" if over else "这一次各策略在这段时间里都在上限以内。")
+             + "每种策略左图是云散前一刻，右图是这段时间里峰值最高的一刻（同一色标）。")
+    strats = list(spot["strategies"])
+    zmax = max(float(np.max(rr.frames[x]["plans"][s]["flux"])) for s in strats
+               for x in (spot["before"], spot["strategies"][s]["worst"])) / 1e3
+    cols = st.columns(len(strats))
+    for col, s in zip(cols, strats):
+        info = spot["strategies"][s]
+        with col:
+            verdict = ("超限" if info["over_limit"] else "在上限内")
+            st.markdown(f"**{STRAT_ZH.get(s, s)}** · {verdict}")
+            st.caption(f"峰值 {info['before_peak_to_limit']:.2f} → {info['peak_to_limit']:.2f} × 上限"
+                       f"（{pd.Timestamp(info['time']):%H:%M:%S}，{info['peak_flux_kw_m2']:.0f} kW/m²）")
+            for idx, name in ((spot["before"], "云散前"), (info["worst"], "云散后、新方案生效前的最高峰值")):
+                plan = rr.frames[idx]["plans"][s]
+                _chart(receiver_map(case, grid, plan["flux"], f"{name} · {pd.Timestamp(rr.frames[idx]['time']):%H:%M:%S}",
+                                    zmax=zmax, hotspot=plan.get("check"), height=230), f"rp_spot_{s}_{idx}_{name}")
+            top = info.get("top_contributors") or []
+            if top:
+                ids = np.asarray(fld.ids)
+                names = [str(int(ids[c["heliostat"]])) if c["heliostat"] < len(ids) else str(c["heliostat"]) for c in top]
+                st.caption("热点的主要贡献镜：" + "、".join(f"{n}（{c['flux_kw_m2']:.0f} kW/m²）" for n, c in zip(names, top)))
+    pred = spot["strategies"].get("aps_predictive")
+    react = spot["strategies"].get("aps_reactive")
+    jump = lambda v: v["peak_to_limit"] - v["before_peak_to_limit"]  # noqa: E731
+    if pred and react and ((react["over_limit"] and not pred["over_limit"]) or jump(react) > jump(pred) + 0.05):
+        _callout("info", "为什么含预测的策略更稳",
+                 "“APS · 当前 DNI”只按此刻测到的 DNI 校核热流：云下 DNI 低，它会把更多镜子集中到吸热器上，云一散，这些光斑同时变亮。"
+                 "“APS · 含 DNI 预测”按方案生效时段内预报的最高 DNI 校核（云会移开的地方按晴空算），所以云散时峰值只从 "
+                 f"{pred['before_peak_to_limit']:.2f} 变到 {pred['peak_to_limit']:.2f} × 上限，而前者从 "
+                 f"{react['before_peak_to_limit']:.2f} 变到 {react['peak_to_limit']:.2f}。")
+    if st.button("在下方“逐时刻细节”里看这一刻", key=f"rp_spot_jump_{t_at:%H%M%S}"):
+        st.session_state[slider_key] = labels[spot["at"]] if spot["at"] < len(labels) else labels[-1]
+        st.rerun()
+
+
 def _ops_replay(case, historical: dict | None = None) -> None:
     if case is None:
         st.warning("请先在「全部参数」中修正当前算例。")
@@ -3761,13 +3998,15 @@ def _ops_replay(case, historical: dict | None = None) -> None:
             st.write(f"{last_case.realtime.start} · {last_case.site.timezone}")
         with _card("replay_settings"):
             _section(None, "回放设置")
-            _section_form("realtime", expanded=True, fields=["scenario", "duration_min", "step_s"], title="云影与时间")
+            _section_form("realtime", expanded=True, fields=["scenario", "start", "duration_min", "step_s", "substep_s"],
+                          title="云影与时间")
+            _weather_window(case, case.realtime.start)
             _job_button("rt", "运行回放", wf.task_realtime, progress=True)
             st.caption("使用当前算例即可运行，结果可按时刻查看。")
         case, _ = _case()
         _job_error("rt")
         advanced = [f.name for f in dataclasses.fields(_SECTIONS["realtime"])
-                    if f.name not in ("scenario", "duration_min", "step_s")]
+                    if f.name not in ("scenario", "start", "duration_min", "step_s", "substep_s")]
         _section_form("realtime", fields=advanced, title="回放时间、预测与云层参数")
         _section_form("engine", title="控制周期与回退策略")
         res = st.session_state.get("res_rt")
@@ -3778,12 +4017,20 @@ def _ops_replay(case, historical: dict | None = None) -> None:
     rr, fld = res["result"], res["field"]
     times = [f["time"] for f in rr.frames]
     strategies = list(rr.frames[0]["plans"]) if rr.frames else []
-    c1, c2 = st.columns([2, 3])
     run_key = hashlib.sha1(str(res["run_dir"]).encode()).hexdigest()[:10]
+    labels = [f"{t:%H:%M:%S}" for t in times]
+    slider_key = f"ops_t_{run_key}"
+    if st.session_state.get(slider_key) not in labels:
+        st.session_state[slider_key] = labels[0]
+    if rr.frames and "cloud_cover" in rr.table:
+        _replay_overview(case, rr, fld, _replay_story(rr, case, run_key), run_key, labels, slider_key)
+    else:
+        st.info("这是旧版回放记录，没有云影统计。重新运行一次回放，就能看到结论、播放、事件和云散瞬间。")
+    _section(None, "逐时刻细节", "选一个时刻和一个策略，看镜场 DNI、吸热器热流、各项指标；点镜子或吸热器上的点看明细。")
+    c1, c2 = st.columns([2, 3])
     strat = c1.radio("显示策略", strategies, format_func=lambda s: STRAT_ZH.get(s, s), horizontal=True,
                      key=f"ops_strat_{run_key}")
-    labels = [f"{t:%H:%M:%S}" for t in times]
-    k = labels.index(c2.select_slider("回放时间", options=labels, value=labels[0], key=f"ops_t_{run_key}"))
+    k = labels.index(c2.select_slider("回放时间", options=labels, key=slider_key))
     frame, row = rr.frames[k], rr.table[(rr.table["time"] == times[k]) & (rr.table["strategy"] == strat)].iloc[0]
     plan = frame["plans"][strat]
     chk = plan["check"] or {}
@@ -4076,6 +4323,13 @@ def _cloud_results(res: dict) -> None:
              f"（CV {_format_number(a['cv_2d'], 3)} → {_format_number(b['cv_2d'], 3)}）。按云下 DNI 重新求解后，目标 J 提高 {gain:.3f} MW，"
              f"CV 回到 {_format_number(c['cv_2d'], 3)}。如果云在执行方案 C 时突然散去，峰值为设备上限的 {100 * d['peak_to_limit']:.0f}%；"
              f"按晴空 DNI 校核通量的方案 S 在云散后峰值为上限的 {100 * safe_clear['peak_to_limit']:.0f}%。")
+    from cspaps.gui_plots import cloud_story_strip
+
+    _section(None, "一图看懂：云来 → 怎么应对 → 云散",
+             "同一色标下的吸热器热流。从左到右：云来之前的方案 A；云来了还沿用 A；按云下 DNI 重新 APS 得到方案 C；云突然散去而"
+             "仍在执行 C（最危险）；防云散的方案 S 在云下和云散后。红框 = 超过设备上限。")
+    order = ["clear", "cloud_keep", "cloud_aps", "clear_keep", "cloud_safe", "clear_safe"]
+    _chart(cloud_story_strip(case, grid, [st_[k] for k in order if k in st_], zmax), "cc_story")
     tabs = st.tabs(["① 云来之前", "② 云来了 · DNI 变化", "③ 不改变策略", "④ 重新 APS", "⑤ 云散风险与防云散方案", "全部数值与下载"])
     with tabs[0]:
         _state_numbers(a)

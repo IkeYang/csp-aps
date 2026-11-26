@@ -1536,3 +1536,256 @@ def mirror_factor_chart(d: dict, height: int = 300):
     fig.update_xaxes(range=[lo, 1.0], title="效率（1 = 无损失）")
     fig.update_yaxes(autorange="reversed")
     return _base_layout(fig, "", height)
+
+
+# --------------------------------------------------------------------------- cloud replay: the story
+
+STRAT_COLORS = {"center": "#8a9a97", "aps_reactive": "#e07b39", "aps_predictive": "#16a08a"}
+STRAT_NAMES = {"center": "中心瞄准基准", "aps_reactive": "APS · 当前 DNI", "aps_predictive": "APS · 含 DNI 预测"}
+SHADOW_FILL = "rgba(30,44,58,0.30)"
+
+
+def _circle(x, y, r, n: int = 120):
+    th = np.linspace(0.0, 2.0 * np.pi, n)
+    return x + r * np.sin(th), y + r * np.cos(th)
+
+
+ARROW_S = 30.0  # the movement arrow shows this many seconds of travel
+
+
+def _cloud_traces(clouds: list[dict], horizon_s: float, center_xy):
+    """(shadow outlines, movement arrows of ``ARROW_S`` of travel, outlines after ``horizon_s``) as NaN-separated
+    x / y lists."""
+    sx, sy, ax, ay, px, py = [], [], [], [], [], []
+    fx, fy = center_xy
+    for c in clouds:
+        x, y = _circle(c["x"], c["y"], c["radius"])
+        sx += list(x) + [None]
+        sy += list(y) + [None]
+        v = np.array([c["vx"], c["vy"]])
+        if np.hypot(*v) > 1e-9:
+            d = np.array([fx - c["x"], fy - c["y"]])
+            nd = np.hypot(*d)
+            edge = np.array([c["x"], c["y"]]) + (c["radius"] * d / nd if nd > c["radius"] else 0.0)
+            tip = edge + v * ARROW_S
+            ax += [edge[0], tip[0], None]
+            ay += [edge[1], tip[1], None]
+            ends = c.get("ends_in_s")
+            if ends is None or ends > horizon_s:
+                x, y = _circle(c["x"] + c["vx"] * horizon_s, c["y"] + c["vy"] * horizon_s, c["radius"])
+                px += list(x) + [None]
+                py += list(y) + [None]
+    return (sx or [None]), (sy or [None]), (ax or [None]), (ay or [None]), (px or [None]), (py or [None])
+
+
+def replay_player(case: Case, xyz: np.ndarray, frames: list[dict], table, max_points: int = 2500,
+                  horizon_s: float = 120.0, height: int = 660, start: int = 0):
+    """The replay as an animation that runs in the browser: the field's DNI with the cloud shadows (filled),
+    where they move (arrow) and where they will be after ``horizon_s`` (dashed), next to every strategy's
+    receiver flux at the same moment (one colour scale) with its verified peak / limit in the title."""
+    from plotly.subplots import make_subplots
+
+    from .receiver import build_grid
+
+    strategies = list(frames[0]["plans"])
+    n_s = len(strategies)
+    rec = case.receiver
+    grid = build_grid(rec)
+    xyz = np.asarray(xyz, float)
+    sub = np.arange(len(xyz)) if len(xyz) <= max_points else np.unique(np.linspace(0, len(xyz) - 1, max_points).astype(int))
+    zmax = max(float(np.max(f["plans"][s]["flux"])) for f in frames for s in strategies) / 1e3 or 1.0
+    dmax = max(float(np.max(f.get("dni_clear", np.max(f["dni"])))) for f in frames) or 1.0
+    ratio = {(str(r.time), r.strategy): r.peak_to_limit for r in table.itertuples()}
+
+    def titles(f):
+        return [f"镜场 DNI 与云影（{len(sub):,} / {len(xyz):,} 面）"] + [
+            f"{STRAT_NAMES.get(s, s)} · 峰值 {ratio.get((str(f['time']), s), float('nan')):.2f} × 上限" for s in strategies]
+
+    specs = [[{"rowspan": n_s}, {}]] + [[None, {}] for _ in range(n_s - 1)]
+    fig = make_subplots(rows=n_s, cols=2, specs=specs, column_widths=[0.52, 0.48], horizontal_spacing=0.14,
+                        vertical_spacing=0.09, subplot_titles=titles(frames[start]))
+    title_idx = list(range(len(fig.layout.annotations)))
+
+    def field_traces(f):
+        sx, sy, ax_, ay, px, py = _cloud_traces(f.get("clouds", []), horizon_s, rec.center[:2])
+        return [go.Scatter(x=xyz[sub, 0], y=xyz[sub, 1], mode="markers", hoverinfo="skip", showlegend=False,
+                           marker=dict(size=4 if len(sub) > 1200 else 6, color=np.round(np.asarray(f["dni"])[sub]),
+                                       colorscale=DNI_SCALE, cmin=0, cmax=dmax,
+                                       colorbar=dict(title="DNI<br>W/m²", x=0.455, len=0.5, y=0.5, thickness=9))),
+                go.Scatter(x=sx, y=sy, mode="lines", fill="toself", fillcolor=SHADOW_FILL,
+                           line=dict(color="#2b3a46", width=1.5), name="云影", hoverinfo="skip"),
+                go.Scatter(x=ax_, y=ay, mode="lines+markers", line=dict(color="#16232b", width=2.5),
+                           marker=dict(size=([0, 13, 0] * (len(ax_) // 3)) or [0], symbol="arrow",
+                                       angleref="previous", color="#16232b"),
+                           name=f"移动方向（{ARROW_S:.0f} s 行程）", hoverinfo="skip"),
+                go.Scatter(x=px, y=py, mode="lines", line=dict(color="#2b3a46", width=1.5, dash="dash"),
+                           name=f"{horizon_s:.0f} s 后的位置", hoverinfo="skip")]
+
+    def flux_traces(f):
+        return [go.Heatmap(x=grid.azimuth_deg, y=grid.z, z=np.round(np.asarray(f["plans"][s]["flux"]) / 1e3, 1),
+                           coloraxis="coloraxis", hovertemplate="方位 %{x:.0f}°，高 %{y:.1f} m<br>%{z:.0f} kW/m²<extra></extra>")
+                for s in strategies]
+
+    f0 = frames[start]
+    for tr in field_traces(f0):
+        fig.add_trace(tr, row=1, col=1)
+    fig.add_trace(go.Scatter(x=[rec.center[0]], y=[rec.center[1]], mode="markers", name="塔",
+                             marker=dict(symbol="triangle-up", size=12, color=RED), hoverinfo="skip"), row=1, col=1)
+    for i, tr in enumerate(flux_traces(f0)):
+        fig.add_trace(tr, row=i + 1, col=2)
+    moving = [0, 1, 2, 3] + [5 + i for i in range(n_s)]
+
+    def label(f):
+        cover = float(np.mean(np.asarray(f["dni"]) < 0.9 * f.get("dni_clear", np.max(f["dni"]))))
+        return (f"{f['time']:%H:%M:%S}" + ("  ● 控制时刻（新方案生效）" if f.get("control", True) else "  · 方案保持")
+                + f"  · 云影下 {cover:.0%} 的镜子")
+
+    def annotations(f):
+        ann = [a.to_plotly_json() for a in fig.layout.annotations]
+        for j, text in zip(title_idx, titles(f)):
+            ann[j]["text"] = text
+        return ann
+
+    fig.frames = [go.Frame(name=str(j), traces=moving, data=field_traces(f) + flux_traces(f),
+                           layout=dict(title_text=label(f), annotations=annotations(f))) for j, f in enumerate(frames)]
+    steps = [dict(method="animate", label=(f"{f['time']:%H:%M:%S}" if j % max(1, len(frames) // 6) == 0 else ""),
+                  args=[[str(j)], dict(mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0))])
+             for j, f in enumerate(frames)]
+
+    def play(ms):
+        return dict(method="animate", args=[None, dict(frame=dict(duration=ms, redraw=True), transition=dict(duration=0),
+                                                       fromcurrent=True, mode="immediate")])
+
+    fig.update_layout(
+        coloraxis=dict(colorscale=FLUX_SCALE, cmin=0, cmax=zmax, colorbar=dict(title="kW/m²", x=1.0, len=0.8, thickness=10)),
+        updatemenus=[dict(type="buttons", direction="left", x=0.0, y=-0.13, xanchor="left", yanchor="top", showactive=False,
+                          buttons=[dict(label="▶ 播放", **play(450)), dict(label="2×", **play(220)),
+                                   dict(label="4×", **play(110)),
+                                   dict(label="⏸ 暂停", method="animate",
+                                        args=[[None], dict(mode="immediate", frame=dict(duration=0, redraw=False))])])],
+        sliders=[dict(active=start, steps=steps, x=0.24, len=0.76, y=-0.11, currentvalue=dict(visible=False),
+                      pad=dict(t=0), ticklen=3, font=dict(size=10))])
+    span = float(np.ptp(xyz[:, :2], axis=0).max()) if len(xyz) else 400.0
+    cx, cy = float(np.mean(xyz[:, 0])), float(np.mean(xyz[:, 1]))
+    fig.update_xaxes(range=[cx - 0.62 * span, cx + 0.62 * span], title="东 x (m)", row=1, col=1)
+    fig.update_yaxes(range=[cy - 0.62 * span, cy + 0.62 * span], title="北 y (m)", scaleanchor="x", scaleratio=1,
+                     row=1, col=1)
+    for i in range(n_s):
+        fig.update_xaxes(range=[0, 360], tickvals=[0, 90, 180, 270, 360], ticktext=["北", "东", "南", "西", "北"],
+                         row=i + 1, col=2)
+        fig.update_yaxes(title="z (m)" if i == n_s // 2 else "", row=i + 1, col=2)
+    _base_layout(fig, label(f0), height)
+    fig.update_layout(margin=dict(l=60, r=20, t=90, b=110),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.05, x=0.0, font=dict(size=11)))
+    return fig
+
+
+def replay_story_timeline(table, episodes: list[dict], events, margin: float, selected_time=None, height: int = 560):
+    """Three rows on one time axis: clouds (share of mirrors in a shadow, field DNI / clear sky), absorbed power of
+    every strategy against the clear-sky power of the same plans, and the verified peak / limit with the safety
+    margin. Cloud episodes are shaded across all rows; events are marked."""
+    from plotly.subplots import make_subplots
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.26, 0.37, 0.37],
+                        subplot_titles=["云与日照", "吸收功率（实线）与同一方案的晴空功率（虚线）", "细网格复核峰值 / 设备上限"])
+    first = table["strategy"].iloc[0]
+    g = table[table["strategy"] == first]
+    fig.add_trace(go.Scatter(x=g["time"], y=100 * g["cloud_cover"], mode="lines", line_shape="hv", fill="tozeroy",
+                             line=dict(color="#4a6070"), fillcolor="rgba(74,96,112,0.25)", name="云影下的镜子 (%)",
+                             hovertemplate="%{x|%H:%M:%S}<br>云影下 %{y:.0f}% 的镜子<extra></extra>"), row=1, col=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = 100 * g["dni_mean_w_m2"] / g["dni_clear_w_m2"]
+    fig.add_trace(go.Scatter(x=g["time"], y=ratio, mode="lines", line=dict(color=AMBER, width=2), name="全场平均 DNI / 晴空 (%)",
+                             hovertemplate="%{x|%H:%M:%S}<br>DNI 为晴空的 %{y:.0f}%<extra></extra>"), row=1, col=1)
+    for strat, s in table.groupby("strategy", sort=False):
+        color = STRAT_COLORS.get(strat, NAVY)
+        name = STRAT_NAMES.get(strat, strat)
+        fig.add_trace(go.Scatter(x=s["time"], y=s["p_absorbed_mw"], mode="lines", line_shape="hv", name=name,
+                                 legendgroup=strat, line=dict(color=color, width=2.2),
+                                 hovertemplate=name + "<br>%{x|%H:%M:%S}：%{y:.2f} MW<extra></extra>"), row=2, col=1)
+        if "p_absorbed_clear_mw" in s:
+            fig.add_trace(go.Scatter(x=s["time"], y=s["p_absorbed_clear_mw"], mode="lines", line_shape="hv",
+                                     legendgroup=strat, showlegend=False, line=dict(color=color, width=1, dash="dot"),
+                                     hovertemplate=name + " · 晴空参考<br>%{x|%H:%M:%S}：%{y:.2f} MW<extra></extra>"),
+                          row=2, col=1)
+        fig.add_trace(go.Scatter(x=s["time"], y=s["peak_to_limit"], mode="lines+markers", line_shape="hv",
+                                 legendgroup=strat, showlegend=False, line=dict(color=color, width=2.2),
+                                 marker=dict(size=4), customdata=np.arange(len(s)),
+                                 hovertemplate=name + "<br>%{x|%H:%M:%S}：峰值 %{y:.2f} × 上限<extra></extra>"), row=3, col=1)
+    fig.add_hrect(y0=1.0 - margin, y1=1.0, fillcolor="rgba(224,155,45,0.14)", line_width=0, row=3, col=1)
+    fig.add_hline(y=1.0, line=dict(color=RED, dash="dash"), row=3, col=1)
+    fig.add_annotation(x=0.0, xref="x3 domain", y=1.0, yref="y3", text="设备上限", showarrow=False, yshift=9,
+                       xanchor="left", font=dict(size=10, color=RED))
+    for e in episodes:
+        for r in (1, 2, 3):
+            fig.add_vrect(x0=e["start"], x1=e["end"], fillcolor="rgba(74,96,112,0.08)", line_width=0, row=r, col=1)
+    marks = {"dni_drop": ("云来 · 日照骤降", "#4a6070"), "dni_rise": ("云散 · 日照骤升", AMBER)}
+    if events is not None and len(events):
+        for _, e in events[events["kind"].isin(list(marks))].iterrows():
+            text, color = marks[e["kind"]]
+            fig.add_vline(x=e["time"], line=dict(color=color, width=1.5, dash="dot"))
+            fig.add_annotation(x=e["time"], xref="x", y=0.97, yref="y domain", text=text, showarrow=False,
+                               yanchor="top", xanchor="left", xshift=3, font=dict(size=11, color=color),
+                               bgcolor="rgba(255,255,255,0.75)")
+        bad = events[events["kind"].isin(["over_limit", "fallback"])]
+        if len(bad):
+            fig.add_trace(go.Scatter(x=bad["time"], y=[float(v) if v == v and v is not None else 1.0 for v in bad["value"]],
+                                     mode="markers", name="超限 / 回退", marker=dict(symbol="x", size=11, color=RED),
+                                     hovertemplate="%{x|%H:%M:%S}<extra></extra>"), row=3, col=1)
+    if selected_time is not None:
+        fig.add_vline(x=selected_time, line=dict(color="magenta", width=1.2))
+    fig.update_yaxes(title="%", range=[0, 105], row=1, col=1)
+    fig.update_yaxes(title="MW", row=2, col=1)
+    fig.update_yaxes(title="× 上限", rangemode="tozero", row=3, col=1)
+    fig = _base_layout(fig, "", height)
+    fig.update_layout(legend=dict(orientation="h", y=-0.08), hovermode="x unified")
+    return fig
+
+
+def panel_strip(times, matrices: dict, height_per: int = 150):
+    """Per strategy a (time x panel) heat strip of the highest flux / allowed flux of every panel (coarse map),
+    with the contour where it reaches the limit."""
+    from plotly.subplots import make_subplots
+
+    names = list(matrices)
+    zmax = max(1.05, max(float(np.max(m)) for m in matrices.values()))
+    fig = make_subplots(rows=len(names), cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=[STRAT_NAMES.get(s, s) for s in names])
+    for i, s in enumerate(names):
+        m = np.asarray(matrices[s])
+        panels = np.arange(1, m.shape[1] + 1)
+        fig.add_trace(go.Heatmap(x=times, y=panels, z=m.T, coloraxis="coloraxis",
+                                 hovertemplate="%{x|%H:%M:%S} · 第 %{y} 管屏<br>峰值 %{z:.2f} × 上限<extra></extra>"),
+                      row=i + 1, col=1)
+        if m.max() >= 1.0:
+            fig.add_trace(go.Contour(x=times, y=panels, z=m.T, showscale=False, hoverinfo="skip",
+                                     contours=dict(start=1.0, end=1.0, size=1, coloring="none"),
+                                     line=dict(color="cyan", width=2)), row=i + 1, col=1)
+        fig.update_yaxes(title="管屏", row=i + 1, col=1)
+    fig.update_layout(coloraxis=dict(colorscale=FLUX_SCALE, cmin=0, cmax=zmax,
+                                     colorbar=dict(title="峰值 / 上限", thickness=10)))
+    return _base_layout(fig, "", 60 + height_per * len(names))
+
+
+def cloud_story_strip(case: Case, grid: ReceiverGrid, states: list[dict], zmax: float | None = None, height: int = 300):
+    """The single-instant cloud comparison in one row: the receiver flux of every state on one colour scale,
+    titled with its absorbed power and verified peak / limit."""
+    from plotly.subplots import make_subplots
+
+    zmax = zmax or max(float(np.max(s["flux"])) for s in states) / 1e3
+    titles = [f"{s['short']}<br><sub>{s['p_abs_mw']:.2f} MW · 峰值 {s['peak_to_limit']:.2f} × 上限</sub>" for s in states]
+    fig = make_subplots(rows=1, cols=len(states), horizontal_spacing=0.025, subplot_titles=titles)
+    for i, s in enumerate(states):
+        fig.add_trace(go.Heatmap(x=grid.azimuth_deg, y=grid.z, z=np.asarray(s["flux"]) / 1e3, coloraxis="coloraxis",
+                                 hovertemplate="方位 %{x:.0f}°，高 %{y:.1f} m<br>%{z:.0f} kW/m²<extra></extra>"),
+                      row=1, col=i + 1)
+        fig.update_xaxes(range=[0, 360], tickvals=[0, 180, 360], ticktext=["北", "南", "北"], row=1, col=i + 1)
+        fig.update_yaxes(showticklabels=i == 0, row=1, col=i + 1)
+        if s["peak_to_limit"] > 1.0:
+            fig.add_shape(type="rect", xref=f"x{i + 1 if i else ''} domain", yref=f"y{i + 1 if i else ''} domain",
+                          x0=0, x1=1, y0=0, y1=1, line=dict(color=RED, width=3))
+    fig.update_layout(coloraxis=dict(colorscale=FLUX_SCALE, cmin=0, cmax=zmax, colorbar=dict(title="kW/m²", thickness=10)))
+    fig = _base_layout(fig, "", height)
+    fig.update_annotations(font_size=11)
+    fig.update_layout(margin=dict(t=70))
+    return fig

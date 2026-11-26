@@ -221,7 +221,10 @@ class EngineSpec:
 class Realtime:
     start: str = "2025-06-21 12:00"
     duration_min: float = 20.0
-    step_s: float = 60.0
+    step_s: float = 60.0  # control period: the engine decides a new plan at every step
+    # sub-samples between control instants: the plan is held while the clouds move, every sample is evaluated
+    # and verified (0 = control instants only)
+    substep_s: float = 15.0
     forecast_horizon_s: float = 120.0  # predictive strategy: forecast window after the command takes effect
     forecast_step_s: float = 15.0  # spacing of the forecast snapshots
     clouds: list[dict[str, Any]] | None = None  # explicit cloud list
@@ -617,6 +620,8 @@ def _validate(case: Case) -> None:
         raise ValueError(f"aps.initial_aim '{case.aps.initial_aim}' not in spread|kfactor|center|none")
     if case.aps.move_penalty_per_m < 0 or case.aps.max_aim_shift_m < 0 or case.aps.max_rotation_deg < 0:
         raise ValueError("aps.move_penalty_per_m, aps.max_aim_shift_m and aps.max_rotation_deg must be >= 0")
+    if case.realtime.substep_s < 0:
+        raise ValueError("realtime.substep_s must be >= 0 (0 = control instants only)")
     if case.aps.subfield_sectors < 1:
         raise ValueError("aps.subfield_sectors must be >= 1")
     if case.annual.representative_dni not in ("time_mean", "energy_weighted"):

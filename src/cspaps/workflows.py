@@ -595,15 +595,30 @@ def task_realtime(case: Case, base: str | Path, progress: Progress | None = None
     t0 = _time.perf_counter()
     out = out_dir(base, case, "realtime")
     fld = build_field(case)
-    res = run_realtime(case, fld, progress=(lambda i, n: progress(f"replay step {i}/{n}")) if progress else None)
+    res = run_realtime(case, fld, progress=(lambda i, n, what="replay samples": progress(f"{what}: {i}/{n}"))
+                       if progress else None)
     files = {
         "summary_json": out / "realtime.json",
         "table_csv": out / "realtime_timeseries.csv",
         "timeseries_png": out / "realtime.png",
         "frames_npz": out / "realtime_frames.npz",
     }
+    from .replay_story import clearing_spotlight, cloud_episodes, events, scorecard
+
+    story_events = events(res, case)
+    spot = clearing_spotlight(res, case)
     summary = {"scenario": case.realtime.scenario, "strategies": res.summary(),
-               "engine": res.extra.get("engine_stats")}
+               "engine": res.extra.get("engine_stats"),
+               "sampling": {"control_period_s": case.realtime.step_s, "substep_s": case.realtime.substep_s,
+                            "n_samples": len(res.frames),
+                            "basis": "every sample (control instants and sub-samples) verified on the fine grid; "
+                                     "the plan decided at a control instant is held until the next one"},
+               "scorecard": scorecard(res, case).to_dict("records"),
+               "cloud_episodes": cloud_episodes(res.table),
+               "events": story_events.to_dict("records"),
+               "clearing": None if spot is None else {k: v for k, v in spot.items()}}
+    files["events_csv"] = out / "realtime_events.csv"
+    story_events.to_csv(files["events_csv"], index=False)
     _json(files["summary_json"], summary)
     res.table.to_csv(files["table_csv"], index=False)
     plot_realtime(res.table, files["timeseries_png"])
@@ -626,7 +641,11 @@ def task_realtime(case: Case, base: str | Path, progress: Progress | None = None
 def save_frames(path: Path, res, fld: Field) -> None:
     """Per-sample DNI, aims and flux maps of a replay (for the GUI timeline)."""
     arrays = {"ids": fld.ids, "xyz": fld.xyz, "times": np.array([str(f["time"]) for f in res.frames]),
-              "dni": np.array([f["dni"] for f in res.frames])}
+              "dni": np.array([f["dni"] for f in res.frames]),
+              "control": np.array([bool(f.get("control", True)) for f in res.frames]),
+              "control_index": np.array([int(f.get("control_index", j)) for j, f in enumerate(res.frames)]),
+              "dni_clear": np.array([float(f.get("dni_clear", np.nan)) for f in res.frames]),
+              "clouds_json": np.array([json.dumps(f.get("clouds", []), default=float) for f in res.frames])}
     for strat in res.frames[0]["plans"] if res.frames else []:
         arrays[f"{strat}__aim_azimuth"] = np.array([f["plans"][strat]["aim_azimuth"] for f in res.frames])
         arrays[f"{strat}__aim_z"] = np.array([f["plans"][strat]["aim_z"] for f in res.frames])
@@ -643,7 +662,7 @@ def save_frames(path: Path, res, fld: Field) -> None:
 def load_realtime_run(folder: str | Path) -> dict:
     """Restore the complete timeline and per-mirror plans from a saved real-time run."""
     from .clouds import cloud_field
-    from .realtime import RealtimeResult
+    from .realtime import RealtimeResult, cloud_shapes
 
     folder = Path(folder).resolve()
     case = load_case(folder / "inputs_case.yaml")
@@ -660,9 +679,16 @@ def load_realtime_run(folder: str | Path) -> dict:
         strategies = [key[:-len("__aim_azimuth")] for key in archive.files if key.endswith("__aim_azimuth")]
         grid = build_grid(case.receiver)
         frames = []
+        clouds = cloud_field(case, fld, pd.Timestamp(times[0]))
+        has = set(archive.files)
+        control = archive["control"] if "control" in has else np.ones(len(times), bool)
+        control_index = archive["control_index"] if "control_index" in has else np.arange(len(times))
         for i, timestamp in enumerate(times):
-            _, elevation, azimuth, _ = sun_state(case, timestamp)
-            frame = {"time": timestamp, "dni": dni[i], "sun_angles": (elevation, azimuth), "plans": {}}
+            _, elevation, azimuth, dni_clear = sun_state(case, timestamp)
+            frame = {"time": timestamp, "dni": dni[i], "sun_angles": (elevation, azimuth), "plans": {},
+                     "control": bool(control[i]), "control_index": int(control_index[i]), "dni_clear": float(dni_clear),
+                     "clouds": (json.loads(str(archive["clouds_json"][i])) if "clouds_json" in has
+                                else cloud_shapes(clouds, timestamp))}
             for strategy in strategies:
                 aim_azimuth = archive[f"{strategy}__aim_azimuth"][i]
                 aim_z = archive[f"{strategy}__aim_z"][i]
@@ -689,12 +715,12 @@ def load_realtime_run(folder: str | Path) -> dict:
                     "state": str(row["plan_state"]), "uniformity_status": str(row["uniformity_status"]),
                     "operational_feasible": bool(row["operational_feasible"])}
             frames.append(frame)
-    start = pd.Timestamp(times[0])
     # sample-and-hold time base of one strategy (the table has one row per strategy and instant)
     duration_s = float(table.drop_duplicates("time")["interval_s"].sum())
-    clouds = cloud_field(case, fld, start)
+    if "control" in table:  # booleans may come back from the CSV as text
+        table["control"] = table["control"].astype(str).str.lower().isin(("true", "1"))
     result = RealtimeResult(table, {}, clouds, case.realtime.step_s, duration_s, frames,
-                            {"engine_stats": summary.get("engine")})
+                            {"engine_stats": summary.get("engine"), "substep_s": float(case.realtime.substep_s or 0.0)})
     files = {path.stem: path for path in folder.iterdir() if path.is_file()}
     return {"summary": summary, "files": files, "result": result, "field": fld, "run_dir": folder}
 
