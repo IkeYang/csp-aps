@@ -2,14 +2,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from cspaps import load_case
+from cspaps import case_from_dict, load_case
 from cspaps.benchmark import inner_benchmark
-from cspaps.field import Field
-from cspaps.layout_opt import LayoutEval, formal_ranking
+from cspaps.field import Field, build_field
+from cspaps.layout_opt import (LayoutEval, design_spacing, formal_ranking, resolve_layout_opt_case,
+                               validate_layout)
 from cspaps.scenarios import build_scenarios, validation_scenarios
 from cspaps.simulate import sun_state
 from cspaps.workflows import replay_layout_value, task_layout_value
-from tests.conftest import ROOT
+from tests.conftest import ROOT, small_case_dict
 
 
 def test_imported_layouts_require_buildable_positions_and_exact_count(tmp_path):
@@ -21,6 +22,32 @@ def test_imported_layouts_require_buildable_positions_and_exact_count(tmp_path):
     assert set(result["summary"]["excluded_layouts"]) == {"outside", "crowded", "extra"}
     snapshot = load_case(result["run_dir"] / "inputs_case.yaml")
     assert build_scenarios(snapshot).fingerprint() == result["scenario_set"].fingerprint()
+
+
+def test_imported_field_defaults_to_same_count_and_ranks_initial_layout(tmp_path):
+    layout_path = tmp_path / "measured_layout.csv"
+    pd.DataFrame({"id": [101, 102], "x": [50.0, 58.0], "y": [0.0, 0.0], "z": [4.0, 4.0]}).to_csv(
+        layout_path, index=False)
+    data = small_case_dict()
+    data["field"]["layout_file"] = str(layout_path)
+    data["layout_opt"].update({"n_heliostats": None, "min_spacing_factor": None, "fixed": {},
+                               "formal_swap_rounds": 0, "formal_position_trials": 0,
+                               "ranking_refine_states": 0, "cross_check_maps": False})
+    case = case_from_dict(data, base_dir=tmp_path)
+
+    resolved = resolve_layout_opt_case(case)
+
+    assert case.layout_opt.n_heliostats is None  # resolving defaults does not mutate the caller
+    assert resolved.layout_opt.n_heliostats == 2
+    assert design_spacing(resolved) == pytest.approx(8.0)
+    original = build_field(resolved)
+    assert validate_layout(resolved, original.xyz, 2, design_spacing(resolved), original.ids)["status"] == "ok"
+
+    scenarios = build_scenarios(resolved)
+    candidate = np.array([[-60.0, 0.0, 4.0], [60.0, 0.0, 4.0]])
+    ranked = formal_ranking(resolved, [LayoutEval({}, 2, candidate, 0.0)],
+                            scenarios.samples, scenarios.samples)
+    assert set(ranked["values"]) == {"search_1", "initial"}
 
 
 def test_formal_dedup_keeps_xy_pairing():

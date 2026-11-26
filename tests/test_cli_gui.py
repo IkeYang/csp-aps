@@ -1,4 +1,5 @@
 import json
+import gzip
 import os
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import pytest
 import yaml
 
 from cspaps.cli import main
-from cspaps.workflows import list_runs
+from cspaps.workflows import list_runs, task_realtime
 
 from .conftest import ROOT, small_case_dict
 
@@ -26,6 +27,50 @@ def _run_dir(out: Path, task: str) -> Path:
     return d
 
 
+def test_plotly_chart_is_archived_for_run_history(tmp_path):
+    pytest.importorskip("streamlit")
+    import plotly.graph_objects as go
+    import plotly.io as pio
+
+    from cspaps import gui_app
+
+    run_dir = tmp_path / "saved-run"
+    run_dir.mkdir()
+    gui_app._capture_chart_run({"run_dir": run_dir})
+    gui_app._archive_chart(go.Figure(go.Scatter(x=[1, 2], y=[3, 4], name="power")), "power_history")
+
+    index = json.loads((run_dir / "visualizations" / "index.json").read_text(encoding="utf-8"))
+    assert len(index["charts"]) == 1 and index["charts"][0]["key"] == "power_history"
+    with gzip.open(run_dir / "visualizations" / index["charts"][0]["file"], "rt", encoding="utf-8") as stream:
+        restored = pio.from_json(stream.read())
+    assert list(restored.data[0].x) == [1, 2] and list(restored.data[0].y) == [3, 4]
+    gui_app._capture_chart_run(None)
+
+
+def test_history_page_restores_saved_realtime_visualizations(monkeypatch, tmp_path):
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+    from cspaps import case_from_dict
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CSPAPS_GUI_SYNC", "1")
+    case = case_from_dict(small_case_dict(), base_dir=ROOT)
+    run = task_realtime(case, tmp_path / "results" / "gui")
+    at = AppTest.from_file(str(Path(ROOT) / "src" / "cspaps" / "gui_app.py"), default_timeout=120)
+    at.session_state["case_dict"] = case.to_dict()
+    at.session_state["base_dir"] = str(ROOT)
+    at.session_state["ver"] = 1
+    at.run()
+    at.radio(key="page").set_value("运行记录").run()
+
+    assert not at.exception
+    assert at.selectbox(key="history_run_pick").value == 0
+    assert any("时序仿真回放" in item.value for item in at.markdown)
+    assert len(at.get("plotly_chart")) >= 3
+    index = run["run_dir"] / "visualizations" / "index.json"
+    assert index.is_file() and len(json.loads(index.read_text(encoding="utf-8"))["charts"]) >= 3
+
+
 def test_cli_layout_snapshot_aps(case_file, tmp_path):
     out = tmp_path / "out"
     assert main(["layout", str(case_file), "--out", str(out)]) == 0
@@ -41,6 +86,8 @@ def test_cli_layout_snapshot_aps(case_file, tmp_path):
                  "--dni-map", str(dni_map), "--out", str(out)]) == 0
     runs = list_runs(out)
     assert {"layout", "snapshot", "aps"} <= set(runs["task"])
+    snapshot_run = Path(runs.loc[runs["task"] == "snapshot", "path"].iloc[0])
+    assert list(snapshot_run.glob("*_snapshot.npz"))
 
 
 def test_cli_infeasible_exit_code(tmp_path):
@@ -201,6 +248,16 @@ def test_gui_cloud_compare_and_formal_value(monkeypatch, tmp_path):
     assert not at.exception
     f = at.session_state["res_opt"]["summary"]["formal"]
     assert {r["name"] for r in f["ranking"]} >= {"initial"} and f["winner"]
+    formal = at.session_state["res_opt"]["result"].formal
+    winner = formal["winner"]
+    all_values, all_ranking = formal["values"], formal["ranking"]
+    formal["values"] = {winner: formal["values"][winner]}
+    formal["ranking"] = formal["ranking"].loc[formal["ranking"]["name"] == winner].reset_index(drop=True)
+    at.run()
+    assert not at.exception
+    assert any("只有一套可排名布局" in item.value for item in at.info)
+    formal["values"], formal["ranking"] = all_values, all_ranking
+    at.run()
     at.slider(key="fv_opt_lam").set_value(1.0).run()
     assert not at.exception
     at.button(key="fv_opt_recompute").click().run()

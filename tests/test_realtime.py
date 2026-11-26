@@ -5,6 +5,7 @@ import pytest
 from cspaps.clouds import Cloud, CloudField, load_dni_map
 from cspaps.field import build_field
 from cspaps.realtime import run_realtime
+from cspaps.workflows import load_realtime_run, task_realtime
 
 
 def test_cloud_transmittance_and_motion():
@@ -45,3 +46,29 @@ def test_realtime_runs_and_reports(small_case):
     res.table["uniformity_feasible"] = res.table["time"] != res.table["time"].min()
     for report in res.summary().values():
         assert report["hours_uniformity_failed"] == pytest.approx(small_case.realtime.step_s / 3600)
+
+
+def test_saved_realtime_run_restores_full_frame_data(small_case, tmp_path):
+    run = task_realtime(small_case, tmp_path)
+    restored = load_realtime_run(run["run_dir"])
+    original, replayed = run["result"], restored["result"]
+
+    assert len(replayed.frames) == len(original.frames)
+    assert replayed.table["strategy"].tolist() == original.table["strategy"].tolist()
+    assert replayed.table["time"].astype(str).tolist() == original.table["time"].astype(str).tolist()
+    for column in ("p_intercepted_mw", "p_absorbed_mw", "peak_flux_kw_m2", "peak_to_limit", "interval_s"):
+        np.testing.assert_allclose(replayed.table[column], original.table[column], equal_nan=True)
+    for column in ("plan_state", "plan_reasons"):
+        saved = replayed.table[column].astype(object).where(replayed.table[column].notna(), "").astype(str)
+        source = original.table[column].astype(object).where(original.table[column].notna(), "").astype(str)
+        assert saved.tolist() == source.tolist()
+    for source, target in zip(original.frames, replayed.frames):
+        np.testing.assert_array_equal(target["dni"], source["dni"])
+        assert target["time"] == source["time"]
+        for strategy, plan in source["plans"].items():
+            restored_plan = target["plans"][strategy]
+            np.testing.assert_array_equal(restored_plan["aim_azimuth"], plan["aim_azimuth"])
+            np.testing.assert_array_equal(restored_plan["aim_z"], plan["aim_z"])
+            np.testing.assert_array_equal(restored_plan["active"], plan["active"])
+            np.testing.assert_array_equal(restored_plan["tower_fraction"], plan["tower_fraction"])
+            np.testing.assert_array_equal(restored_plan["flux"], plan["flux"])

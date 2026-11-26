@@ -45,7 +45,7 @@ from scipy.spatial import cKDTree
 
 from . import sun
 from .config import Case
-from .field import BOUNDARY_TOL_M, Field, generate, site_mask
+from .field import BOUNDARY_TOL_M, Field, build_field, generate, site_mask
 from .parallel import n_workers, pool
 from .receiver import build_grid
 from .simulate import AnnualResult, annual
@@ -392,6 +392,35 @@ def design_spacing(case: Case) -> float:
     return case.heliostat.diagonal * (spec.min_spacing_factor or spec.fixed.get("spacing_factor", 1.1))
 
 
+def resolve_layout_opt_case(case: Case) -> Case:
+    """Use an imported field's count and tightest existing pitch as unspecified search defaults."""
+    spec = case.layout_opt
+    infer_count = spec.n_heliostats is None
+    fixed = dict(spec.fixed or {})
+    infer_spacing = spec.min_spacing_factor is None and "spacing_factor" not in fixed
+    if not case.field.layout_file or not (infer_count or infer_spacing):
+        return case
+
+    fld = build_field(case)
+    target_count = fld.n if infer_count and fld.n else None
+    spacing_factor = None
+    if infer_spacing and fld.n > 1:
+        nearest = cKDTree(fld.xyz[:, :2]).query(fld.xyz[:, :2], k=2)[0][:, 1]
+        min_spacing = float(nearest.min())
+        if np.isfinite(min_spacing) and min_spacing > 0:
+            spacing_factor = min(1.1, min_spacing / case.heliostat.diagonal)
+    if target_count is None and spacing_factor is None:
+        return case
+
+    resolved = case.copy()
+    if target_count is not None:
+        resolved.layout_opt.n_heliostats = target_count
+    if spacing_factor is not None:
+        fixed["spacing_factor"] = spacing_factor
+        resolved.layout_opt.fixed = fixed
+    return resolved
+
+
 def validate_layout(case: Case, xyz: np.ndarray, n_required: int | None, spacing_m: float, ids=None) -> dict:
     """Final site checks of a layout; status ok / capacity_shortfall / constraint_violation."""
     xyz = np.asarray(xyz, dtype=float)
@@ -622,6 +651,7 @@ def optimize_layout(
     from scipy.optimize import differential_evolution
 
     t0 = _time.perf_counter()
+    case = resolve_layout_opt_case(case)
     spec = case.layout_opt
     kind = spec.generator
     bounds = dict(DEFAULT_BOUNDS.get(kind, {}))

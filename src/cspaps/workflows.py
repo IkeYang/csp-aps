@@ -29,7 +29,7 @@ from .config import Case, load_case
 from .coupled import search_joint_poses
 from .engine import APSEngine, request_from_dict, response_to_dict
 from .field import Field, build_field, generate, save_layout_csv
-from .layout_opt import design_spacing, optimize_layout, validate_layout
+from .layout_opt import design_spacing, optimize_layout, resolve_layout_opt_case, validate_layout
 from .mcrt import compare, convergence, trace_repeated
 from .plotting import (
     plot_annual_monthly, plot_flux_compare, plot_flux_map, plot_history, plot_layout,
@@ -316,6 +316,7 @@ def task_aim(
         "aims_csv": out / f"{tag}_{stamp}_aims.csv",
         "flux_png": out / f"{tag}_{stamp}_flux.png",
         "efficiency_png": out / f"{tag}_{stamp}_efficiency.png",
+        "snapshot_npz": out / f"{tag}_{stamp}_snapshot.npz",
     }
     extra = {f"eta_{k}": np.round(snap.eta[k], 6) for k in LOSSES}
     extra["dni_w_m2"] = np.round(snap.dni, 2)
@@ -330,6 +331,21 @@ def task_aim(
                       "initial_aim_azimuth_deg": np.round(prev[0], 6), "initial_aim_z": np.round(prev[1], 6),
                       "aim_shift_m": np.round(per["shift_m"], 4), "rotation_deg": np.round(per["rotation_deg"], 5)})
     write_aims_csv(files["aims_csv"], fld, case, aim, active, extra)
+    snapshot_arrays = {
+        "ids": fld.ids, "xyz": fld.xyz, "dni_w_m2": snap.dni,
+        "aim_azimuth_deg": np.asarray(aim[0]), "aim_z_m": np.asarray(aim[1]),
+        "active": np.asarray(active, dtype=np.uint8), "flux_w_m2": snap.flux,
+        "absorbed_flux_w_m2": snap.absorbed_flux, "azimuth_deg": snap.grid.azimuth_deg,
+        "height_m": snap.grid.z, "tower_fraction": snap.tower_fraction,
+        "sun_elevation_deg": np.asarray(el), "sun_azimuth_deg": np.asarray(az),
+    }
+    snapshot_arrays.update({f"efficiency_{name}": value for name, value in snap.eta.items()})
+    if snap0 is not None:
+        snapshot_arrays["initial_flux_w_m2"] = snap0.flux
+        snapshot_arrays["initial_aim_azimuth_deg"] = np.asarray(prev[0])
+        snapshot_arrays["initial_aim_z_m"] = np.asarray(prev[1])
+        snapshot_arrays["initial_active"] = np.asarray(prev_active, dtype=np.uint8)
+    np.savez_compressed(files["snapshot_npz"], **snapshot_arrays)
     check_summary = chk_con.summary()
     check_summary["top_contributors"] = [{"heliostat_id": int(fld.ids[c["heliostat"]]), "flux_kw_m2": c["flux_kw_m2"]}
                                          for c in check_summary["top_contributors"]]
@@ -376,7 +392,7 @@ def task_aim(
                 title=f"Heliostat optical efficiency, {ts:%Y-%m-%d %H:%M}")
     finish(out, tag, summary, {"time": str(time), "method": method, "dni": dni, "dni_map": dni_map,
                                "forecast_dni_map": forecast_dni_map, "prev_aims": prev_aims,
-                               "dni_source": dni_source, "certify": cert is not None}, t_start)
+                               "dni_source": dni_source, "certify": do_certify}, t_start)
     return {"summary": _clean(summary), "files": files, "snapshot": snap, "aim_result": res, "field": fld,
             "check": chk_con, "run_dir": out, "certificate": cert, "initial_snapshot": snap0}
 
@@ -475,7 +491,10 @@ def task_aps_refinement(case: Case, base: str | Path, time, levels=None, dni_map
                "note": "certificates hold for each discrete candidate set; nested refinement shows the convergence "
                        "towards continuous aim points"}
     _json(files["summary_json"], summary)
-    finish(out, "aps_refinement", summary, {"time": str(time), "levels": levels}, t0)
+    finish(out, "aps_refinement", summary, {"time": str(time), "levels": levels, "dni_map": dni_map,
+                                             "dni_source": dni_source, "dni": dni,
+                                             "forecast_dni_map": forecast_dni_map,
+                                             "azimuth_span": azimuth_span}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out}
 
 
@@ -568,7 +587,7 @@ def task_pareto(case: Case, base: str | Path, time, lambdas=None, dni_map: str |
                                                              "verified peaks: peak_flux_kw_m2 / hotspot_*"}
     _json(files["summary_json"], summary)
     finish(out, "pareto", summary, {"time": str(time), "lambdas": lambdas, "dni_map": dni_map,
-                                    "dni_source": dni_source, "prev_aims": prev_aims}, t0)
+                                    "dni_source": dni_source, "prev_aims": prev_aims, "certify": certify}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out, "flux": flux}
 
 
@@ -612,8 +631,66 @@ def save_frames(path: Path, res, fld: Field) -> None:
         arrays[f"{strat}__aim_azimuth"] = np.array([f["plans"][strat]["aim_azimuth"] for f in res.frames])
         arrays[f"{strat}__aim_z"] = np.array([f["plans"][strat]["aim_z"] for f in res.frames])
         arrays[f"{strat}__active"] = np.array([f["plans"][strat]["active"] for f in res.frames])
+        plans = [f["plans"][strat] for f in res.frames]
+        arrays[f"{strat}__tower_fraction"] = np.array([
+            plan["tower_fraction"] if plan["tower_fraction"] is not None else np.zeros(fld.n) for plan in plans])
         arrays[f"{strat}__flux"] = np.array([f["plans"][strat]["flux"] for f in res.frames])
     np.savez_compressed(path, **arrays)
+
+
+def load_realtime_run(folder: str | Path) -> dict:
+    """Restore the complete timeline and per-mirror plans from a saved real-time run."""
+    from .clouds import cloud_field
+    from .realtime import RealtimeResult
+
+    folder = Path(folder).resolve()
+    case = load_case(folder / "inputs_case.yaml")
+    fld = build_field(case)
+    table_path = folder / "realtime_timeseries.csv"
+    frames_path = folder / "realtime_frames.npz"
+    summary_path = folder / "realtime.json"
+    table = pd.read_csv(table_path, keep_default_na=False, na_values=[""])
+    table["time"] = pd.to_datetime(table["time"], utc=True).dt.tz_convert(case.site.timezone)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    with np.load(frames_path, allow_pickle=False) as archive:
+        times = pd.to_datetime(archive["times"], utc=True).tz_convert(case.site.timezone)
+        dni = archive["dni"]
+        strategies = [key[:-len("__aim_azimuth")] for key in archive.files if key.endswith("__aim_azimuth")]
+        grid = build_grid(case.receiver)
+        frames = []
+        for i, timestamp in enumerate(times):
+            _, elevation, azimuth, _ = sun_state(case, timestamp)
+            frame = {"time": timestamp, "dni": dni[i], "sun_angles": (elevation, azimuth), "plans": {}}
+            for strategy in strategies:
+                aim_azimuth = archive[f"{strategy}__aim_azimuth"][i]
+                aim_z = archive[f"{strategy}__aim_z"][i]
+                active = archive[f"{strategy}__active"][i].astype(bool)
+                flux = archive[f"{strategy}__flux"][i]
+                tower_key = f"{strategy}__tower_fraction"
+                tower_fraction = archive[tower_key][i] if tower_key in archive else np.zeros(fld.n)
+                row = table[(table["time"] == timestamp) & (table["strategy"] == strategy)].iloc[0]
+                hotspot_idx = np.unravel_index(int(np.argmax(flux)), flux.shape)
+                hotspot = {"panel": int(row["hotspot_panel"]),
+                           "azimuth_deg": float(grid.azimuth_deg[hotspot_idx[1]]),
+                           "z_m": float(grid.z[hotspot_idx[0]])}
+                check = {"status": "over_limit" if bool(row["over_limit"]) else "ok",
+                         "peak_flux_kw_m2": float(row["peak_flux_kw_m2"]),
+                         "peak_ratio": float(row["peak_to_limit"]), "hotspot_panel": hotspot["panel"],
+                         "hotspot_azimuth_deg": hotspot["azimuth_deg"], "hotspot_z_m": hotspot["z_m"],
+                         "hotspot": hotspot}
+                frame["plans"][strategy] = {
+                    "aim_azimuth": aim_azimuth, "aim_z": aim_z, "active": active,
+                    "tower_fraction": tower_fraction, "flux": flux, "check": check,
+                    "state": str(row["plan_state"]), "uniformity_status": str(row["uniformity_status"]),
+                    "operational_feasible": bool(row["operational_feasible"])}
+            frames.append(frame)
+    start = pd.Timestamp(times[0])
+    duration_s = float(table["interval_s"].sum())
+    clouds = cloud_field(case, fld, start)
+    result = RealtimeResult(table, {}, clouds, case.realtime.step_s, duration_s, frames,
+                            {"engine_stats": summary.get("engine")})
+    files = {path.stem: path for path in folder.iterdir() if path.is_file()}
+    return {"summary": summary, "files": files, "result": result, "field": fld, "run_dir": folder}
 
 
 def task_annual(case: Case, base: str | Path, method: str | None = None, aiming: str | None = None,
@@ -650,6 +727,7 @@ def task_annual(case: Case, base: str | Path, method: str | None = None, aiming:
 def task_optimize_layout(case: Case, base: str | Path, progress: Progress | None = None,
                          cancel: Callable[[], bool] | None = None) -> dict:
     t0 = _time.perf_counter()
+    case = resolve_layout_opt_case(case)
     out = out_dir(base, case, "layout_opt")
     res = optimize_layout(case, progress=progress, cancel=cancel)
     fld = Field(res.best.xyz)
@@ -807,7 +885,9 @@ def task_uniformity(case: Case, base: str | Path, time, eps_values=None, exact: 
                                    "solver": base_info, **m0},
                "curve": curve, "edge_band_bound": bound}
     _json(files["summary_json"], summary)
-    finish(out, "uniformity", summary, {"time": str(time), "eps": list(eps_values), "exact": exact}, t0)
+    finish(out, "uniformity", summary, {"time": str(time), "eps": list(eps_values), "exact": exact,
+                                        "power_floor_fraction": power_floor_fraction,
+                                        "band_fraction": band_fraction}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out}
 
 
@@ -841,7 +921,8 @@ def task_validate(case: Case, base: str | Path, time, rays: int | None = None, m
     _json(files["summary_json"], cmp)
     plot_flux_compare(snap.flux, ray.flux, grid, case.receiver, files["compare_png"],
                       labels=("Analytic (HFLCAL)", f"MCRT ({len(stats['seeds'])} seeds x {stats['rays_per_heliostat']} rays)"))
-    finish(out, "validate", cmp, {"time": str(time), "rays": rays, "method": method, "seeds": seeds}, t0)
+    finish(out, "validate", cmp, {"time": str(time), "rays": rays, "method": method, "seeds": seeds,
+                                   "convergence_rays": convergence_rays}, t0)
     return {"summary": _clean(cmp), "files": files, "run_dir": out}
 
 
@@ -854,7 +935,8 @@ def task_soltrace_export(case: Case, base: str | Path, time, method: str = "cent
     fld = build_field(case)
     res = export_benchmark(case, fld, time, out, method, rays, seeds)
     _json(out / "export_summary.json", res["summary"])
-    finish(out, "soltrace_export", res["summary"], {"time": str(time), "method": method}, t0)
+    finish(out, "soltrace_export", res["summary"], {"time": str(time), "method": method,
+                                                       "rays": rays, "seeds": seeds}, t0)
     return {"summary": _clean(res["summary"]), "files": res["files"], "run_dir": out}
 
 
@@ -913,7 +995,8 @@ def task_validation_suite(case: Case, base: str | Path, keys=None, rays: int | N
                                "mcrt_within_limit": "MCRT mean map + 2 standard errors <= the limit (same grid)",
                                "dni": "clear-sky model of the case (not the weather record); cloud edge scales it per mirror"}}
     _json(files["summary_json"], summary)
-    finish(out, "validation_suite", {"table": rows}, {"keys": list(keys), "rays": rays, "seeds": seeds, "year": year}, t0)
+    finish(out, "validation_suite", {"table": rows}, {"keys": list(keys), "rays": rays, "seeds": seeds,
+                                                       "year": year, "soltrace": soltrace}, t0)
     return {"summary": _clean(summary), "table": table, "maps": {r["key"]: r["_maps"] for r in results},
             "files": files, "run_dir": out}
 
@@ -966,7 +1049,8 @@ def task_solver_benchmark(case: Case, base: str | Path, part: str = "inner", n_s
     _json(files["summary_json"], summary)
     finish(out, "solver_benchmark", {"part": part}, {"part": part, "n_states": n_states, "budget_s": budget_s,
                                                        "seeds": list(seeds), "limit_factor": limit_factor,
-                                                       "lambda_aps": lam_aps}, t0)
+                                                       "lambda_aps": lam_aps, "methods": methods,
+                                                       "max_evals": max_evals}, t0)
     return {"summary": _clean(summary), **result, "files": files, "run_dir": out}
 
 
@@ -1049,7 +1133,7 @@ def task_sunbins(case: Case, base: str | Path, n_bins: int | None = None, check:
         files["check_csv"] = out / "sun_bins_check.csv"
         pd.DataFrame(rows).to_csv(files["check_csv"], index=False)
     _json(files["summary_json"], summary)
-    finish(out, "sunbins", summary, t0=t0)
+    finish(out, "sunbins", summary, {"n_bins": n_bins, "check": check, "methods": methods}, t0=t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out}
 
 
@@ -1185,7 +1269,8 @@ def task_scenario_aps(case: Case, base: str | Path, scenario_id: str, scenarios_
                "map": sset.samples.map_of(i).record()}
     _json(files["summary_json"], summary)
     finish(out, "scenario_aps", summary, {"scenario_id": scenario_id, "scenarios_dir": scenarios_dir,
-                                          "layout": str(layout) if layout is not None else None}, t0)
+                                          "layout": str(layout) if layout is not None else None,
+                                          "lam_aps": lam_aps}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out, "record": rec, "field": fld}
 
 
@@ -1306,6 +1391,88 @@ def replay_layout_value(folder, base, progress=None, cancel=None):
     return task_layout_value(case, base, layouts, folder / "scenario_set", summary["lambda_layout"], progress, cancel)
 
 
+def replay_run(folder, base, progress=None, cancel=None):
+    """Re-run a saved task with its frozen case and recorded arguments into a new run directory."""
+    folder = Path(folder).resolve()
+    run = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+    case = load_case(folder / "inputs_case.yaml")
+    args = run.get("arguments") or {}
+    task = run.get("task")
+
+    if task == "layout_value":
+        return replay_layout_value(folder, base, progress=progress, cancel=cancel)
+    if task in ("aps", "snapshot"):
+        return task_aim(case, base, args["time"], method=args.get("method"), dni=args.get("dni"),
+                        dni_map=args.get("dni_map"), forecast_dni_map=args.get("forecast_dni_map"),
+                        prev_aims=args.get("prev_aims"), tag=task, certify=args.get("certify"),
+                        progress=progress, dni_source=args.get("dni_source", "site"))
+    if task == "aps_refinement":
+        return task_aps_refinement(case, base, args["time"], levels=args.get("levels"),
+                                   dni_map=args.get("dni_map"), dni_source=args.get("dni_source", "site"),
+                                   progress=progress, dni=args.get("dni"),
+                                   forecast_dni_map=args.get("forecast_dni_map"),
+                                   azimuth_span=args.get("azimuth_span"))
+    if task == "layout_opt":
+        return task_optimize_layout(case, base, progress=progress, cancel=cancel)
+    if task == "realtime":
+        return task_realtime(case, base, progress=progress)
+    if task == "annual":
+        return task_annual(case, base, method=args.get("method"), aiming=args.get("aiming"), progress=progress)
+    if task == "cloud_compare":
+        return task_cloud_compare(case, base, args["time"], n_clouds=args.get("n_clouds", 2),
+                                  radius_m=tuple(args.get("radius_m", (60.0, 140.0))),
+                                  transmittance=tuple(args.get("transmittance", (0.1, 0.35))),
+                                  seed=args.get("seed", 0), clouds=args.get("clouds"),
+                                  lam_aps=args.get("lambda_aps"), progress=progress)
+    if task == "pareto":
+        return task_pareto(case, base, args["time"], lambdas=args.get("lambdas"), dni_map=args.get("dni_map"),
+                           certify=args.get("certify", True), progress=progress, prev_aims=args.get("prev_aims"),
+                           dni_source=args.get("dni_source", "site"))
+    if task == "uniformity":
+        return task_uniformity(case, base, args["time"], eps_values=args.get("eps"), exact=args.get("exact", False),
+                               power_floor_fraction=args.get("power_floor_fraction", 0.995),
+                               band_fraction=args.get("band_fraction", 0.125))
+    if task == "validate":
+        return task_validate(case, base, args["time"], rays=args.get("rays"), method=args.get("method", "center"),
+                             seeds=args.get("seeds"), convergence_rays=args.get("convergence_rays"))
+    if task == "soltrace_export":
+        return task_soltrace_export(case, base, args["time"], method=args.get("method", "center"),
+                                    rays=args.get("rays"), seeds=args.get("seeds"))
+    if task == "validation_suite":
+        return task_validation_suite(case, base, keys=args.get("keys"), rays=args.get("rays"),
+                                     seeds=args.get("seeds"), year=args.get("year", 2025),
+                                     soltrace=args.get("soltrace", True), progress=progress)
+    if task == "solver_benchmark":
+        return task_solver_benchmark(case, base, part=args.get("part", "inner"),
+                                     n_states=args.get("n_states", 6), budget_s=args.get("budget_s", 60.0),
+                                     seeds=tuple(args.get("seeds", (1, 2))),
+                                     limit_factor=args.get("limit_factor"), methods=args.get("methods"),
+                                     max_evals=args.get("max_evals"), lam_aps=args.get("lambda_aps"),
+                                     progress=progress)
+    if task == "layout_tradeoff":
+        return task_layout_tradeoff(case, base, lambdas=args.get("lambdas"), params=args.get("params"),
+                                    progress=progress)
+    if task == "scenarios":
+        return task_scenarios(case, base, n=args.get("n"))
+    if task == "scenario_aps":
+        return task_scenario_aps(case, base, args["scenario_id"], scenarios_dir=args.get("scenarios_dir"),
+                                 layout=args.get("layout"), lam_aps=args.get("lam_aps"))
+    if task == "preference_trial":
+        return task_preference_trial(case, base, scenario_id=args.get("scenario_id"),
+                                     lambdas=tuple(args.get("lambdas", (0.0, None))),
+                                     layout=args.get("layout", "initial"), scenarios_dir=args.get("scenarios_dir"))
+    if task == "shading_check":
+        return task_shading_check(case, base)
+    if task == "sunbins":
+        return task_sunbins(case, base, n_bins=args.get("n_bins"), check=args.get("check", False),
+                            methods=args.get("methods"))
+    if task == "fetch_weather":
+        return task_fetch_weather(case, base, year=args.get("year"))
+    if task == "layout":
+        return task_layout(case, base)
+    raise ValueError(f"This run cannot be replayed from its recorded inputs: {task}")
+
+
 def task_rescore(folder: str | Path, lam_layout: float, land_weight: float = 0.0) -> dict:
     """Recompute every layout's V (and J = V - kappa A) for another outer weight / land weight from exported
     scenario tables and layouts only (no solver)."""
@@ -1410,7 +1577,8 @@ def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, ra
     rows = [{k: v for k, v in s.items() if not isinstance(v, np.ndarray) and k not in ("hotspot",)} for s in states]
     table = pd.DataFrame(rows)
     files = {"summary_json": out / "cloud_compare.json", "states_csv": out / "cloud_compare_states.csv",
-             "compare_png": out / "cloud_compare.png", "aims_csv": out / "cloud_compare_aims.csv"}
+             "compare_png": out / "cloud_compare.png", "aims_csv": out / "cloud_compare_aims.csv",
+             "states_npz": out / "cloud_compare_states.npz"}
     table.to_csv(files["states_csv"], index=False)
     aims = pd.DataFrame({"id": fld.ids, "x": fld.xyz[:, 0], "y": fld.xyz[:, 1], "transmittance": np.round(tau, 5)})
     for s in states:
@@ -1421,6 +1589,20 @@ def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, ra
         aims[f"{s['key']}_aim_z"] = np.round(s["aim_z"], 5)
         aims[f"{s['key']}_power_kw"] = np.round(s["mirror_power_kw"], 4)
     aims.to_csv(files["aims_csv"], index=False)
+    state_arrays = {"ids": fld.ids, "xyz": fld.xyz, "transmittance": tau,
+                    "dni_clear_w_m2": d_clear, "receiver_azimuth_deg": grid.azimuth_deg,
+                    "receiver_height_m": grid.z}
+    for state in states:
+        prefix = state["key"]
+        state_arrays[f"{prefix}__dni_w_m2"] = state["dni"]
+        state_arrays[f"{prefix}__aim_azimuth_deg"] = state["aim_azimuth"]
+        state_arrays[f"{prefix}__aim_z_m"] = state["aim_z"]
+        state_arrays[f"{prefix}__active"] = np.asarray(state["active"], dtype=np.uint8)
+        state_arrays[f"{prefix}__tower_fraction"] = (state["tower_fraction"] if state["tower_fraction"] is not None
+                                                        else np.zeros(fld.n))
+        state_arrays[f"{prefix}__flux_w_m2"] = state["flux"]
+        state_arrays[f"{prefix}__absorbed_flux_w_m2"] = state["absorbed_flux"]
+    np.savez_compressed(files["states_npz"], **state_arrays)
     plot_cloud_compare(fld.xyz, case.receiver, grid, states[:3] + states[3:4], files["compare_png"],
                        boundary=case.field.boundary)
     base_row = states[0]
@@ -1433,7 +1615,8 @@ def task_cloud_compare(case: Case, base: str | Path, time, n_clouds: int = 2, ra
                "inner_settings": settings.record()}
     _json(files["summary_json"], summary)
     finish(out, "cloud_compare", summary, {"time": str(time), "n_clouds": n_clouds, "seed": seed,
-                                           "radius_m": list(radius_m), "transmittance": list(transmittance)}, t0)
+                                           "radius_m": list(radius_m), "transmittance": list(transmittance),
+                                           "lambda_aps": lam, "clouds": [c.__dict__ for c in cl]}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out, "states": states, "field": fld,
             "grid": grid, "transmittance": tau, "clouds": cl, "case": case}
 
@@ -1471,5 +1654,8 @@ def task_preference_trial(case: Case, base: str | Path, scenario_id: str | None 
                "trials": rows}
     files = {"summary_json": out / "preference_trial.json"}
     _json(files["summary_json"], summary)
-    finish(out, "preference_trial", summary, {"scenario_id": scenario_id, "lambdas": list(lambdas)}, t0)
+    finish(out, "preference_trial", summary, {"scenario_id": scenario_id, "lambdas": list(lambdas),
+                                               "layout": (None if layout is None else
+                                                          str(layout) if not isinstance(layout, np.ndarray) else "array"),
+                                               "scenarios_dir": scenarios_dir}, t0)
     return {"summary": _clean(summary), "files": files, "run_dir": out}

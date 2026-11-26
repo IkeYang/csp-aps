@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import gzip
 import hashlib
 import importlib.machinery
 import json
@@ -26,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import yaml
 
 from cspaps import workflows as wf
@@ -41,7 +43,7 @@ from cspaps.gui_plots import (
 )
 from cspaps.layout_opt import validate_layout
 from cspaps.layout_value import value_labels
-from cspaps.tables import export_name, read_user_csv
+from cspaps.tables import export_name, read_user_csv, safe_filename
 from cspaps.optics import footprints_at
 from cspaps.resources import demo_case_path
 from cspaps.receiver import build_grid, incident_limit_w_m2, panel_of, surface_normal, surface_point
@@ -69,6 +71,8 @@ PLOTLY_CONFIG = {"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "se
 # Blocking input problems found while drawing the current page (the script reruns from the top on every
 # interaction, so this list is fresh each time); any entry disables the run buttons.
 INPUT_ERRORS: list[str] = []
+_CHART_ARCHIVE_RUN_DIR: Path | None = None
+_CHART_ARCHIVE_LOCK = threading.Lock()
 
 SECTION_TITLES = {
     "site": "站址", "receiver": "集热器与管屏", "heliostat": "定日镜", "sun": "太阳", "atmosphere": "大气衰减",
@@ -140,7 +144,7 @@ LABELS = {
     "annual.workers": "并行进程 (-1 = 全部)", "annual.year": "年份",
     "annual.day_of_month": "代表日（每月几号）", "annual.time_step_min": "时间步长 (min)",
     "annual.min_sun_elevation_deg": "最低太阳高度角 (°)", "annual.aiming": "瞄准方式",
-    "layout_opt.generator": "布置生成器", "layout_opt.n_heliostats": "镜子数量",
+    "layout_opt.generator": "布置生成器", "layout_opt.n_heliostats": "镜子数量（默认沿用导入镜场）",
     "layout_opt.bounds": "优化参数范围 (YAML)", "layout_opt.fixed": "固定参数 (YAML)",
     "layout_opt.search_sampling": "搜索阶段采样", "layout_opt.n_sun_bins": "搜索代表点数",
     "layout_opt.search_aiming": "布局评价使用的瞄准策略", "layout_opt.uniformity_metric": "布局受热均匀性指标",
@@ -280,7 +284,7 @@ HELP = {
     "uniformity.min_load_mw": "考核区域最低吸收功率。未达到时该运行状态按不满足目标处理。",
     "annual.n_sun_bins": "把全年有效太阳状态压缩成代表点以加速估算。代表点越多，计算越慢，采样误差通常越小。",
     "annual.dni_bands": "每个太阳方向再按 DNI 强弱拆分工况。受通量限制的 APS 建议大于 1。",
-    "layout_opt.n_heliostats": "希望最终布置的镜面数量。场地无法容纳时会报告缺额。",
+    "layout_opt.n_heliostats": "希望最终布置的镜面数量。导入镜场且未设置时沿用原镜数；场地无法容纳时会报告缺额。",
     "layout_opt.search_aiming": "中心瞄准按理论吸热量扣除均匀度惩罚复排。选用 APS 时按运行可行能量和实际姿态的均匀度复排。",
     "layout_opt.refine_top": "对搜索阶段排名靠前的布局运行完整 APS 年收益复核。",
     "engine.max_slew_deg_s": "镜面法向最大转速，用于排除本控制周期内物理上来不及到达的瞄准点。",
@@ -676,7 +680,46 @@ def _pct(value, digits: int = 2) -> str:
         return "—"
 
 
+def _capture_chart_run(result: dict | None) -> None:
+    global _CHART_ARCHIVE_RUN_DIR
+    run_dir = result.get("run_dir") if result else None
+    _CHART_ARCHIVE_RUN_DIR = Path(run_dir) if run_dir else None
+
+
+def _archive_chart(fig, key: str) -> None:
+    if _CHART_ARCHIVE_RUN_DIR is None:
+        return
+    try:
+        payload = fig.to_json()
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        directory = _CHART_ARCHIVE_RUN_DIR / "visualizations"
+        directory.mkdir(parents=True, exist_ok=True)
+        slug = safe_filename(str(key)) or "chart"
+        filename = f"{slug}_{digest}.json.gz"
+        title = getattr(getattr(fig.layout, "title", None), "text", None) or str(key)
+        with _CHART_ARCHIVE_LOCK:
+            chart_path = directory / filename
+            if not chart_path.exists():
+                temp_chart = chart_path.with_suffix(chart_path.suffix + ".tmp")
+                with gzip.open(temp_chart, "wt", encoding="utf-8") as stream:
+                    stream.write(payload)
+                temp_chart.replace(chart_path)
+            index_path = directory / "index.json"
+            index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {"charts": []}
+            existing = {entry["file"] for entry in index["charts"]}
+            if filename not in existing:
+                index["charts"].append({"key": str(key), "title": str(title), "file": filename})
+                temp_path = index_path.with_suffix(".tmp")
+                temp_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+                temp_path.replace(index_path)
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        if not st.session_state.get("chart_archive_error_shown"):
+            st.session_state["chart_archive_error_shown"] = True
+            st.warning(f"交互图表未能保存到历史记录：{exc}")
+
+
 def _chart(fig, key: str, **kw):
+    _archive_chart(fig, key)
     return st.plotly_chart(fig, theme=None, key=key, config=PLOTLY_CONFIG, **kw)
 
 
@@ -1146,8 +1189,8 @@ def _selected_id(event) -> int | None:
 def _site_check(case, layouts: dict, key: str, height: int = 500) -> None:
     """Step 1: plan view with north arrow and scale; click a mirror to check its ID, coordinates and size."""
     sel = st.session_state.get(f"site_sel_{key}")
-    ev = st.plotly_chart(site_preview(case, layouts, sel, height=height), theme=None, key=f"site_{key}",
-                         on_select="rerun", selection_mode=("points",), config=PLOTLY_CONFIG)
+    ev = _chart(site_preview(case, layouts, sel, height=height), f"site_{key}",
+                on_select="rerun", selection_mode=("points",))
     picked = _selected_id(ev)
     if picked is not None and picked != sel:
         st.session_state[f"site_sel_{key}"] = picked
@@ -1484,14 +1527,13 @@ def _scenario_browser(case, layouts: dict, key: str) -> None:
         xyz = np.vstack(allxyz) if allxyz else np.zeros((0, 3))
         ids = np.concatenate(allids) if allids else np.zeros(0, int)
         dni = sset.dni_at(i, xyz[:, :2]) if len(xyz) else np.zeros(0)
-        ev2 = st.plotly_chart(field_dni_map(case, xyz, ids, dni, dni_map=m,
+        ev2 = _chart(field_dni_map(case, xyz, ids, dni, dni_map=m,
                                             sun_angles=(sset.samples.elevation[i], sset.samples.azimuth[i]),
                                             shadow_fraction=tower_shadow_fraction(case, xyz, sset.samples.elevation[i],
                                                                                   sset.samples.azimuth[i]),
                                             map_scale=float(sset.samples.dni[i]) if m.unit == "factor" else 1.0,
                                             title=f"{sid} · 地图 {m.map_id}", cmin=0, height=420),
-                              theme=None, key=f"scen_map_{key}_{i}", on_select="rerun", selection_mode=("points",),
-                              config=PLOTLY_CONFIG)
+                              f"scen_map_{key}_{i}", on_select="rerun", selection_mode=("points",))
         pick = _selected_id(ev2)
     with r:
         st.markdown(f"**{sid}**　{m.description or m.map_id}")
@@ -1819,6 +1861,7 @@ def _scenario_check_section(case) -> None:
     res = st.session_state.get("res_scen")
     if res is None:
         return
+    _capture_chart_run(res)
     from cspaps.layout_value import STATUS_ZH, eval_grid_shape
 
     rec, fld = res["record"], res["field"]
@@ -1848,6 +1891,7 @@ def _scenario_check_section(case) -> None:
 
 
 def _aps_results(res: dict) -> None:
+    _capture_chart_run(res)
     s, snap, fld = res["summary"], res["snapshot"], res["field"]
     run = Path(res["run_dir"])
     case = load_case(run / "inputs_case.yaml")
@@ -2476,6 +2520,7 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now, up_prev=None) -> Non
         res = st.session_state.get("res_pareto")
         if res is None:
             return
+        _capture_chart_run(res)
         rows = res["summary"]["curve"]
         sel = case.uniformity.weight if case and case.uniformity.enabled and case.uniformity.mode == "weighted" else None
         a, b = st.columns([1.5, 1])
@@ -2777,6 +2822,7 @@ def _layout_search_inputs(case) -> str | None:
 
 
 def _layout_search_results(completed, res: dict, digest: str | None) -> None:
+    _capture_chart_run(res)
     if res.get("input_digest") != digest:
         _callout("warn", "参数已修改，需要重新计算",
                  f"下面的图表、指标和导出文件对应上一次的参数：镜数 {completed.layout_opt.n_heliostats}，"
@@ -2813,6 +2859,13 @@ def page_layout(case) -> None:
     if mode == "compare":
         _compare_workspace(case)
         return
+    from cspaps.layout_opt import resolve_layout_opt_case
+
+    resolved_case = resolve_layout_opt_case(case)
+    if resolved_case is not case:
+        st.session_state["case_dict"] = resolved_case.to_dict()
+        st.session_state["ver"] += 1
+        case = resolved_case
     res = st.session_state.get("res_opt")
     if res is None:
         _layout_search_preview(case)
@@ -2832,6 +2885,7 @@ def page_layout(case) -> None:
 
 
 def _layout_results(case, res: dict) -> None:
+    _capture_chart_run(res)
     s = res["summary"]
     r = res["result"]
     ub = s.get("upper_bound") or {}
@@ -3039,11 +3093,10 @@ def _planning_compare(case) -> None:
         eff = None
     c1, c2 = st.columns([3, 2])
     with c1:
-        st.plotly_chart(theme=None, figure_or_data=field_map(case, fld.xyz, fld.ids, values=eff, label="年均光学效率",
+        _chart(field_map(case, fld.xyz, fld.ids, values=eff, label="年均光学效率",
                                   candidates=cand.candidates_xyz,
                                   title=f"复核排名 {final_rank} / 搜索排名 {search_rank}：{fld.n} 面" +
-                                        ("（含换位优化）" if is_best else "")),
-                        key=f"cand_map_{pick}")
+                                        ("（含换位优化）" if is_best else "")), f"cand_map_{pick}")
     with c2:
         st.markdown(f"**选中布局**　复核排名 {final_rank} · 搜索排名 {search_rank}")
         site_status = {"ok": "场地约束通过", "capacity_shortfall": "镜数不足", "constraint_violation": "场地约束未通过"}
@@ -3429,6 +3482,7 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
     """Formal comparison of layouts by V(L): ranking, decomposition, per-scenario plans, maps, audit."""
     from cspaps.layout_value import compare_values, eval_grid_shape
 
+    _capture_chart_run({"run_dir": run_dir})
     key = f"fv_{key}"  # widget keys of this view never collide with the pre-screen view
     labels = _labels(values)
     _decision_callout(values, ranking)
@@ -3474,63 +3528,78 @@ def _render_values(case, values: dict, ranking: pd.DataFrame, sset, key: str, bo
                 st.caption("换位：移出 APS 年吸热最少的镜子、换入定价最高的空闲候选镜位；只有在同一工况集上 V 提高才接受。")
     names = list(values)
     with tabs[1]:
-        c1, c2, c3 = st.columns(3)
-        na = c1.selectbox("布局 A", names, index=0, format_func=labels.get, key=f"{key}_la")
-        others = [n for n in names if n != na] or names
-        default_b = others.index("initial") if "initial" in others else 0
-        nb = c2.selectbox("布局 B", others, index=default_b, format_func=labels.get, key=f"{key}_lb")
-        lam = float(ranking["lambda_layout"].iloc[0])
-        ta, tb = values[na].table(lam), values[nb].table(lam)
-        # sort the scenarios by their contribution to the score difference A - B (largest effect first)
-        diff = ta["contribution_mwh"] - tb["contribution_mwh"]
-        order = np.argsort(-np.abs(diff.to_numpy()), kind="stable")
-        ta, tb, diff = ta.iloc[order].reset_index(drop=True), tb.iloc[order].reset_index(drop=True), diff.iloc[order]
-        _chart(scenario_contrib_chart({na: ta, nb: tb}, labels, lam), f"{key}_contrib")
-        view = pd.DataFrame({
-            "对分差的贡献 A − B (MWh 等效)": diff.round(2).to_numpy(),
-            "工况": ta["scenario_id"], "DNI 地图": ta["map_id"], "代表小时 h": ta["hours"].round(2),
-            "太阳 高度/方位 (°)": [f"{e:.1f} / {z:.0f}" for e, z in zip(ta["elevation_deg"], ta["azimuth_deg"])],
-            "工况 DNI": ta["dni_w_m2"].round(0),
-            "A 状态": ta["status"].map(VALUE_STATUS_ZH), "A: P (MW)": ta["p_abs_mw"].round(3), "A: U (MW)": ta["u_mw"].round(3),
-            "A: 贡献 (MWhₜₕ)": ta["contribution_mwh"].round(1),
-            "B 状态": tb["status"].map(VALUE_STATUS_ZH), "B: P (MW)": tb["p_abs_mw"].round(3), "B: U (MW)": tb["u_mw"].round(3),
-            "B: 贡献 (MWhₜₕ)": tb["contribution_mwh"].round(1)})
-        ev = st.dataframe(view, hide_index=True, height=320, on_select="rerun", selection_mode="single-row",
-                          key=f"{key}_rows")
-        st.caption(f"A = {labels[na]}，B = {labels[nb]}。按对两方案分差的贡献从大到小排序；贡献 = h·(P − λ_L·U)，"
-                   "只对“可行运行”工况计入。点一行在下方用同一色标对照两套镜位、逐镜日照和接收器热流。")
-        rows = getattr(getattr(ev, "selection", None), "rows", None) or [0]
-        sid = str(ta["scenario_id"].iloc[int(rows[0])])
-        st.markdown(f"**工况 {sid}** · 对分差的贡献 {float(diff.iloc[int(rows[0])]):+,.2f} MWh 等效")
-        i = sset.index(sid)
-        nz, nax = eval_grid_shape(case)
-        grid = build_grid(case.receiver, nax, nz)
-        m = sset.samples.map_of(i)
-        pa, pb = values[na].plan(sid), values[nb].plan(sid)
-        zmax = max(float(np.max(p.flux)) if p.flux is not None else 0.0 for p in (pa, pb)) / 1e3 or None
-        dmax = max(float(np.max(pa.dni)), float(np.max(pb.dni))) if pa.dni.size else None
-        l, r = st.columns(2)
-        for col, name, p in ((l, na, pa), (r, nb, pb)):
-            with col:
-                st.markdown(f"**{labels[name]}** · {VALUE_STATUS_ZH.get(p.status, p.status)}")
-                _kpis([("P", f"{p.p_abs_w / 1e6:.3f}", "MW"), ("U", f"{p.u_w / 1e6:.3f}", "MW", f"CV {_format_number(p.cv_2d, 3)}"),
-                       ("J = P − λ_APS·U", f"{p.objective_w / 1e6:.3f}", "MW", f"差距 ≤ {_pct(p.gap, 2)}"),
-                       ("峰值", f"{p.peak_flux_kw_m2:.0f}", "kW/m²", f"散焦 {p.n_defocused} 面")])
-                v = values[name]
-                _chart(field_dni_map(case, v.xyz, v.ids, p.dni, dni_map=m,
-                                     sun_angles=(sset.samples.elevation[i], sset.samples.azimuth[i]),
-                                     map_scale=float(sset.samples.dni[i]) if m.unit == "factor" else 1.0,
-                                     title=f"{sid} 镜场 DNI（底图为该工况的场地 DNI 地图）", cmin=0, cmax=dmax, height=400),
-                       f"{key}_dni_{name}_{sid}")
-                if p.flux is not None:
-                    hs = ({"azimuth_deg": p.info["hotspot_azimuth_deg"], "z_m": p.info["hotspot_z_m"]}
-                          if p.info.get("hotspot_azimuth_deg") is not None else None)
-                    _chart(receiver_aims_map(case, grid, p.flux, p.aim_azimuth, p.aim_z, p.active, v.ids, p.dni,
-                                             title="吸热器热流与瞄准点（该布局自己的 APS 方案）", zmax=zmax, height=380,
-                                             hotspot=hs, cmin=0, cmax=dmax,
-                                             spots=_spots(case, v.xyz, p.aim_azimuth, p.aim_z, sset.samples.elevation[i],
-                                                          sset.samples.azimuth[i])), f"{key}_rec_{name}_{sid}")
-                    _hotspot_text(case, p)
+        if len(names) == 1:
+            name = names[0]
+            st.info(f"本次正式排名只有一套可排名布局：{labels[name]}。以下显示该布局的逐工况结果。")
+            lam = float(ranking["lambda_layout"].iloc[0])
+            table = values[name].table(lam)
+            columns = ["scenario_id", "map_id", "hours", "elevation_deg", "azimuth_deg", "dni_w_m2",
+                       "status", "p_abs_mw", "u_mw", "contribution_mwh"]
+            view = table[[column for column in columns if column in table]].rename(columns={
+                "scenario_id": "工况", "map_id": "DNI 地图", "hours": "代表小时 h",
+                "elevation_deg": "太阳高度 (°)", "azimuth_deg": "太阳方位 (°)", "dni_w_m2": "工况 DNI (W/m²)",
+                "status": "状态", "p_abs_mw": "吸收功率 P (MW)", "u_mw": "均匀性扣分 U (MW)",
+                "contribution_mwh": "年度贡献 (MWhₜₕ)"})
+            view["状态"] = view["状态"].map(VALUE_STATUS_ZH).fillna(view["状态"])
+            st.dataframe(view, hide_index=True, height=360, key=f"{key}_single_scenarios")
+        else:
+            c1, c2, c3 = st.columns(3)
+            na = c1.selectbox("布局 A", names, index=0, format_func=labels.get, key=f"{key}_la")
+            others = [n for n in names if n != na]
+            default_b = others.index("initial") if "initial" in others else 0
+            nb = c2.selectbox("布局 B", others, index=default_b, format_func=labels.get, key=f"{key}_lb")
+            lam = float(ranking["lambda_layout"].iloc[0])
+            ta, tb = values[na].table(lam), values[nb].table(lam)
+            # sort the scenarios by their contribution to the score difference A - B (largest effect first)
+            diff = ta["contribution_mwh"] - tb["contribution_mwh"]
+            order = np.argsort(-np.abs(diff.to_numpy()), kind="stable")
+            ta, tb, diff = ta.iloc[order].reset_index(drop=True), tb.iloc[order].reset_index(drop=True), diff.iloc[order]
+            _chart(scenario_contrib_chart({na: ta, nb: tb}, labels, lam), f"{key}_contrib")
+            view = pd.DataFrame({
+                "对分差的贡献 A − B (MWh 等效)": diff.round(2).to_numpy(),
+                "工况": ta["scenario_id"], "DNI 地图": ta["map_id"], "代表小时 h": ta["hours"].round(2),
+                "太阳 高度/方位 (°)": [f"{e:.1f} / {z:.0f}" for e, z in zip(ta["elevation_deg"], ta["azimuth_deg"])],
+                "工况 DNI": ta["dni_w_m2"].round(0),
+                "A 状态": ta["status"].map(VALUE_STATUS_ZH), "A: P (MW)": ta["p_abs_mw"].round(3), "A: U (MW)": ta["u_mw"].round(3),
+                "A: 贡献 (MWhₜₕ)": ta["contribution_mwh"].round(1),
+                "B 状态": tb["status"].map(VALUE_STATUS_ZH), "B: P (MW)": tb["p_abs_mw"].round(3), "B: U (MW)": tb["u_mw"].round(3),
+                "B: 贡献 (MWhₜₕ)": tb["contribution_mwh"].round(1)})
+            ev = st.dataframe(view, hide_index=True, height=320, on_select="rerun", selection_mode="single-row",
+                              key=f"{key}_rows")
+            st.caption(f"A = {labels[na]}，B = {labels[nb]}。按对两方案分差的贡献从大到小排序；贡献 = h·(P − λ_L·U)，"
+                       "只对“可行运行”工况计入。点一行在下方用同一色标对照两套镜位、逐镜日照和接收器热流。")
+            rows = getattr(getattr(ev, "selection", None), "rows", None) or [0]
+            sid = str(ta["scenario_id"].iloc[int(rows[0])])
+            st.markdown(f"**工况 {sid}** · 对分差的贡献 {float(diff.iloc[int(rows[0])]):+,.2f} MWh 等效")
+            i = sset.index(sid)
+            nz, nax = eval_grid_shape(case)
+            grid = build_grid(case.receiver, nax, nz)
+            m = sset.samples.map_of(i)
+            pa, pb = values[na].plan(sid), values[nb].plan(sid)
+            zmax = max(float(np.max(p.flux)) if p.flux is not None else 0.0 for p in (pa, pb)) / 1e3 or None
+            dmax = max(float(np.max(pa.dni)), float(np.max(pb.dni))) if pa.dni.size else None
+            l, r = st.columns(2)
+            for col, name, p in ((l, na, pa), (r, nb, pb)):
+                with col:
+                    st.markdown(f"**{labels[name]}** · {VALUE_STATUS_ZH.get(p.status, p.status)}")
+                    _kpis([("P", f"{p.p_abs_w / 1e6:.3f}", "MW"), ("U", f"{p.u_w / 1e6:.3f}", "MW", f"CV {_format_number(p.cv_2d, 3)}"),
+                           ("J = P − λ_APS·U", f"{p.objective_w / 1e6:.3f}", "MW", f"差距 ≤ {_pct(p.gap, 2)}"),
+                           ("峰值", f"{p.peak_flux_kw_m2:.0f}", "kW/m²", f"散焦 {p.n_defocused} 面")])
+                    v = values[name]
+                    _chart(field_dni_map(case, v.xyz, v.ids, p.dni, dni_map=m,
+                                         sun_angles=(sset.samples.elevation[i], sset.samples.azimuth[i]),
+                                         map_scale=float(sset.samples.dni[i]) if m.unit == "factor" else 1.0,
+                                         title=f"{sid} 镜场 DNI（底图为该工况的场地 DNI 地图）", cmin=0, cmax=dmax, height=400),
+                           f"{key}_dni_{name}_{sid}")
+                    if p.flux is not None:
+                        hs = ({"azimuth_deg": p.info["hotspot_azimuth_deg"], "z_m": p.info["hotspot_z_m"]}
+                              if p.info.get("hotspot_azimuth_deg") is not None else None)
+                        _chart(receiver_aims_map(case, grid, p.flux, p.aim_azimuth, p.aim_z, p.active, v.ids, p.dni,
+                                                 title="吸热器热流与瞄准点（该布局自己的 APS 方案）", zmax=zmax, height=380,
+                                                 hotspot=hs, cmin=0, cmax=dmax,
+                                                 spots=_spots(case, v.xyz, p.aim_azimuth, p.aim_z, sset.samples.elevation[i],
+                                                              sset.samples.azimuth[i])), f"{key}_rec_{name}_{sid}")
+                        _hotspot_text(case, p)
     with tabs[2]:
         tbl = sset.table()
         a, b = st.columns([1, 1])
@@ -3648,44 +3717,51 @@ def res_case(res: dict):
 
 # --------------------------------------------------------------------------- replay
 
-def _ops_replay(case) -> None:
+def _ops_replay(case, historical: dict | None = None) -> None:
     if case is None:
         st.warning("请先在「全部参数」中修正当前算例。")
         return
-    if "res_rt" not in st.session_state:
-        _section(None, "场地预览", "当前镜场、塔位与塔周禁排区。")
-        try:
-            field = build_field(case)
-            st.plotly_chart(field_map(case, field.xyz, field.ids, title=f"当前镜场 · {field.n:,} 面定日镜",
-                                      preview=True), theme=None, key="replay_site_preview")
-        except (OSError, ValueError) as exc:
-            st.error(f"镜场坐标无法读取。{exc}")
+    if historical is not None:
+        res = historical
+        last_case = load_case(Path(res["run_dir"]) / "inputs_case.yaml")
     else:
-        st.markdown("**回放工况**")
-        last_case = load_case(Path(st.session_state["res_rt"]["run_dir"]) / "inputs_case.yaml")
-        st.write(f"{last_case.realtime.start} · {last_case.site.timezone}")
-    with _card("replay_settings"):
-        _section(None, "回放设置")
-        _section_form("realtime", expanded=True, fields=["scenario", "duration_min", "step_s"], title="云影与时间")
-        _job_button("rt", "运行回放", wf.task_realtime, progress=True)
-        st.caption("使用当前算例即可运行，结果可按时刻查看。")
-    case, _ = _case()
-    _job_error("rt")
-    advanced = [f.name for f in dataclasses.fields(_SECTIONS["realtime"])
-                if f.name not in ("scenario", "duration_min", "step_s")]
-    _section_form("realtime", fields=advanced, title="回放时间、预测与云层参数")
-    _section_form("engine", title="控制周期与回退策略")
-    res = st.session_state.get("res_rt")
-    if res is None:
-        return
+        if "res_rt" not in st.session_state:
+            _section(None, "场地预览", "当前镜场、塔位与塔周禁排区。")
+            try:
+                field = build_field(case)
+                _chart(field_map(case, field.xyz, field.ids, title=f"当前镜场 · {field.n:,} 面定日镜",
+                                 preview=True), "replay_site_preview")
+            except (OSError, ValueError) as exc:
+                st.error(f"镜场坐标无法读取。{exc}")
+        else:
+            st.markdown("**回放工况**")
+            last_case = load_case(Path(st.session_state["res_rt"]["run_dir"]) / "inputs_case.yaml")
+            st.write(f"{last_case.realtime.start} · {last_case.site.timezone}")
+        with _card("replay_settings"):
+            _section(None, "回放设置")
+            _section_form("realtime", expanded=True, fields=["scenario", "duration_min", "step_s"], title="云影与时间")
+            _job_button("rt", "运行回放", wf.task_realtime, progress=True)
+            st.caption("使用当前算例即可运行，结果可按时刻查看。")
+        case, _ = _case()
+        _job_error("rt")
+        advanced = [f.name for f in dataclasses.fields(_SECTIONS["realtime"])
+                    if f.name not in ("scenario", "duration_min", "step_s")]
+        _section_form("realtime", fields=advanced, title="回放时间、预测与云层参数")
+        _section_form("engine", title="控制周期与回退策略")
+        res = st.session_state.get("res_rt")
+        if res is None:
+            return
     case = last_case
+    _capture_chart_run(res)
     rr, fld = res["result"], res["field"]
     times = [f["time"] for f in rr.frames]
     strategies = list(rr.frames[0]["plans"]) if rr.frames else []
     c1, c2 = st.columns([2, 3])
-    strat = c1.radio("显示策略", strategies, format_func=lambda s: STRAT_ZH.get(s, s), horizontal=True, key="ops_strat")
+    run_key = hashlib.sha1(str(res["run_dir"]).encode()).hexdigest()[:10]
+    strat = c1.radio("显示策略", strategies, format_func=lambda s: STRAT_ZH.get(s, s), horizontal=True,
+                     key=f"ops_strat_{run_key}")
     labels = [f"{t:%H:%M:%S}" for t in times]
-    k = labels.index(c2.select_slider("回放时间", options=labels, value=labels[0], key="ops_t"))
+    k = labels.index(c2.select_slider("回放时间", options=labels, value=labels[0], key=f"ops_t_{run_key}"))
     frame, row = rr.frames[k], rr.table[(rr.table["time"] == times[k]) & (rr.table["strategy"] == strat)].iloc[0]
     plan = frame["plans"][strat]
     chk = plan["check"] or {}
@@ -3718,7 +3794,7 @@ def _ops_replay(case) -> None:
                         hover=[f"ID {i}<br>DNI {d:.0f} W/m²" for i, d in zip(fld.ids, frame["dni"])],
                         inactive=~plan["active"], sun_angles=frame.get("sun_angles"),
                         shadow_fraction=plan["tower_fraction"])
-        ev = st.plotly_chart(theme=None, figure_or_data=fig, on_select="rerun", selection_mode=("points",), key=f"ops_field_{k}_{strat}")
+        ev = _chart(fig, f"ops_field_{k}_{strat}", on_select="rerun", selection_mode=("points",))
         pts = getattr(getattr(ev, "selection", None), "points", None) or []
         if pts and pts[0].get("customdata") is not None:
             st.session_state["ops_sel_id"] = int(np.atleast_1d(pts[0]["customdata"])[0])
@@ -3726,11 +3802,11 @@ def _ops_replay(case) -> None:
         sel_cell = st.session_state.get("ops_sel_cell")
         fig = receiver_map(case, grid, plan["flux"], title="接收器展开通量（粗网格；× = 细网格复核热点）",
                            hotspot=chk if chk else None, aims=(plan["aim_azimuth"], plan["aim_z"]), selected_cell=sel_cell)
-        ev = st.plotly_chart(theme=None, figure_or_data=fig, on_select="rerun", selection_mode=("points",), key=f"ops_rec_{k}_{strat}")
+        ev = _chart(fig, f"ops_rec_{k}_{strat}", on_select="rerun", selection_mode=("points",))
         pts = getattr(getattr(ev, "selection", None), "points", None) or []
         if pts:
             st.session_state["ops_sel_cell"] = (float(pts[0]["x"]), float(pts[0]["y"]))
-    st.plotly_chart(theme=None, figure_or_data=replay_timeline(rr.table, "peak_to_limit", "峰值 / 设备限值", times[k], 1.0), key=f"tl_{k}")
+    _chart(replay_timeline(rr.table, "peak_to_limit", "峰值 / 设备限值", times[k], 1.0), f"tl_{k}")
     d1, d2 = st.columns(2)
     with d1:
         sid = st.session_state.get("ops_sel_id")
@@ -3943,6 +4019,7 @@ def _cloud_compare_inputs(case) -> None:
 
 
 def _cloud_results(res: dict) -> None:
+    _capture_chart_run(res)
     st_ = {s["key"]: s for s in res["states"]}
     for k, s in st_.items():
         s["short"] = CLOUD_SHORT[k]
@@ -4320,53 +4397,157 @@ def page_parameters(case) -> None:
             st.rerun()
 
 
+def _history_payload(path: Path):
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix in (".yaml", ".yml"):
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    if suffix == ".npz":
+        with np.load(path, allow_pickle=False) as arrays:
+            return pd.DataFrame([{"数组": name, "形状": " × ".join(map(str, arrays[name].shape)),
+                                  "类型": str(arrays[name].dtype)} for name in arrays.files])
+    return None
+
+
+def _history_run_detail(run: pd.Series, task_names: dict[str, str]) -> None:
+    directory = Path(run["path"])
+    task = str(run["task"])
+    run_key = hashlib.sha1(str(directory).encode()).hexdigest()[:12]
+    metadata_path = directory / "run.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    _section(None, f"{task_names.get(task, task)} · {directory.name}",
+             f"{run['case']} · {run.get('finished') or '完成时间未知'} · {run.get('status') or '状态未知'} · "
+             f"耗时 {_format_number(metadata.get('runtime_s'), 1)} s")
+
+    replayable = task in {"layout_value", "layout_opt", "aps", "snapshot", "realtime", "annual", "cloud_compare",
+                          "pareto", "uniformity", "validate", "layout", "aps_refinement", "soltrace_export",
+                          "validation_suite", "solver_benchmark", "layout_tradeoff", "scenarios", "scenario_aps",
+                          "preference_trial", "shading_check", "sunbins", "fetch_weather"}
+    if task == "realtime" and (directory / "realtime_frames.npz").is_file():
+        cached = st.session_state.get("history_realtime")
+        if not cached or cached.get("run_dir") != directory:
+            try:
+                st.session_state["history_realtime"] = wf.load_realtime_run(directory)
+            except Exception as exc:  # noqa: BLE001 - old archives can lack a complete frame set
+                st.error(f"无法恢复实时回放：{exc}")
+        restored = st.session_state.get("history_realtime")
+        if restored and restored.get("run_dir") == directory:
+            st.markdown("**时序仿真回放**")
+            _ops_replay(load_case(directory / "inputs_case.yaml"), historical=restored)
+    elif replayable:
+        job_key = f"history_replay_{run_key}"
+        if st.button("按冻结参数重新计算并补齐全部图表", key=f"start_{job_key}",
+                     disabled=st.session_state.get(f"job_{job_key}") is not None):
+            st.session_state[f"job_{job_key}"] = Job(wf.replay_run, directory, RESULTS, progress=True, cancel=True)
+            st.rerun()
+        if f"job_{job_key}" in st.session_state:
+            _job_status(job_key)
+        _job_error(job_key)
+        replay = st.session_state.get(f"res_{job_key}")
+        if replay:
+            st.success(f"完整复算已保存为新运行：{replay['run_dir']}")
+
+    charts_dir = directory / "visualizations"
+    index_path = charts_dir / "index.json"
+    charts = []
+    if index_path.is_file():
+        try:
+            charts = json.loads(index_path.read_text(encoding="utf-8")).get("charts", [])
+        except (OSError, ValueError):
+            st.warning("交互图目录索引损坏，可以从冻结输入重新计算以恢复图表。")
+    if charts:
+        labels = [f"{entry.get('title', entry['key'])} · {entry['key']}" for entry in charts]
+        selected = st.selectbox("交互图表", range(len(charts)), format_func=lambda index: labels[index],
+                                key=f"history_chart_{run_key}")
+        entry = charts[selected]
+        chart_path = charts_dir / entry["file"]
+        try:
+            with gzip.open(chart_path, "rt", encoding="utf-8") as stream:
+                figure_json = stream.read()
+            import plotly.io as pio
+
+            figure = pio.from_json(figure_json)
+            html = pio.to_html(figure, include_plotlyjs="cdn", full_html=True,
+                               config={"responsive": True, "displaylogo": False})
+            components.html(html, height=int(figure.layout.height or 520), scrolling=True)
+        except (OSError, ValueError, KeyError) as exc:
+            st.error(f"无法读取交互图：{exc}")
+        with st.expander("交互图表归档"):
+            st.dataframe(pd.DataFrame([{"序号": i + 1, "图表": label} for i, label in enumerate(labels)]),
+                         hide_index=True)
+
+    pngs = sorted(directory.rglob("*.png"))
+    if pngs:
+        st.markdown("**静态分析图**")
+        image_tabs = st.tabs([str(path.relative_to(directory)) for path in pngs])
+        for tab, path in zip(image_tabs, pngs):
+            with tab:
+                st.image(str(path), width="stretch")
+
+    all_data_files = sorted(path for path in directory.rglob("*") if path.is_file() and path != index_path
+                            and path.suffix.lower() in {".csv", ".json", ".yaml", ".yml", ".npz"})
+    if all_data_files:
+        st.markdown("**保存的结果数据**")
+        groups = {
+            "数据表": [path for path in all_data_files if path.suffix.lower() == ".csv"],
+            "结果与配置": [path for path in all_data_files if path.suffix.lower() in {".json", ".yaml", ".yml"}],
+            "数组数据包": [path for path in all_data_files if path.suffix.lower() == ".npz"],
+        }
+        groups = {name: paths for name, paths in groups.items() if paths}
+        group = st.selectbox("数据类型", list(groups), key=f"history_data_group_{run_key}")
+        data_files = groups[group]
+        relative_names = [str(path.relative_to(directory)) for path in data_files]
+        data_name = st.selectbox("数据文件", relative_names, key=f"history_data_{run_key}")
+        data_path = directory / data_name
+        payload = _history_payload(data_path)
+        if isinstance(payload, pd.DataFrame):
+            st.dataframe(payload, hide_index=True, width="stretch", height=420)
+        elif payload is not None:
+            st.json(payload, expanded=False)
+        st.download_button("下载所选数据文件", data_path.read_bytes(), file_name=data_path.name,
+                           key=f"history_download_{run_key}_{safe_filename(data_name)}")
+
+    if (directory / "inputs_case.yaml").is_file():
+        with st.expander("本次输入参数"):
+            st.code((directory / "inputs_case.yaml").read_text(encoding="utf-8"), language="yaml")
+        if st.button("载入这次运行的输入参数", key=f"history_load_case_{run_key}"):
+            _load_into_state(yaml.safe_load((directory / "inputs_case.yaml").read_text(encoding="utf-8")), directory,
+                             {"kind": "run", "path": str(directory)})
+            st.rerun()
+
+
 def page_runs(case) -> None:
-    _hero("可追溯", "运行记录", "每次计算都保存当时的参数副本、结果表和图表。选择一条记录查看结果，或载入这份参数继续仿真。")
+    _hero("可追溯", "运行记录", "每次仿真的输入、图表、表格和逐镜结果都可从运行目录恢复。选择历史运行以完整浏览或复算。")
     runs = wf.list_runs(RESULTS)
     if runs.empty:
         st.info("还没有运行记录")
         return
     task_names = {"layout_value": "年度布局比较", "layout": "镜场生成", "snapshot": "单时刻基准", "aps": "APS 瞄准优化",
                   "realtime": "云影回放", "annual": "全年评估", "layout_opt": "布局优化",
-                  "uniformity": "均匀受热分析", "validate": "光线追迹校验",
-                  "pareto": "功率–均匀度曲线", "soltrace_export": "SolTrace 对标导出", "shading_check": "遮挡筛选复核",
-                  "sunbins": "代表太阳位置"}
-    status_names = {"done": "已完成", "ok": "约束通过", "infeasible": "不可执行",
-                    "uniformity_infeasible": "均匀度未达标", "capacity_shortfall": "场地容量不足",
-                    "constraint_violation": "几何约束不满足"}
-    shown = runs.drop(columns=["path"]).rename(
-        columns={"case": "算例", "run": "运行编号", "task": "计算任务", "status": "状态", "finished": "完成时间"})
-    shown["计算任务"] = shown["计算任务"].map(lambda value: task_names.get(value, value))
-    shown["状态"] = shown["状态"].map(lambda value: status_names.get(value, value))
-    ev = st.dataframe(shown, on_select="rerun", selection_mode="single-row", hide_index=True,
-                      key="runs_table")
-    rows = getattr(getattr(ev, "selection", None), "rows", None) or []
-    if rows:
-        d = Path(runs.loc[rows[0], "path"])
-        task = runs.loc[rows[0], "task"]
-        st.subheader(f"{task_names.get(task, task)} · {d.name}")
-        for j in sorted(d.glob("*.json")):
-            with st.expander(j.name):
-                st.json(json.loads(j.read_text(encoding="utf-8")))
-        for img in sorted(d.glob("*.png")):
-            st.image(str(img), caption=img.name, width="stretch")
-        if task == "layout_value" and (d / "layout_value.json").is_file():
-            key = f"replay_{d.name}_{d.parent.name}"
-            if st.button("用冻结的布局与工况重新求解", key=f"start_{key}", disabled=f"job_{key}" in st.session_state):
-                st.session_state[f"job_{key}"] = Job(wf.replay_layout_value, d, RESULTS, progress=True, cancel=True)
-                st.rerun()
-            if f"job_{key}" in st.session_state:
-                _job_status(key)
-            _job_error(key)
-            replay = st.session_state.get(f"res_{key}")
-            if replay and not replay["ranking"].empty:
-                st.dataframe(_ranking_table(replay["ranking"]), hide_index=True)
-                st.caption(f"复算结果目录 {replay['run_dir']}")
-        if (d / "inputs_case.yaml").exists():
-            if st.button("载入这次运行的输入参数"):
-                _load_into_state(yaml.safe_load((d / "inputs_case.yaml").read_text(encoding="utf-8")), d,
-                                 {"kind": "run", "path": str(d)})
-                st.rerun()
+                  "uniformity": "均匀受热分析", "validate": "光线追迹校验", "pareto": "功率–均匀度曲线",
+                  "soltrace_export": "SolTrace 对标导出", "shading_check": "遮挡筛选复核", "sunbins": "代表太阳位置",
+                  "aps_refinement": "瞄准点加密", "scenario_aps": "年度工况 APS", "cloud_compare": "云影对比",
+                  "validation_suite": "压力工况复核", "solver_benchmark": "求解器对比", "layout_tradeoff": "布局权衡",
+                  "scenarios": "年度工况生成", "fetch_weather": "下载气象数据", "preference_trial": "偏好试算"}
+    task_filter = st.multiselect("仿真任务", sorted(runs["task"].dropna().unique()),
+                                 format_func=lambda task: task_names.get(task, task),
+                                 default=sorted(runs["task"].dropna().unique()), key="history_task_filter")
+    visible = runs[runs["task"].isin(task_filter)].reset_index(drop=True)
+    if visible.empty:
+        st.info("没有符合筛选条件的仿真")
+        return
+    shown = visible.drop(columns=["path"]).rename(
+        columns={"case": "算例", "run": "运行编号", "task": "仿真任务", "status": "状态", "finished": "完成时间"})
+    shown["仿真任务"] = shown["仿真任务"].map(lambda value: task_names.get(value, value))
+    selected = st.selectbox("选择要回看的仿真", range(len(visible)),
+                            format_func=lambda index: f"{shown.iloc[index]['完成时间']} · "
+                                                       f"{shown.iloc[index]['算例']} · {shown.iloc[index]['仿真任务']} · "
+                                                       f"{shown.iloc[index]['运行编号']}", key="history_run_pick")
+    st.dataframe(shown, hide_index=True, width="stretch", height=220)
+    _history_run_detail(visible.iloc[selected], task_names)
 
 
 GPU_ERROR_ZH = {

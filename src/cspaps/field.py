@@ -231,8 +231,10 @@ def generate(case: Case, kind: str, params: dict[str, Any]) -> np.ndarray:
         params["r_max"] = default_r_max(case)
     params.setdefault("r_min", max(case.field.exclusion_radius, rec.radius + case.heliostat.diagonal))
     # Every subset (including later swaps) inherits the site's minimum centre distance.
-    required = case.layout_opt.min_spacing_factor or case.layout_opt.fixed.get("spacing_factor", 1.1)
-    params["spacing_factor"] = max(params.get("spacing_factor", 1.1), required)
+    fixed = case.layout_opt.fixed or {}
+    required = case.layout_opt.min_spacing_factor or fixed.get("spacing_factor", 1.1)
+    params.setdefault("spacing_factor", fixed.get("spacing_factor", 1.1))
+    params["spacing_factor"] = max(params["spacing_factor"], required)
     xy = GENERATORS[kind](case.heliostat, (rec.center[0], rec.center[1]), rec.center[2], **params)
     xy = remove_collisions(xy, required * case.heliostat.diagonal)
     xyz = np.column_stack([xy, np.full(len(xy), case.heliostat.pivot_height)])

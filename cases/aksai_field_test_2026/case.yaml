@@ -39,7 +39,7 @@ atmosphere:
 
 weather:
   source: file
-  file: nasa_power_dni_2026.csv
+  file: /mnt/data/YLX/APS/csp-aps/cases/aksai_field_test_2026/nasa_power_dni_2026.csv
 
 shading:
   enabled: true
@@ -47,7 +47,7 @@ shading:
   tower_shadow: true
 
 field:
-  layout_file: layout_full.csv
+  layout_file: /mnt/data/YLX/APS/csp-aps/cases/aksai_field_test_2026/layout_full.csv
   exclusion_radius: 0
 
 aps:

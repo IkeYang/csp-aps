@@ -86,12 +86,13 @@ class RealtimeResult:
                 "max_defocused": int(g["n_defocused"].max()),
             }
             if lat.size:
+                reasons = g["plan_reasons"].astype(object).where(g["plan_reasons"].notna(), "")
                 item.update({
                     "engine_latency_p50_s": round(float(np.percentile(lat, 50)), 3),
                     "engine_latency_p95_s": round(float(np.percentile(lat, 95)), 3),
                     "engine_latency_max_s": round(float(lat.max()), 3),
                     "cold_builds": int((~g["response_reused"].dropna().astype(bool)).sum()),
-                    "timeouts": int(g["plan_reasons"].fillna("").str.contains("solve_timeout").sum()),
+                    "timeouts": int(reasons.astype(str).str.contains("solve_timeout").sum()),
                     "plan_states": g["plan_state"].value_counts().to_dict(),
                 })
             out[strat] = item
