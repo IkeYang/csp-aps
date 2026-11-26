@@ -201,8 +201,8 @@ def _safe_console() -> None:
 
 
 def _move_args(sp) -> None:
-    sp.add_argument("--initial-aim", choices=["spread", "kfactor", "center", "none"], default=None,
-                    help="initial plan without --prev-aims (default from the case: spread)")
+    sp.add_argument("--initial-aim", choices=["center", "spread", "kfactor", "none"], default=None,
+                    help="initial plan without --prev-aims (default from the case: center)")
     sp.add_argument("--move-penalty", type=float, default=None,
                     help="power fraction a mirror must gain per metre of aim shift from its initial aim (default 0.001)")
     sp.add_argument("--max-shift", type=float, default=None, help="hard limit of the aim shift from the initial state (m)")

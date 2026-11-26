@@ -26,7 +26,7 @@ def parse_power_csv(text: str, timezone: str, year: int) -> tuple[pd.DataFrame, 
         start = next(i for i, line in enumerate(lines) if line.strip().upper().startswith("YEAR,"))
     except StopIteration as exc:
         raise ValueError("not a NASA POWER hourly CSV (no YEAR,MO,DY,HR header)") from exc
-    df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+    df = pd.read_csv(io.StringIO("\n".join(lines[start:])), float_precision="round_trip")
     col = next((c for c in df.columns if c.upper().startswith("ALLSKY_SFC_SW_DNI")), None)
     if col is None:
         raise ValueError("NASA POWER CSV has no ALLSKY_SFC_SW_DNI column")

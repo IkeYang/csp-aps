@@ -328,7 +328,7 @@ def save_library(maps: dict[str, DNIMap], folder) -> dict:
 
 def load_library(folder) -> dict[str, DNIMap]:
     folder = Path(folder)
-    df = pd.read_csv(folder / "dni_maps.csv")
+    df = pd.read_csv(folder / "dni_maps.csv", float_precision="round_trip")
     meta = json.loads((folder / "dni_maps.json").read_text(encoding="utf-8"))
     out = {}
     for map_id, g in df.groupby("map_id", sort=False):

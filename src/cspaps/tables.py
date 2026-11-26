@@ -26,7 +26,8 @@ def decode_bytes(data: bytes) -> tuple[str, str]:
 
 
 def read_user_csv(src, lower_header: bool = True, **kwargs) -> pd.DataFrame:
-    """``pd.read_csv`` for a path or an uploaded file object, independent of the file's encoding.
+    """``pd.read_csv`` for a path or an uploaded file object, independent of the file's encoding; floats are
+    parsed exactly (round trip), so saved layouts, maps and plans reproduce bit-identical results.
 
     Header names are stripped (and lower-cased unless ``lower_header`` is False) so that "X , Y ,DNI"
     from a spreadsheet matches the documented columns x, y, dni."""
@@ -40,6 +41,7 @@ def read_user_csv(src, lower_header: bool = True, **kwargs) -> pd.DataFrame:
     else:
         data = Path(src).read_bytes()
     text = data if isinstance(data, str) else decode_bytes(data)[0]
+    kwargs.setdefault("float_precision", "round_trip")  # exact floats (pandas' default parser can be 1 ulp off)
     df = pd.read_csv(io.StringIO(text), **kwargs)
     names = [str(c).strip() for c in df.columns]
     df.columns = [c.lower() for c in names] if lower_header else names

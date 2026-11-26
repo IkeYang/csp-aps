@@ -583,7 +583,7 @@ def solve_spread(prob: AimProblem, k_sigma: float = SPREAD_K_SIGMA, sector_deg: 
     return np.where(prob.available, choice, -1)
 
 
-def initial_plan(prob: AimProblem, mode: str = "spread") -> np.ndarray | None:
+def initial_plan(prob: AimProblem, mode: str = "center") -> np.ndarray | None:
     """The initial aim plan of an offline solve without a working state: "spread" (``solve_spread``),
     "kfactor" (``solve_kfactor``), "center", or "none" (no initial plan: cold start, no move pricing)."""
     if mode == "none":
@@ -594,7 +594,7 @@ def initial_plan(prob: AimProblem, mode: str = "spread") -> np.ndarray | None:
         return solve_kfactor(prob)[0]
     if mode == "center":
         return solve_center(prob)
-    raise ValueError(f"Unknown initial aim '{mode}' (spread, kfactor, center, none)")
+    raise ValueError(f"Unknown initial aim '{mode}' (center, spread, kfactor, none)")
 
 
 def move_cost(prob: AimProblem, prev_xyz: np.ndarray | None, prev_active=None, spec: APSSpec | None = None):

@@ -187,7 +187,7 @@ def test_trade_off_starts_from_the_initial_state(small_case, tmp_path):
     case.receiver.height = 16.0
     out = task_pareto(case, tmp_path, "2025-06-21 11:00", lambdas=[0.0, 0.3], certify=False)
     s = out["summary"]
-    assert s["initial_state"]["source"] == "spread"
+    assert s["initial_state"]["source"] == "center"
     assert "initial_incident_kw_m2" in out["flux"]
     assert all(r["mean_shift_m"] is not None for r in s["curve"])
     free = case.copy()
@@ -195,6 +195,24 @@ def test_trade_off_starts_from_the_initial_state(small_case, tmp_path):
     s0 = task_pareto(free, tmp_path, "2025-06-21 11:00", lambdas=[0.0], certify=False)["summary"]
     # the price keeps lambda = 0 closer to the initial plan than free moves do
     assert s["curve"][0]["mean_shift_m"] <= s0["curve"][0]["mean_shift_m"] + 1e-9
+
+
+def test_lambda_zero_hotspot_stays_at_mid_height(small_case, tmp_path):
+    """Field feedback: at lambda = 0 the hotspot belongs in the middle of the receiver. The default initial state
+    puts every mirror on the equator, so the verified hotspot of the lambda = 0 plan stays at mid-height; without
+    an initial state (or from the spread plan) the power-first plan lifts it, because higher aims lose less to
+    blocking and cosine on this case."""
+    case = small_case
+    case.receiver.height = 16.0
+    assert case.aps.initial_aim == "center"  # the default
+    zc = case.receiver.center[2]
+    row = task_pareto(case, tmp_path, "2025-06-21 11:00", lambdas=[0.0], certify=False)["summary"]["curve"][0]
+    assert abs(row["hotspot_z_m"] - zc) <= 0.5
+    cold = case.copy()
+    cold.aps.initial_aim = "none"
+    row0 = task_pareto(cold, tmp_path, "2025-06-21 11:00", lambdas=[0.0], certify=False)["summary"]["curve"][0]
+    assert row0["hotspot_z_m"] - zc > 2.0
+    assert row["power_abs_mw"] >= 0.99 * row0["power_abs_mw"]  # the centred plan costs little power
 
 
 def test_working_state_round_trip(pair, tmp_path):

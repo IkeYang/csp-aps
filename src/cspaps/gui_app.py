@@ -192,7 +192,7 @@ CHOICES = {
     "sun.shape": ["gaussian", "pillbox"], "sun.dni_model": ["meinel", "constant"],
     "atmosphere.model": ["vittitoe_biggs_clear", "vittitoe_biggs_hazy", "beer_lambert"],
     "weather.source": ["clear_sky", "file"], "aps.method": ["greedy", "kfactor", "center", "milp", "subfield"],
-    "aps.initial_aim": ["spread", "kfactor", "center", "none"],
+    "aps.initial_aim": ["center", "spread", "kfactor", "none"],
     "uniformity.mode": ["cv_limit", "weighted"],
     "annual.method": ["sun_bins", "sun_grid", "representative_days", "hourly"],
     "annual.aiming": ["center", "greedy", "kfactor"], "layout_opt.generator": ["radial_staggered", "biomimetic"],
@@ -217,8 +217,9 @@ CHOICES = {
     "layout_opt.search_method": ["de", "bayes"],
 }
 CHOICE_LABELS = {
-    "aps.initial_aim": {"spread": "均布瞄准（推荐）：按光斑大小铺满吸热器高度", "kfactor": "瞄准因子：上下两条带",
-                        "center": "全部瞄吸热器中心", "none": "不设初始状态（纯功率最优，可能集中到一侧）"},
+    "aps.initial_aim": {"center": "全部瞄吸热器中心（推荐）：热斑在中间，按需向上下分散",
+                        "spread": "均布瞄准：按光斑大小铺满吸热器高度", "kfactor": "瞄准因子：上下两条带",
+                        "none": "不设初始状态（纯功率最优，可能集中到一侧）"},
     "layout_opt.uniformity_metric": {"circumferential": "管屏之间（周向）", "surface": "整个考核区（二维热流）"},
     "sun.shape": {"gaussian": "高斯太阳盘", "pillbox": "均匀圆盘"},
     "sun.dni_model": {"meinel": "Meinel 晴空模型", "constant": "固定 DNI"},
@@ -269,9 +270,10 @@ HELP = {
     "weather.file": "EPW 文件或两列 CSV（time,dni）。DNI 单位 W/m²，时间需注明时区或按场址时区解释。",
     "aps.method": "瞄准算法为每面镜子选择接收器表面的位置。贪心法适合大镜场，小规模 MILP 可作候选集精确基准。",
     "aps.safety_margin": "相对设备通量上限预留的比例。例如 0.05 表示优化目标不超过上限的 95%。",
-    "aps.initial_aim": "没有上传运行状态时，方案从这个初始瞄准出发，并对偏离它的移动计价。均布瞄准：每面镜瞄自己正对的方位，"
-                       "每个方位扇区的镜子按允许热流把功率平均分到各个高度，大光斑（远镜）靠中间、小光斑（近镜）可用上下边缘，"
-                       "光斑始终留在吸热器上（2σ）。",
+    "aps.initial_aim": "没有上传运行状态时，方案从这个初始瞄准出发，并对偏离它的移动计价。全部瞄中心（推荐）：每面镜先瞄吸热器"
+                       "中部（赤道），只在热流上限或目标（功率、λ·均匀度）值得时才向上下移开，λ = 0 时热斑在中间，λ 越大越分散。"
+                       "均布瞄准：每个方位扇区的镜子按允许热流把功率平均分到各个高度，λ = 0 时就比较平，但热斑位置由遮挡决定"
+                       "（本站抬高瞄准点能少被前排挡住，热斑常在上部）。",
     "aps.move_penalty_per_m": "一面镜的瞄准点每离开初始状态 1 m，至少要多换来这个比例的该镜功率才值得移动。0.001 = 每米 0.1%，"
                               "移动 15 m 要多 1.5%。0 = 移动不计代价（λ = 0 时会全部移到单镜功率最大的位置）。",
     "aps.max_aim_shift_m": "硬约束：相对初始状态，瞄准点在吸热器表面最多移动这么远（米）。0 = 不限。",
@@ -2446,7 +2448,7 @@ def _moves_tab(case, res: dict) -> None:
     init, moves = s.get("initial_state"), s.get("moves")
     if not init or not moves:
         st.info("本次没有初始状态：方案从零开始（初始瞄准方案设为“不设初始状态”，或用了中心瞄准）。"
-                "上传当前运行的瞄准方案，或选择“均布瞄准”作为初始瞄准方案，就能看到每面镜的移动。")
+                "上传当前运行的瞄准方案，或选一个初始瞄准方案（如“全部瞄吸热器中心”），就能看到每面镜的移动。")
         return
     src = INITIAL_SOURCE_ZH.get(init["source"], init["source"])
     _section(None, f"初始状态：{src}",
@@ -2505,7 +2507,10 @@ def _initial_state_inputs(case):
                                                   "上传后以它为初始状态，下面的移动代价和移动上限都相对它计算。")
     if up_prev is None:
         _fields("aps", ["initial_aim"], n_cols=1)
-        if (case.aps.initial_aim if case else "spread") == "none":
+        if (case.aps.initial_aim if case else "center") == "spread":
+            st.caption("均布瞄准：λ = 0 时热流已经铺满高度；本站遮挡较重，抬高瞄准点能少被前排挡住，所以热斑常落在上部。"
+                       "想让热斑在中间、随 λ 增大再展开，选“全部瞄吸热器中心”。")
+        if (case.aps.initial_aim if case else "center") == "none":
             _callout("warn", "没有初始状态", "λ = 0 时每面镜各自选单镜功率最大的瞄准点。本站遮挡较重时，抬高瞄准点能少被前排挡住，"
                      "方案会把大部分镜子集中到吸热器上部；移动代价与移动上限都不起作用。")
     else:

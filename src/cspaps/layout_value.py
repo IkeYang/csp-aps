@@ -576,12 +576,12 @@ def _jsonable(obj):
 def recompute_from_csv(path, lam_l: float | None = None, land_weight: float = 0.0) -> dict:
     """V, E, Pi from an exported ``scenario_values.csv`` alone (the audit path); with ``land_weight`` also
     J = V - kappa A from the ``layout.csv`` next to it."""
-    t = pd.read_csv(path)
+    t = pd.read_csv(path, float_precision="round_trip")  # exact floats: the default parser can be 1 ulp off
     lam = float(t["lambda_layout"].iloc[0]) if lam_l is None and len(t) else float(lam_l or 0.0)
     out = {**annual_value(t, lam), "lambda_layout": lam}
     layout = Path(path).with_name("layout.csv")
     if layout.exists():
-        area = land_area_ha(pd.read_csv(layout)[["x", "y", "z"]].to_numpy(float))
+        area = land_area_ha(pd.read_csv(layout, float_precision="round_trip")[["x", "y", "z"]].to_numpy(float))
         out.update(land_ha=area, land_weight=float(land_weight), land_penalty_mwh=float(land_weight) * area,
                    objective_mwh=out["value_mwh"] - float(land_weight) * area)
     return out

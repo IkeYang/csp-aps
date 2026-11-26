@@ -136,7 +136,7 @@ def write_aims_csv(path: Path, fld: Field, case: Case, aim, active, extra: dict 
 
 def read_aims_csv(path, fld: Field | None = None) -> tuple[tuple[np.ndarray, np.ndarray], np.ndarray]:
     """Aims from a CSV; rows are matched to the field by ``id`` when both are available."""
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, float_precision="round_trip")
     if fld is not None and "id" in df:
         df = df.set_index("id").loc[fld.ids].reset_index()
     active = df["active"].to_numpy(bool) if "active" in df else np.ones(len(df), bool)
@@ -670,7 +670,7 @@ def load_realtime_run(folder: str | Path) -> dict:
     table_path = folder / "realtime_timeseries.csv"
     frames_path = folder / "realtime_frames.npz"
     summary_path = folder / "realtime.json"
-    table = pd.read_csv(table_path, keep_default_na=False, na_values=[""])
+    table = pd.read_csv(table_path, keep_default_na=False, na_values=[""], float_precision="round_trip")
     table["time"] = pd.to_datetime(table["time"], utc=True).dt.tz_convert(case.site.timezone)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     with np.load(frames_path, allow_pickle=False) as archive:

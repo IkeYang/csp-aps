@@ -49,7 +49,7 @@ def test_initial_state_card_and_move_settings(solved):
     at = solved()
     text = _text(at)
     assert "初始状态与镜面移动" in text
-    assert at.selectbox(key="1:aps.initial_aim").value == "spread"
+    assert at.selectbox(key="1:aps.initial_aim").value == "center"
     labels = [n.label for n in at.number_input]
     assert any(label.startswith("移动代价") for label in labels)
     assert any(label.startswith("瞄准点最大移动") for label in labels)
@@ -99,8 +99,8 @@ def test_moves_tab_compares_initial_and_final(solved):
     keys = _charts(at)
     assert {"mv_flux0", "mv_flux1", "mv_aims", "mv_hist"} <= set(keys)
     s = at.session_state["res_single"]["summary"]
-    assert s["initial_state"]["source"] == "spread" and s["moves"]["within_limits"]
-    assert "初始状态：均布瞄准" in _text(at)
+    assert s["initial_state"]["source"] == "center" and s["moves"]["within_limits"]
+    assert "初始状态：全部瞄中心" in _text(at)
 
 
 def test_without_initial_state_the_page_says_so(solved):

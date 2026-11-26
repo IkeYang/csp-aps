@@ -158,9 +158,11 @@ class APSSpec:
     passes: int = 3  # improvement passes after the greedy construction
     tie_tolerance: float = 0.005  # candidates within this power fraction count as ties
     # Initial state and mirror moves. A plan starts from the working state (uploaded aims) or, without one,
-    # from ``initial_aim`` (offline single-instant runs): "spread" = the image-size balanced plan that uses
-    # the whole receiver height, "kfactor", "center", "none" = cold start without an initial state.
-    initial_aim: str = "spread"
+    # from ``initial_aim`` (offline single-instant runs): "center" = every mirror on the receiver's equator, so
+    # power-first plans keep the hotspot at mid-height and spread only as far as the flux limit and the
+    # objective pay for; "spread" = the image-size balanced plan over the whole height; "kfactor"; "none" =
+    # cold start without an initial state.
+    initial_aim: str = "center"
     # power fraction a mirror must gain per metre of aim shift away from its initial aim (0 = moves are free);
     # also the smoothing of the real-time engine (from the executed plan)
     move_penalty_per_m: float = 0.001

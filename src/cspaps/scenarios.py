@@ -534,7 +534,7 @@ def load_folder(folder) -> ScenarioSet:
     """A scenario set saved by ``ScenarioSet.save`` (scenarios.csv + dni_maps.*)."""
     folder = Path(folder)
     maps = load_library(folder)
-    df = pd.read_csv(folder / "scenarios.csv")
+    df = pd.read_csv(folder / "scenarios.csv", float_precision="round_trip")  # exact floats
     order = list(dict.fromkeys(df["map_id"].astype(str)))
     idx = np.array([order.index(m) for m in df["map_id"].astype(str)], dtype=int)
     samples = sun.Samples(df["elevation_deg"].to_numpy(float), df["azimuth_deg"].to_numpy(float),
@@ -551,7 +551,7 @@ def load_folder(folder) -> ScenarioSet:
         raise ValueError(f"{folder}: scenario set fingerprint mismatch (files edited after saving?)")
     hp = folder / "hourly_members.csv"
     if hp.exists():
-        h = pd.read_csv(hp)
+        h = pd.read_csv(hp, float_precision="round_trip")
         known = [m for m in dict.fromkeys(h["map_id"].astype(str)) if m in maps]
         h = h[h["map_id"].astype(str).isin(known)]
         hourly = sun.Samples(h["elevation_deg"].to_numpy(float), h["azimuth_deg"].to_numpy(float),
