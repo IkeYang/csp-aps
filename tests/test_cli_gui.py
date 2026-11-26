@@ -208,6 +208,7 @@ def test_single_result_keeps_completed_objective(monkeypatch, tmp_path):
     assert not at.exception
     curve = at.session_state["res_pareto"]["summary"]["curve"]
     assert [r["lambda"] for r in curve] == [0.0, 0.5] and curve[1]["cv_2d"] <= curve[0]["cv_2d"]
+    assert any("本次初始方案：均布瞄准" in c.value for c in at.caption)  # the trade-off names its initial plan
     at.radio(key="aps_goal:1").set_value("cv_limit").run()
     at.number_input(key="1:uniformity.max_cv").set_value(0.01).run()
     at.button(key="btn_single").click().run()

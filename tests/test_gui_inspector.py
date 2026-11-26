@@ -49,7 +49,10 @@ def test_initial_state_card_and_move_settings(solved):
     at = solved()
     text = _text(at)
     assert "初始状态与镜面移动" in text
-    assert at.selectbox(key="1:aps.initial_aim").value == "center"
+    choice = at.radio(key="1:aps.initial_aim")
+    assert choice.value == "spread" and list(choice.options) == ["均布瞄准（推荐）", "全部瞄中心", "不设初始状态（纯功率）"]
+    assert "三种初始方案有什么不同？怎么选" in [e.label for e in at.expander]
+    assert "瞄哪儿都差不多的镜子" in text and "初始方案：均布瞄准" in text  # the guide and the result label
     labels = [n.label for n in at.number_input]
     assert any(label.startswith("移动代价") for label in labels)
     assert any(label.startswith("瞄准点最大移动") for label in labels)
@@ -99,8 +102,19 @@ def test_moves_tab_compares_initial_and_final(solved):
     keys = _charts(at)
     assert {"mv_flux0", "mv_flux1", "mv_aims", "mv_hist"} <= set(keys)
     s = at.session_state["res_single"]["summary"]
-    assert s["initial_state"]["source"] == "center" and s["moves"]["within_limits"]
-    assert "初始状态：全部瞄中心" in _text(at)
+    assert s["initial_state"]["source"] == "spread" and s["moves"]["within_limits"]
+    assert "初始状态：均布瞄准" in _text(at)
+
+
+def test_picking_an_initial_plan_changes_the_case_and_the_result(solved):
+    at = solved()
+    at.radio(key="1:aps.initial_aim").set_value("center").run()
+    assert not at.exception and at.session_state["case_dict"]["aps"]["initial_aim"] == "center"
+    at.button(key="btn_single").click().run()
+    assert not at.exception
+    assert at.session_state["res_single"]["summary"]["initial_state"]["source"] == "center"
+    text = _text(at)
+    assert "初始方案：全部瞄中心" in text and "初始状态：全部瞄中心" in text
 
 
 def test_without_initial_state_the_page_says_so(solved):

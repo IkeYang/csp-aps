@@ -11,6 +11,7 @@
   - 瞄准结果：“全场叠加热流”（全部工作镜叠加的热流图、管屏柱状图、周向与高度分布、CV 与细网格复核峰值）排在第一位，不画瞄准点；瞄准点叠加图的底图同样是全场热流，抽样只用于画瞄准点和光斑圈（`gui_app._full_field_flux`，`gui_plots.tradeoff_profiles(labels=...)`）。
   - 气象文件范围检查：`sun.weather_coverage`、`sun.weather_dni_at`（超出 max(1 h, 1.5 × 间隔) 即报错），`simulate.sun_state` 不再静默取最近记录；界面时刻默认落在文件内（`_default_time`）、显示覆盖时段、超出时报错并停用开始按钮（`_weather_window`）。
   - 证书内存保护：`certify.model_bytes` / `check_model_memory` / `CertificateTooLarge`（48 字节 / 非零项，留 max(2 GB, 15%) 内存）；`task_aim` 跳过证书并在结果中说明（`certificate_skipped`），`task_pareto` 关闭证书，通量价格换位改用能量定价；`layout_value.solve_instant` 只按固定的 8 GB 规模判断（`FORMAL_CERTIFY_MAX_BYTES`），与机器无关、结果可复现。
+- **初始瞄准方案三选一**：瞄准优化页第 2 步用单选列出均布瞄准（推荐）、全部瞄中心、不设初始状态，每项下面写明 λ = 0 时会得到什么；“三种初始方案有什么不同？怎么选”说明两类镜子（对高度敏感的移到最佳高度，瞄哪儿都差不多的留在初始位置）、对比表和现场例子（`gui_app.INITIAL_AIM_GUIDE`、`_initial_aim_choice`）。单时刻结果与权衡曲线写明所用初始方案。默认仍为均布瞄准。测试 `test_the_three_initial_plans_behave_as_the_guide_says` 检查说明里的结论（中心方案热斑在中部、均布峰值最低、不设初始状态功率最高、功率差 < 1%）。
 - **CSV 读入逐位精确**：程序读的全部 CSV（镜场与布局、DNI 图、情景集、运行方案、气象、导出记录、回放表；`tables.read_user_csv` 及各处 `read_csv`）按 round-trip 精度解析。pandas 3 的默认解析器个别数会差 1 ulp，导致保存后重载的布局、情景和导出记录复算的结果末几位不同，违反“同一布局 + 情景集 + 设置 → 逐位相同”。
 - **云来云去：回放讲清楚发生了什么**
   - 子采样（`realtime.substep_s`，默认 15 s；`realtime.replay_samples`）：两个控制时刻之间方案保持、按真实 DNI 重算并在细网格上复核；控制时刻的决策与旧实现逐位相同（先按控制时刻算出各策略全部方案，再并行评价全部采样，`annual.workers`）。每行新增 `control`、`control_index`、`dni_clear_w_m2`、`cloud_cover`、`p_absorbed_clear_mw`（同一方案、晴空 DNI，按逐镜效率精确换算）；帧里保存云影几何（`realtime.cloud_shapes`）；汇总新增晴空参考热量、云损失、换瞄准点与散焦指令总数（只计控制时刻）。
@@ -22,7 +23,7 @@
   - 正式排名只有一套可排名布局时不再出错，改为显示它的逐工况结果。
   - 审计修正：现场算例 `case.yaml` 恢复相对路径（分支里是学生机器上的绝对路径）；回放恢复的时长按单一策略的保持时段计（原来把各策略的行加在一起，3 个策略时是 3 倍）；回放帧另存细网格复核结果，恢复后的热点位置与原来一致（原来取粗网格最大值）；运行状态恢复中文。
 - **第二轮现场反馈**
-  - 初始状态与移动：单时刻计算从初始状态出发（上传的运行方案，否则 `aps.initial_aim`，默认 `center` 全部瞄中心，λ = 0 时热斑在中部；可选 `spread` 均布瞄准：`aps.solve_spread`、`spread_levels`，本站从它出发的 λ = 0 方案热斑在上部 167 m，所以不作默认）；移动代价 `aps.move_penalty_per_m` 默认 0.001（原 0）；硬约束 `aps.max_aim_shift_m`、`aps.max_rotation_deg`（`aps.move_limits`，写入 `prob.reach`）；贪心平局先比移动距离（`TIE_MOVE_STEP_M`，编译内核同步）。计价进入贪心、子场分解、MILP（`solve_milp(cost=…)`）、松弛取整的接受、联合姿态搜索（`search_joint_poses(move_cost=…)`，穷举上界取最大不计价目标）。结果 `initial_state`、`moves`（`aps.move_stats`：移动、转角、上限）、`certificate.move_cost_mw`；逐镜 CSV 增加初始瞄准、`aim_shift_m`、`rotation_deg`；`task_pareto(prev_aims=…)`。全年布局价值不变。
+  - 初始状态与移动：单时刻计算从初始状态出发（上传的运行方案，否则 `aps.initial_aim`：`spread` 均布瞄准（默认，`aps.solve_spread`、`spread_levels`）、`center` 全部瞄中心、`none` 不设初始状态，另有 `kfactor` 作对照）；移动代价 `aps.move_penalty_per_m` 默认 0.001（原 0）；硬约束 `aps.max_aim_shift_m`、`aps.max_rotation_deg`（`aps.move_limits`，写入 `prob.reach`）；贪心平局先比移动距离（`TIE_MOVE_STEP_M`，编译内核同步）。计价进入贪心、子场分解、MILP（`solve_milp(cost=…)`）、松弛取整的接受、联合姿态搜索（`search_joint_poses(move_cost=…)`，穷举上界取最大不计价目标）。结果 `initial_state`、`moves`（`aps.move_stats`：移动、转角、上限）、`certificate.move_cost_mw`；逐镜 CSV 增加初始瞄准、`aim_shift_m`、`rotation_deg`；`task_pareto(prev_aims=…)`。全年布局价值不变。
   - 单镜详情（`simulate.mirror_detail`、`occlusion_detail`，`gui_plots.mirror_path_3d`、`mirror_closeup_3d`、`mirror_spot_map`、`mirror_factor_chart`）：点镜场图或输入编号，看全光路（真实比例、视线垂直于入射面）、镜面近景（相邻镜按各自姿态、8×8 采样点的遮挡状态、挡它的镜子）、效率链与全场平均、功率链、光斑与移动。
   - 镜场与效率：按光学效率及各项因子着色，按距离段 / 方位的平均值表和原因说明。初始状态与移动页：移动统计、初始与本方案热流对比、移动箭头、分布图。
   - 界面样式：网格底纹、渐变描边卡片、深色指标卡（等宽数字）、胶囊标签页（适配 Streamlit 1.67 的标签结构）、深色三维视窗。

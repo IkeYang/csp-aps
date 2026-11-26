@@ -158,11 +158,12 @@ class APSSpec:
     passes: int = 3  # improvement passes after the greedy construction
     tie_tolerance: float = 0.005  # candidates within this power fraction count as ties
     # Initial state and mirror moves. A plan starts from the working state (uploaded aims) or, without one,
-    # from ``initial_aim`` (offline single-instant runs): "center" = every mirror on the receiver's equator, so
-    # power-first plans keep the hotspot at mid-height and spread only as far as the flux limit and the
-    # objective pay for; "spread" = the image-size balanced plan over the whole height; "kfactor"; "none" =
-    # cold start without an initial state.
-    initial_aim: str = "center"
+    # from ``initial_aim`` (offline single-instant runs). The mirrors whose power hardly depends on the aim
+    # height stay where the initial plan puts them (moving does not pay), so it shapes the lambda = 0 flux:
+    # "spread" = the image-size balanced plan over the whole height (lowest peak, most uniform); "center" =
+    # every mirror on the equator (hotspot at mid-height, peak up to the limit); "none" = cold start, every
+    # mirror on its own best aim (highest power); "kfactor" = two bands (kept for comparison).
+    initial_aim: str = "spread"
     # power fraction a mirror must gain per metre of aim shift away from its initial aim (0 = moves are free);
     # also the smoothing of the real-time engine (from the executed plan)
     move_penalty_per_m: float = 0.001
@@ -618,8 +619,8 @@ def _validate(case: Case) -> None:
         raise ValueError("aps.safety_margin must be in [0, 1)")
     if case.aps.method not in ("center", "kfactor", "greedy", "milp", "subfield"):
         raise ValueError(f"aps.method '{case.aps.method}' not in center|kfactor|greedy|milp|subfield")
-    if case.aps.initial_aim not in ("spread", "kfactor", "center", "none"):
-        raise ValueError(f"aps.initial_aim '{case.aps.initial_aim}' not in spread|kfactor|center|none")
+    if case.aps.initial_aim not in ("spread", "center", "none", "kfactor"):
+        raise ValueError(f"aps.initial_aim '{case.aps.initial_aim}' not in spread|center|none|kfactor")
     if case.aps.move_penalty_per_m < 0 or case.aps.max_aim_shift_m < 0 or case.aps.max_rotation_deg < 0:
         raise ValueError("aps.move_penalty_per_m, aps.max_aim_shift_m and aps.max_rotation_deg must be >= 0")
     if case.realtime.substep_s < 0:
