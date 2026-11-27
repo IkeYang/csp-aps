@@ -716,7 +716,10 @@ def optimize_layout(
     nw = n_workers(spec.workers)
     # the Bayesian search opens its own pools; an idle DE pool kept alive meanwhile would also make every
     # nested pool start with forkserver (pool helper threads running)
-    pl = pool(nw, probe=obj) if nw > 1 and spec.search_method != "bayes" else None
+    from .aps import candidate_count, problem_memory_bytes
+
+    per_worker = problem_memory_bytes(spec.n_heliostats, candidate_count(case.aps)) if spec.n_heliostats else None
+    pl = pool(nw, probe=obj, per_worker_bytes=per_worker) if nw > 1 and spec.search_method != "bayes" else None
     stage = {"name": "global"}
 
     def mapper(f, xs):

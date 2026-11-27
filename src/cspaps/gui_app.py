@@ -925,10 +925,15 @@ def _progress_zh(msg: str) -> str:
 
 
 def _job_error(key: str) -> None:
-    if st.session_state.get(f"err_{key}"):
-        st.error("计算失败")
+    err = st.session_state.get(f"err_{key}")
+    if err:
+        if "MemoryShortage" in str(err):
+            st.error("内存不够，这一步没有开始算（电脑本身没有受影响）。其他计算正占着内存，或这台电脑放不下这个规模："
+                     "可以等其他计算结束后再算、减少左侧“并行进程数”，或在参数设置里减少候选瞄准点。")
+        else:
+            st.error("计算失败")
         with st.expander("详细错误"):
-            st.code(st.session_state[f"err_{key}"])
+            st.code(err)
 
 
 def _contributors(case, fld, t, dni, aim, active, az, z, top=6):
@@ -4942,6 +4947,29 @@ def _gpu_models_text(devs: list[dict]) -> str:
     return "；".join(f"GPU {d['id']}：{m}" for d, m in zip(devs, models))
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def _field_size(case_yaml: str, base_dir: str) -> int | None:
+    """Mirrors of the loaded case's field (for the memory estimate of the compute resources)."""
+    try:
+        return int(build_field(case_from_dict(yaml.safe_load(case_yaml), base_dir=base_dir)).n)
+    except Exception:  # noqa: BLE001 - incomplete case: no estimate
+        return None
+
+
+def _memory_estimate() -> tuple[int | None, int | None, int | None]:
+    """(mirrors, aim problem bytes per process, certificate model bytes) of the loaded case."""
+    from cspaps.aps import CERTIFICATE_BYTES_PER_CANDIDATE, candidate_count, problem_memory_bytes
+
+    case, _ = _case()
+    if case is None:
+        return None, None, None
+    n = _field_size(yaml.safe_dump(st.session_state["case_dict"], allow_unicode=True), st.session_state["base_dir"])
+    if not n:
+        return None, None, None
+    k = candidate_count(case.aps)
+    return n, problem_memory_bytes(n, k), n * k * CERTIFICATE_BYTES_PER_CANDIDATE
+
+
 def _workers_now() -> int:
     """Parallel processes the scenario-level jobs will use (the case's layout setting, or the depth's choice)."""
     from cspaps.parallel import n_workers
@@ -5018,9 +5046,16 @@ def _resources() -> None:
                                  "显卡负责各进程的光斑核，所以进程数按 CPU 核数取，不按显卡数取。")
         if int(w) > avail:
             st.warning(f"{int(w)} 个进程超过了留出余量后的 {avail} 个 CPU，计算时电脑可能变卡。")
-        cap = memory_cap(int(w))
+        from cspaps.parallel import worker_memory_bytes
+
+        n_field, per_aim, cert = _memory_estimate()
+        per = worker_memory_bytes(per_aim)
+        cap = memory_cap(int(w), per_aim)
+        if n_field:
+            st.caption(f"当前镜场 {n_field:,} 面：每个进程求解时约占 {per / 2 ** 30:.1f} GB 内存；最优性证书另需约 "
+                       f"{cert / 2 ** 30:.0f} GB，多个进程同时要时按剩余内存排队，内存不够就跳过证书，不会把电脑内存用光。")
         if cap < int(w):
-            st.caption(f"按当前可用内存，最多同时启动 {cap} 个进程（每个按 1.5 GB 估计，留出 15% 内存；"
+            st.caption(f"按当前可用内存，最多同时启动 {cap} 个进程（每个按 {per / 2 ** 30:.1f} GB 估计，留出 15% 内存；"
                        "环境变量 CSPAPS_WORKER_MEM_GB 可改估计值）。")
         if int(w) != w_now:
             os.environ["CSPAPS_WORKERS"] = str(int(w))  # the depths use it too
@@ -5193,6 +5228,9 @@ def _missing_files_panel() -> None:
 def main() -> None:
     st.set_page_config(page_title="CSP-APS · 镜场与瞄准优化", page_icon="☀", layout="wide",
                        initial_sidebar_state="expanded")
+    from cspaps.memguard import prefer_oom_kill
+
+    prefer_oom_kill(500)  # out of memory: end this program (its workers first), not the desktop
     _apply_theme()
     if "case_dict" not in st.session_state:
         path = _initial_case_path()

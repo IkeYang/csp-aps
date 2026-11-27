@@ -32,6 +32,7 @@ Solvers:
 from __future__ import annotations
 
 import time as _time
+import weakref
 from dataclasses import dataclass, field as dc_field
 
 import numpy as np
@@ -174,7 +175,27 @@ def build_response(
     """Geometry, shading, intercept and sparse unit-DNI flux responses of all candidates.
 
     ``blockers`` (bool, N) limits the mirrors that shade / block others (candidate positions priced "as if
-    added" to a layout: every mirror sees the layout's mirrors only)."""
+    added" to a layout: every mirror sees the layout's mirrors only).
+
+    Its memory (``problem_memory_bytes``) is reserved machine-wide before anything is allocated and stays
+    reserved while the response set lives (``memguard``): any number of workers, GPUs or runs started side by
+    side share the free memory instead of each assuming all of it. ``memguard.MemoryShortage`` when it cannot
+    fit and no other calculation will free memory."""
+    from .memguard import reserve
+
+    hold = reserve(problem_memory_bytes(fld.n, candidate_count(spec or case.aps)), "aim problem")
+    try:
+        rs = _build_response(case, fld, sun_elevation, sun_azimuth, grid, spec, shading_points, chunk,
+                             store_occlusion_samples, blockers)
+    except BaseException:
+        hold.release()
+        raise
+    weakref.finalize(rs, hold.release)
+    return rs
+
+
+def _build_response(case, fld, sun_elevation, sun_azimuth, grid, spec, shading_points, chunk,
+                    store_occlusion_samples, blockers) -> ResponseSet:
     t0 = _time.perf_counter()
     spec = spec or case.aps
     rec, hel = case.receiver, case.heliostat
@@ -581,6 +602,26 @@ def solve_spread(prob: AimProblem, k_sigma: float = SPREAD_K_SIGMA, sector_deg: 
             choice[i] = ks[j]
             load[j] += weight[i]
     return np.where(prob.available, choice, -1)
+
+
+PROBLEM_BYTES_PER_CANDIDATE = 64_000  # per mirror and candidate aim: response set, efficiencies, solver state
+PROBLEM_BYTES_BASE = 2 ** 29
+# the certificate's model per mirror and candidate (``certify.model_bytes`` once built; 165-200 kB measured)
+CERTIFICATE_BYTES_PER_CANDIDATE = 200_000
+
+
+def problem_memory_bytes(n_mirrors: int, n_candidates: int) -> int:
+    """Peak memory of building and solving one aim problem (``build_problem`` + ``solve``), for sizing worker
+    pools. Measured on the Aksai field (773-3,385 mirrors, 9-21 candidates, receiver grids 32x16 to 128x64):
+    52-60 kB per mirror and candidate, independent of the grid; 11,960 mirrors x 21 candidates ~ 16 GB. The
+    optimality certificate's model (``certify.model_bytes``, ~165 kB per mirror and candidate) is reserved
+    separately when it is built."""
+    return int(PROBLEM_BYTES_BASE + int(n_mirrors) * int(n_candidates) * PROBLEM_BYTES_PER_CANDIDATE)
+
+
+def candidate_count(spec: APSSpec) -> int:
+    """Candidate aims per mirror: height levels x azimuth offsets."""
+    return int(spec.n_height_levels) * max(1, len(spec.azimuth_offsets_deg))
 
 
 def initial_plan(prob: AimProblem, mode: str = "spread") -> np.ndarray | None:

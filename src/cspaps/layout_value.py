@@ -624,6 +624,13 @@ def control_variate(case: Case, value: "LayoutValue", sset, workers: int | None 
     return True
 
 
+def _worker_bytes(case: Case, settings: InnerSettings, n_mirrors: int) -> int:
+    """Memory of one pool worker solving aim problems of ``n_mirrors`` with these inner settings."""
+    from .aps import candidate_count, problem_memory_bytes
+
+    return problem_memory_bytes(n_mirrors, candidate_count(inner_case(case, settings).aps))
+
+
 def _price_chunk(args):
     case, xyz, ids, cand, sset, chain, choices, settings, lam_l, max_iter = args
     from .aps import build_response, make_problem
@@ -693,7 +700,8 @@ def dual_prices(case: Case, value: "LayoutValue", cand_xyz: np.ndarray, sset, se
              for ch in chains]
     results = []
     if nw > 1 and len(tasks) > 1:
-        p = pool(nw, probe=(_price_chunk, tasks[0]))
+        # each worker: aim problem of layout + free positions; the certificate model is reserved when built
+        p = pool(nw, probe=(_price_chunk, tasks[0]), per_worker_bytes=_worker_bytes(case, settings, n + m))
         try:
             for k, part in enumerate(p.imap_unordered(_price_chunk, tasks), start=1):
                 results += part
@@ -879,7 +887,8 @@ def evaluate_layout_value(case: Case, xyz: np.ndarray, sset, name: str = "layout
     chains = scenario_chains(sset, settings)
     if nw > 1 and n_s_run > 1 and len(chains) > 1:
         tasks = [(case, xyz, ids, sset, chain, settings, keep_flux) for chain in chains]
-        p = pool(min(nw, len(tasks)), probe=(_scenario_chunk, tasks[0]))
+        p = pool(min(nw, len(tasks)), probe=(_scenario_chunk, tasks[0]),
+                 per_worker_bytes=_worker_bytes(case, settings, len(xyz)))
         try:
             done = 0
             for out in p.imap_unordered(_scenario_chunk, tasks):
@@ -976,7 +985,8 @@ def evaluate_layout_values(case: Case, layouts: dict, sset, settings: InnerSetti
     tasks = [(case, norm[n][0], norm[n][1], sset, chain, settings, keep_flux, n) for n in names for chain in chains]
     results = {n: [None] * len(sset) for n in names}
     if not stop():
-        p = pool(min(nw, len(tasks)), probe=(_layout_chunk, tasks[0]))
+        p = pool(min(nw, len(tasks)), probe=(_layout_chunk, tasks[0]),
+                 per_worker_bytes=_worker_bytes(case, settings, max(len(v[0]) for v in norm.values())))
         try:
             done = {n: 0 for n in names}
             for name, out in p.imap_unordered(_layout_chunk, tasks):

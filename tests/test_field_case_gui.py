@@ -327,6 +327,20 @@ def test_certificate_that_does_not_fit_is_skipped_not_swapped(monkeypatch, small
     with pytest.raises(CertificateTooLarge) as err:
         check_model_memory(prob)
     assert err.value.need_bytes == need
+    # room for the aim problem (reserved as well since the memory guard) but not for the certificate's model
+    from cspaps.aps import candidate_count, problem_memory_bytes
+
+    import json
+
+    problem = problem_memory_bytes(fld.n, candidate_count(small_case.aps))
+    ledger = tmp_path / "ledger"
+    monkeypatch.setenv("CSPAPS_MEMORY_LEDGER", str(ledger))
+
+    def free_memory():  # as on a real computer: the free memory drops by what the run has taken
+        held = sum(json.loads(f.read_text(encoding="utf-8"))["bytes"] for f in ledger.glob("*.json"))
+        return 2 * gb + problem + need // 2 - held, 8 * gb
+
+    monkeypatch.setattr(parallel, "memory_bytes", free_memory)
     res = wf.task_aim(small_case, tmp_path, "2025-06-21 13:00", method="greedy", certify=True)
     note = res["summary"]["certificate_skipped"]
     assert note["needed_gb"] >= 0 and res["summary"]["status"] in ("ok", "margin_reduced")

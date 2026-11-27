@@ -94,18 +94,27 @@ def memory_bytes() -> tuple[int, int] | None:
         return None
 
 
-def memory_cap(workers: int) -> int:
+def worker_memory_bytes(estimate: int | None = None) -> int:
+    """Memory assumed per worker process: ``CSPAPS_WORKER_MEM_GB`` when set, else the caller's estimate for its
+    work (e.g. ``aps.problem_memory_bytes`` for full-field aim problems), else 1.5 GB."""
+    raw = os.environ.get("CSPAPS_WORKER_MEM_GB", "").strip()
+    if raw:
+        try:
+            return int(float(raw) * 2 ** 30)
+        except ValueError:
+            pass
+    return int(estimate) if estimate else int(1.5 * 2 ** 30)
+
+
+def memory_cap(workers: int, per_worker_bytes: int | None = None) -> int:
     """At most as many worker processes as the free memory carries: each is assumed to need
-    ``CSPAPS_WORKER_MEM_GB`` (default 1.5; large fields need more), and max(2 GB, 15 % of RAM) stays free, so
-    the computer does not start swapping and freeze."""
+    ``worker_memory_bytes(per_worker_bytes)``, and max(2 GB, 15 % of RAM) stays free, so the computer does not
+    start swapping and freeze. Large models inside the workers are reserved on top of this (``memguard``)."""
     mem = memory_bytes()
     if mem is None:
         return workers
     avail, total = mem
-    try:
-        per = float(os.environ.get("CSPAPS_WORKER_MEM_GB", "1.5")) * 2 ** 30
-    except ValueError:
-        per = 1.5 * 2 ** 30
+    per = worker_memory_bytes(per_worker_bytes)
     reserve = max(2 * 2 ** 30, 0.15 * total)
     return max(1, min(int(workers), int((avail - reserve) // max(per, 1.0))))
 
@@ -134,8 +143,8 @@ def _picklable(obj) -> bool:
         return False
 
 
-def pool(workers: int, probe=None):
-    """A pool of ``workers``.
+def pool(workers: int, probe=None, per_worker_bytes: int | None = None):
+    """A pool of ``workers`` (at most as many as the free memory carries at ``per_worker_bytes`` each).
 
     Main thread: processes. Background thread (GUI jobs): threads by default, so that objects of
     hot-reloaded modules never cross a pickle boundary; with ``probe`` (the function and a typical
@@ -148,7 +157,7 @@ def pool(workers: int, probe=None):
         if forced != "process" and (probe is None or not _picklable(probe)):
             return ThreadPool(workers)
     ctx = mp.get_context(start_method())
-    workers = memory_cap(workers)  # leave memory to the system: no swapping
+    workers = memory_cap(workers, per_worker_bytes)  # leave memory to the system: no swapping
     # the parent's CSPAPS_* settings as they are now: a fork server keeps the environment it was started with
     env = {k: v for k, v in os.environ.items() if k.startswith("CSPAPS_") and k not in _PER_WORKER}
     return ctx.Pool(workers, initializer=_worker_init,
@@ -213,6 +222,9 @@ def _worker_init(env: dict, counter, n_workers: int, threads: int = 1) -> None:
     os.environ.update(env)
     limit_threads(threads)
     lower_priority()
+    from .memguard import prefer_oom_kill
+
+    prefer_oom_kill(1000)  # out of memory anyway: the kernel ends a worker, not the desktop
     from .backend import enabled, worker_init
 
     if enabled():

@@ -95,3 +95,28 @@ def test_gui_command_takes_gpus(monkeypatch):
         monkeypatch.delenv(key)
     backend.set_resources([0, 2])
     assert os.environ["CSPAPS_GPU_DEVICES"] == "0,2" and os.environ["CSPAPS_GPU"] == "1"
+
+
+def test_the_sidebar_states_the_memory_per_process_for_this_field(monkeypatch, app):
+    """The per-process memory follows the loaded field (not a flat 1.5 GB), and the process cap uses it."""
+    from cspaps import parallel
+    from cspaps.aps import CERTIFICATE_BYTES_PER_CANDIDATE, candidate_count, problem_memory_bytes
+    from cspaps.config import case_from_dict
+    from cspaps.field import build_field
+
+    case = case_from_dict(small_case_dict(), base_dir=ROOT)
+    n, k = build_field(case).n, candidate_count(case.aps)
+    per = problem_memory_bytes(n, k)
+    gb = 2 ** 30
+    monkeypatch.delenv("CSPAPS_WORKER_MEM_GB", raising=False)
+    monkeypatch.setattr(parallel, "memory_bytes", lambda: (int(2.4 * gb + 2 * per + per // 2), 16 * gb))
+    monkeypatch.setattr(parallel, "cpu_count", lambda: 8)  # any machine: room for 6 processes in the box
+    at = app()
+    at.run()
+    box = next(x for x in at.sidebar.number_input if x.label.startswith("并行进程数"))
+    box.set_value(6).run()
+    assert not at.exception
+    text = _captions(at)
+    assert f"当前镜场 {n:,} 面：每个进程求解时约占 {per / gb:.1f} GB" in text
+    assert f"最优性证书另需约 {n * k * CERTIFICATE_BYTES_PER_CANDIDATE / gb:.0f} GB" in text
+    assert f"最多同时启动 2 个进程（每个按 {per / gb:.1f} GB 估计" in text

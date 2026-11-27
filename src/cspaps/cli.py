@@ -212,6 +212,9 @@ def _move_args(sp) -> None:
 def main(argv: list[str] | None = None) -> int:
     global _TRACKER
     _safe_console()
+    from .memguard import prefer_oom_kill
+
+    prefer_oom_kill(500)  # out of memory: end this calculation (its workers first), not the desktop
     from .progress import ProgressTracker
 
     _TRACKER = ProgressTracker()  # elapsed / remaining times count from the start of this command

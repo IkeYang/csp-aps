@@ -55,6 +55,7 @@ absorptivity), so no step relies on sampling.
 from __future__ import annotations
 
 import math
+import weakref
 import time as _time
 from dataclasses import dataclass
 
@@ -124,8 +125,36 @@ def check_model_memory(prob) -> None:
             "free after the system's reserve", need, room)
 
 
+def reserve_model_memory(prob):
+    """Reserve the model's memory machine-wide (``memguard``) before building it: parallel workers and runs
+    started side by side cannot all take the same free memory. Waits while another calculation holds memory it
+    will release; ``CertificateTooLarge`` when the model cannot fit."""
+    from .memguard import MemoryShortage, reserve
+
+    need = model_bytes(prob)
+    try:
+        return reserve(need, "optimality certificate")
+    except MemoryShortage as exc:
+        raise CertificateTooLarge(
+            f"the optimality certificate needs about {need / 2 ** 30:.1f} GB ({prob.n} heliostats x {prob.k} candidate "
+            f"aims on {prob.rs.points.shape[0]} constraint points), {str(exc).split(', ', 1)[1]}", need,
+            exc.room_bytes) from None
+
+
 def _build_model(prob, h_mask: np.ndarray) -> _Model:
-    check_model_memory(prob)  # before allocating anything: a too large model must not freeze the computer
+    # before allocating anything: a too large model must not freeze the computer; the reservation lives as long
+    # as the model
+    hold = reserve_model_memory(prob)
+    try:
+        model = _assemble_model(prob, h_mask)
+    except BaseException:
+        hold.release()
+        raise
+    weakref.finalize(model, hold.release)
+    return model
+
+
+def _assemble_model(prob, h_mask: np.ndarray) -> _Model:
     rs = prob.rs
     n, k = prob.n, prob.k
     rows, cols, vals = [], [], []
