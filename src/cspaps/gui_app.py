@@ -2623,6 +2623,12 @@ def _pareto_section(case, stamp: str, dni_src: str, up_now, up_prev=None) -> Non
                                  "差距": df["gap"].map(lambda g: _pct(g, 2)) if "gap" in df else "—"})
             st.dataframe(view, hide_index=True)
             p0 = rows[0]["power_abs_mw"] if rows else None
+            top = max(rows[1:], key=lambda r: r["power_abs_mw"]) if len(rows) > 1 else None
+            if p0 is not None and rows[0]["lambda"] == 0 and top and top["power_abs_mw"] > p0 * 1.005:
+                _callout("warn", "λ = 0 的功率不是最高",
+                         f"λ = {top['lambda']:g} 的吸收功率 {top['power_abs_mw']:.1f} MW 高于 λ = 0 的 {p0:.1f} MW。"
+                         "λ = 0 只追求功率，按理应是曲线上功率最高的点，说明这一点的求解没有找到好方案。"
+                         "请保存这次的运行记录并反馈；可以先换一个初始方案或时刻重新计算。")
             if p0 and len(rows) > 1:
                 best = min(rows, key=lambda r: r["cv_2d"])
                 st.caption(f"从 λ = {rows[0]['lambda']:g} 到 λ = {best['lambda']:g}：CV {rows[0]['cv_2d']:.3f} → "

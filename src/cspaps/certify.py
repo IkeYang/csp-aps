@@ -478,7 +478,8 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
        relaxed solution), flux repair (greedy warm start), local search in the
        mode's objective.
     3. The best plan that improves the objective is verified on the fine grid
-       (hotspots added as constraints, repaired); otherwise the input plan is kept.
+       (hotspots added as constraints, repaired); otherwise the input plan is kept. It may not use more of
+       the safety margin than the input plan: strictly within it when the input was, else no higher peak.
     4. A second bound run from the final plan; the reported bound is the smaller one.
     With an initial state (``prev``) and ``aps.move_penalty_per_m`` > 0, plans are compared by the objective
     minus their move price (``aps.move_cost``): a rounding of the relaxation may not undo the move pricing. The
@@ -551,8 +552,12 @@ def improve_and_certify(prob, res, spec=None, rounds: int = 8, max_iter: int = 3
             rounds_v += 1
         v = priced(choice)
         base_now = priced(base_choice)
-        ok = (not spec.verify or check.status in ("ok", "margin_reduced")) and v is not None and \
-            (base_now is None or v > base_now)
+        # no more of the safety margin than the input plan: within it if the input was ("ok"), else no higher peak
+        base_check = res.check
+        margin_ok = (check.status == "ok" or (check.status == "margin_reduced" and base_check is not None
+                                               and base_check.status != "ok"
+                                               and check.peak_ratio <= base_check.peak_ratio))
+        ok = (not spec.verify or margin_ok) and v is not None and (base_now is None or v > base_now)
         if ok:
             info = {k: v_ for k, v_ in res.info.items() if not k.startswith("uniformity") and not k.startswith("cv_")
                     and k not in ("power_H_mw", "global_optimality_proven", "solution_class")}

@@ -84,6 +84,14 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
     objective without the price: the exhaustive bound is the best unpriced objective over all joint poses,
     the gap is that of the selected plan's unpriced objective (what staying near the initial state costs).
 
+    A pose counts as verified when its fine-grid peak is within the allowed level (limit x (1 - margin)).
+    The solver may end its plan a hair above that level after its verification rounds ("margin_reduced":
+    above the allowed level, below the limit), and the rest of the pipeline accepts such a plan. The bounded
+    (non-exhaustive) search then accepts poses up to the seed's own verified peak, never more: the result uses
+    no more of the safety margin than the solver's plan and has at least its objective, instead of a nearly
+    empty plan that passes the stricter check only because it carries almost no flux. The exhaustive search
+    keeps the strict rule (it finds the best pose within the margin).
+
     The independent, unshaded per-mirror maxima dominate every feasible combination:
     shading factors lie in [0,1], and the uniformity penalty is nonnegative. For small
     products visit all choices. For large products keep the best feasible incumbent
@@ -122,9 +130,14 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
     best_motion = None
     best_raw = None  # unpriced objective of the selected plan
     top_raw = [-np.inf]  # best unpriced objective of any legal, verified joint pose (exhaustive bound)
+    peak_cap = [None]  # the seed's verified peak ratio when it ends inside the safety margin
     from .aps import plan_move_cost
 
-    def consider(ch):
+    def verified(check) -> bool:
+        return check.ok or (peak_cap[0] is not None and check.status == "margin_reduced"
+                            and check.peak_ratio <= peak_cap[0])
+
+    def consider(ch, is_seed=False):
         nonlocal best, best_value, best_motion, best_raw, fallback
         ch = np.asarray(ch, dtype=int)
         key = ch.tobytes()
@@ -148,16 +161,18 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
         forecast = (evaluate(case, field, rs.sun_elevation, rs.sun_azimuth, prob.dni_con, **args)
                     if separate_forecast else snap)
         check = forecast.verify(case.receiver, max_cells=spec.verify_max_cells)
-        flux_rejections[0] += int(not check.ok)
+        if is_seed and not exact and check.status == "margin_reduced":
+            peak_cap[0] = check.peak_ratio
+        flux_rejections[0] += int(not verified(check))
         entry = (ch.copy(), snap, value, check)
         if fallback is None:
             fallback = entry
-        if legal and value["uniformity_met"] and check.ok:
+        if legal and value["uniformity_met"] and verified(check):
             top_raw[0] = max(top_raw[0], value["objective_w"])
             if better:
                 best, best_value, best_motion, best_raw = entry, priced, motion, value["objective_w"]
 
-    consider(seed.choice)
+    consider(seed.choice, is_seed=True)
     if warm is not None:
         consider(warm)
     if exact and not impossible_load:
@@ -207,7 +222,7 @@ def search_joint_poses(prob, field, seed, *, warm=None, exact_limit=None, trials
             retained_check = forecast.verify(case.receiver, max_cells=spec.verify_max_cells)
             retained_on = retained >= 0
             retained_legal = np.all(allowed[np.flatnonzero(retained_on), retained[retained_on]])
-            if (retained_check.ok and retained_value["objective_w"] >= value["objective_w"]
+            if (verified(retained_check) and retained_value["objective_w"] >= value["objective_w"]
                     and retained_legal):
                 choice, snap, value, check = retained, retained_snap, retained_value, retained_check
     feasible = best is not None

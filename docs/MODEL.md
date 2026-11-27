@@ -233,6 +233,7 @@ Streamlit 热重载可在一个进程内重新执行 Python 模块，使运行�
 
 - 年度价值、APS 页的结论与“可以执行”判断只认 `ok`（`simulate._annual_state` 的中心瞄准路径也做细网格复核；纯能量研究可设 `check_flux=False`，结果标注“未校核通量”）。
 - 求解器最后一步是**从当前方案出发的修复**（`aps.solve`）：均匀性调整或重新求解可能把峰值推过安全裕度（仍在限值之下）；修复只移动或散焦给超限点供热的镜子，直到复核为 `ok`。没有这一步时，联合姿态复核只能退回到很差的可行方案。测试算例（346 面镜）在 0.6.6 的“逼近热流限制”工况上，修复前方案只剩 18 面镜（0.47 MW），修复后 346 面全部工作（9.36 MW，峰值为限值的 0.87）。测试：`test_near_limit_plan_keeps_its_power_after_the_final_repair`、`test_single_mirror_boundary_case_uses_the_margin_everywhere`。
+- **余量内的一致规则。** 细网格复核分三档：`ok`（峰值 ≤ 上限 ×(1 − 裕度)）、`margin_reduced`（在余量里、未超上限）、`over_limit`。求解器在复核轮数用完后可能停在 `margin_reduced`，流程接受它。为避免后续步骤把它换成更差的方案，两步用同一原则——不比输入方案多用余量：松弛取整（`improve_and_certify`）的方案在输入为 `ok` 时也必须 `ok`，否则峰值不得高于输入；联合姿态有界搜索（`search_joint_poses`）在种子方案为 `margin_reduced` 时接受峰值不高于种子复核峰值的姿态，结果的目标不低于种子、峰值不高于种子。穷举仍只接受 `ok`。修正前，联合姿态搜索只接受 `ok`，种子被丢掉后从“全部散焦”随机试探：测试算例（346 面镜、上限 200 kW/m²、从中心出发）λ = 0 只剩 127 面镜、3.15 MW，修正后 346 面、8.68 MW，峰值 190 kW/m²。测试：`tests/test_joint_pose_margin.py`。
 
 ### 0.6.3 一个偏好 λ
 
