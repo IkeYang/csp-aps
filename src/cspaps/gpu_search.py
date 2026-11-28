@@ -330,6 +330,10 @@ def local_search(prob, state, mu: float, passes: int, absorb_power, order, move_
             s = cp.asnumpy(sums)
             n_limited = int(cp.asnumpy(limited)[0])
     except Exception as exc:  # noqa: BLE001 - any GPU problem: CPU kernels from now on
+        if backend._is_out_of_memory(exc):  # device memory full: this search on the CPU, the GPU stays in use
+            backend.free_device_memory()
+            backend.OOM_FALLBACKS.append("local_search")
+            return False
         _FAILED.append(repr(exc))
         warnings.warn(f"GPU local search unavailable ({exc!r}); using the CPU kernels", RuntimeWarning, stacklevel=2)
         return False

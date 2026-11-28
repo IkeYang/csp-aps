@@ -15,6 +15,12 @@ import numpy as np
 
 
 class DeviceArray(np.ndarray):
+    def __getitem__(self, key):  # fancy indexing allocates on the device as well
+        out = super().__getitem__(key)
+        if isinstance(out, np.ndarray) and not np.shares_memory(out, self):
+            _budget(out.nbytes)
+        return out
+
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         for x in inputs + tuple(kwargs.get("out", ()) or ()):
             if isinstance(x, np.ndarray) and not isinstance(x, DeviceArray) and x.ndim > 0:
@@ -35,13 +41,26 @@ class DeviceArray(np.ndarray):
         return float(self.view(np.ndarray))
 
 
-_STATE = {"strict_host": False, "devices_used": [], "current": 0, "limits": {}}
+_STATE = {"strict_host": False, "devices_used": [], "current": 0, "limits": {}, "max_bytes": None}
+
+
+class OutOfMemoryError(MemoryError):
+    """``cupy.cuda.memory.OutOfMemoryError``."""
+
+
+def _budget(nbytes: int) -> None:
+    """A device with little memory: ``_STATE["max_bytes"]`` is the largest allocation that succeeds."""
+    limit = _STATE.get("max_bytes")
+    if limit is not None and nbytes > limit:
+        _STATE["oom"] = _STATE.get("oom", 0) + 1
+        raise OutOfMemoryError(f"Out of memory allocating {nbytes:,} bytes (limit set to: {limit:,})")
 
 
 def _wrap(out):
     if isinstance(out, tuple):
         return tuple(_wrap(o) for o in out)
     if isinstance(out, np.ndarray) and not isinstance(out, DeviceArray):
+        _budget(out.nbytes)
         return out.view(DeviceArray)
     return out
 
@@ -91,12 +110,16 @@ class _Module(types.ModuleType):
             def set_limit(self, size=None, fraction=None):
                 state["limits"][state["current"]] = fraction if fraction is not None else size
 
+            def free_all_blocks(self):
+                state["freed"] = state.get("freed", 0) + 1
+
         runtime = types.SimpleNamespace(
             getDeviceCount=lambda: mod.n_devices,
             memGetInfo=lambda: mem,
             getDeviceProperties=lambda dev: {"name": b"NVIDIA GeForce RTX 2080 Ti", "totalGlobalMem": 11 << 30},
         )
-        self.cuda = types.SimpleNamespace(Device=Device, runtime=runtime)
+        self.cuda = types.SimpleNamespace(Device=Device, runtime=runtime,
+                                          memory=types.SimpleNamespace(OutOfMemoryError=OutOfMemoryError))
         self._pool = MemoryPool()
         self.linalg = types.SimpleNamespace(norm=self._fn(np.linalg.norm, "linalg.norm"))
 
@@ -144,7 +167,9 @@ class _Module(types.ModuleType):
     def asarray(a, dtype=None):
         if isinstance(a, DeviceArray):
             return a if dtype is None else a.astype(dtype)
-        return np.array(a, dtype=dtype).view(DeviceArray)
+        out = np.array(a, dtype=dtype)
+        _budget(out.nbytes)
+        return out.view(DeviceArray)
 
     @staticmethod
     def asnumpy(a):
@@ -194,7 +219,7 @@ def install(monkeypatch, n_devices: int = 2):
     monkeypatch.setenv("CSPAPS_GPU", "1")
     monkeypatch.setattr(backend, "_cupy", lambda: fake)
     monkeypatch.setattr(backend, "_CONFIGURED", set())
-    _STATE.update(strict_host=True, devices_used=[], current=0, limits={})
+    _STATE.update(strict_host=True, devices_used=[], current=0, limits={}, max_bytes=None, oom=0, freed=0)
     monkeypatch.setattr(sys.modules[__name__], "_STATE", _STATE)
     return fake, _STATE
 

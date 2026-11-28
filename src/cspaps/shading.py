@@ -112,12 +112,15 @@ def ray_hits_tower(o, d, center_xy, radius: float, z_top: float, z_bottom: float
 
 
 def neighbor_pairs(xy: np.ndarray, radius: float) -> tuple[np.ndarray, np.ndarray]:
-    """All ordered pairs (i, j), i != j, with horizontal distance <= radius."""
+    """All ordered pairs (i, j), i != j, with horizontal distance <= radius (int32 indices below 2^31 mirrors:
+    a low sun over a large field gives hundreds of millions of pairs)."""
+    itype = np.int32 if len(xy) < 2 ** 31 else np.int64
     if len(xy) < 2:
-        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
-    pairs = cKDTree(xy).query_pairs(radius, output_type="ndarray")
+        return np.zeros(0, dtype=itype), np.zeros(0, dtype=itype)
+    pairs = cKDTree(xy).query_pairs(radius, output_type="ndarray").astype(itype, copy=False)
     i = np.concatenate([pairs[:, 0], pairs[:, 1]])
     j = np.concatenate([pairs[:, 1], pairs[:, 0]])
+    del pairs
     order = np.argsort(i, kind="stable")
     return i[order], j[order]
 
@@ -134,15 +137,23 @@ class PairCache:
     def __init__(self, xyz: np.ndarray):
         self.xyz = xyz
         self.radius = -1.0
-        self.i = self.j = np.zeros(0, dtype=np.int64)
+        self.i = self.j = np.zeros(0, dtype=np.int32)
+        self.d = np.zeros(0)
 
     def get(self, radius: float) -> tuple[np.ndarray, np.ndarray]:
         if radius > self.radius:
             self.radius = radius * 1.25  # head-room so small increases do not recompute
+            self.i = self.j = self.d = None  # the old pairs go before the new ones are built
             self.i, self.j = neighbor_pairs(self.xyz[:, :2], self.radius)
-        d = np.hypot(*(self.xyz[self.j, :2] - self.xyz[self.i, :2]).T)
-        keep = d <= radius
+            self.d = np.empty(self.i.size)
+            for s in range(0, self.i.size, PAIR_BLOCK):  # same values as one hypot, without the (P, 2) temporary
+                e = s + PAIR_BLOCK
+                self.d[s:e] = np.hypot(*(self.xyz[self.j[s:e], :2] - self.xyz[self.i[s:e], :2]).T)
+        keep = self.d <= radius
         return self.i[keep], self.j[keep]
+
+
+PAIR_BLOCK = 1_000_000  # neighbour pairs per step of the CPU corridor test (a few (block, 3) float64 arrays)
 
 
 def _corridor(rel: np.ndarray, d: np.ndarray, diag: float, max_along: np.ndarray, xp=np) -> np.ndarray:
@@ -154,7 +165,9 @@ def _corridor(rel: np.ndarray, d: np.ndarray, diag: float, max_along: np.ndarray
 def _shading_blocking_gpu(cp, scatter_add, xyz, normals, sun_vec, t, helio, rec, i_all, j_all, r_shade, dz,
                           n_points, tower_shadow) -> dict[str, np.ndarray]:
     """``shading_blocking`` after the (CPU) neighbour-pair selection, on the device: same geometry and rules;
-    the hit masks are OR-ed per mirror with a scatter-add of the per-pair hits."""
+    the hit masks are OR-ed per mirror with a scatter-add of the per-pair hits. The pairs stream through the
+    device in blocks (a low sun over a large field gives hundreds of millions of them), so the device memory
+    stays within ``block_elements`` whatever their number; the OR makes the result independent of the blocks."""
     from .backend import block_elements
 
     n = xyz.shape[0]
@@ -166,31 +179,38 @@ def _shading_blocking_gpu(cp, scatter_add, xyz, normals, sun_vec, t, helio, rec,
     diag = helio.diagonal
     hw, hh = 0.5 * helio.width, 0.5 * helio.height
     p = offsets.shape[0]
-    chunk = max(1, block_elements(cp) // (12 * p))
+    block = block_elements(cp)
+    chunk = max(1, block // (12 * p))  # pairs per ray test: (chunk, P, 3) float64 arrays
+    pair_block = max(chunk, block // 8)  # pairs per corridor step: a few (pair_block, 3) float64 arrays
 
-    def hit_mask(I, J, d):
-        counts = cp.zeros((n, p), dtype=cp.int32)
+    def add_hits(counts, I, J, d):
         for start in range(0, int(I.size), chunk):
             ii, jj = I[start:start + chunk], J[start:start + chunk]
             dd = d[ii][:, None, :] if d.ndim == 2 else d[None, None, :]
             hits = ray_hits_rect(pts[ii], dd, X[jj][:, None, :], Nrm[jj][:, None, :], e_w[jj][:, None, :],
                                  e_h[jj][:, None, :], hw, hh, xp=cp)
             scatter_add(counts, ii, hits.astype(cp.int32))
-        return counts > 0
 
-    I, J = cp.asarray(i_all), cp.asarray(j_all)
-    rel = X[J] - X[I]
-    keep_s = _corridor(rel, cp.broadcast_to(S, rel.shape), diag, cp.full(rel.shape[0], r_shade + diag), xp=cp)
-    shaded = hit_mask(I[keep_s], J[keep_s], S)
+    shade_counts = cp.zeros((n, p), dtype=cp.int32)
+    block_counts = cp.zeros((n, p), dtype=cp.int32)
+    for start in range(0, int(np.asarray(i_all).size), pair_block):
+        I = cp.asarray(np.asarray(i_all[start:start + pair_block], dtype=np.int64))
+        J = cp.asarray(np.asarray(j_all[start:start + pair_block], dtype=np.int64))
+        rel = X[J] - X[I]
+        keep_s = _corridor(rel, cp.broadcast_to(S, rel.shape), diag, cp.full(rel.shape[0], r_shade + diag), xp=cp)
+        add_hits(shade_counts, I[keep_s], J[keep_s], S)
+        t_pair = T[I]
+        max_along = (helio.height + dz) / cp.maximum(t_pair[:, 2], 0.03) + diag
+        keep_b = _corridor(rel, t_pair, diag, max_along, xp=cp)
+        add_hits(block_counts, I[keep_b], J[keep_b], T)
+        del I, J, rel, t_pair, max_along, keep_s, keep_b
+    shaded = shade_counts > 0
+    blocked = block_counts > 0
     tower_hits = cp.zeros(shaded.shape, dtype=bool)
     tower_fraction = cp.zeros(n)
     if tower_shadow and rec is not None and rec.tower_radius > 0:
         tower_hits = ray_hits_structure(pts, S[None, None, :], rec, xp=cp)
         tower_fraction = tower_hits.mean(axis=1)
-    t_pair = T[I]
-    max_along = (helio.height + dz) / cp.maximum(t_pair[:, 2], 0.03) + diag
-    keep_b = _corridor(rel, t_pair, diag, max_along, xp=cp)
-    blocked = hit_mask(I[keep_b], J[keep_b], T)
     other = shaded | blocked
     eta_shade = 1.0 - (shaded | tower_hits).sum(axis=1) / p
     eta_comb = 1.0 - (other | tower_hits).sum(axis=1) / p
@@ -199,9 +219,9 @@ def _shading_blocking_gpu(cp, scatter_add, xyz, normals, sun_vec, t, helio, rec,
             "tower_fraction": cp.asnumpy(tower_fraction), "non_tower_occluded": cp.asnumpy(other)}
 
 
-def _hit_mask(points, i, j, d, xyz, normals, e_w, e_h, helio, n, chunk=4096) -> np.ndarray:
-    """(N, P) mask: point of mirror i hits any listed neighbour j along direction d."""
-    mask = np.zeros(points.shape[:2], dtype=bool)
+def _hit_mask(points, i, j, d, xyz, normals, e_w, e_h, helio, n, chunk=4096, out=None) -> np.ndarray:
+    """(N, P) mask: point of mirror i hits any listed neighbour j along direction d (OR-ed into ``out``)."""
+    mask = np.zeros(points.shape[:2], dtype=bool) if out is None else out
     hw, hh = 0.5 * helio.width, 0.5 * helio.height
     for start in range(0, i.size, chunk):
         ii, jj = i[start:start + chunk], j[start:start + chunk]
@@ -258,20 +278,23 @@ def shading_blocking(
     if blockers is not None:
         keep = np.asarray(blockers, dtype=bool)[j_all]
         i_all, j_all = i_all[keep], j_all[keep]
-    rel = xyz[j_all] - xyz[i_all]
-
-    keep_s = _corridor(rel, np.broadcast_to(sun_vec, rel.shape), diag, np.full(rel.shape[0], r_shade + diag))
-    shaded_mirrors = _hit_mask(pts, i_all[keep_s], j_all[keep_s], sun_vec, xyz, normals, e_w, e_h, helio, n)
+    # the pairs in blocks: memory bounded whatever their number (hundreds of millions at a low sun)
+    shaded_mirrors = np.zeros(pts.shape[:2], dtype=bool)
+    blocked = np.zeros(pts.shape[:2], dtype=bool)
+    for start in range(0, i_all.size, PAIR_BLOCK):
+        i_b, j_b = i_all[start:start + PAIR_BLOCK], j_all[start:start + PAIR_BLOCK]
+        rel = xyz[j_b] - xyz[i_b]
+        keep_s = _corridor(rel, np.broadcast_to(sun_vec, rel.shape), diag, np.full(rel.shape[0], r_shade + diag))
+        _hit_mask(pts, i_b[keep_s], j_b[keep_s], sun_vec, xyz, normals, e_w, e_h, helio, n, out=shaded_mirrors)
+        t_pair = t[i_b]
+        max_along = (helio.height + dz) / np.maximum(t_pair[:, 2], 0.03) + diag
+        keep_b = _corridor(rel, t_pair, diag, max_along)
+        _hit_mask(pts, i_b[keep_b], j_b[keep_b], t, xyz, normals, e_w, e_h, helio, n, out=blocked)
     tower_hits = np.zeros(shaded_mirrors.shape, dtype=bool)
     tower_fraction = np.zeros(n)
     if tower_shadow and rec is not None and rec.tower_radius > 0:
         tower_hits = ray_hits_structure(pts, sun_vec[None, None, :], rec)
         tower_fraction = tower_hits.mean(axis=1)
-
-    t_pair = t[i_all]
-    max_along = (helio.height + dz) / np.maximum(t_pair[:, 2], 0.03) + diag
-    keep_b = _corridor(rel, t_pair, diag, max_along)
-    blocked = _hit_mask(pts, i_all[keep_b], j_all[keep_b], t, xyz, normals, e_w, e_h, helio, n)
 
     p = offsets.shape[0]
     other_occlusion = shaded_mirrors | blocked
@@ -284,7 +307,15 @@ def shading_blocking(
 
 
 def _shading_gpu(xyz, normals, sun_vec, t, helio, rec, pairs, n_points, tower_shadow, blockers):
-    """``shading_blocking`` on the GPU when the backend is on and the ray tests are many; else None."""
+    """``shading_blocking`` on the GPU when the backend is on and the ray tests are many; else None (also when
+    the device runs out of memory: ``backend.falls_back_on_oom``)."""
+    from . import backend
+
+    return backend.falls_back_on_oom(_shading_gpu_run)(xyz, normals, sun_vec, t, helio, rec, pairs, n_points,
+                                                         tower_shadow, blockers)
+
+
+def _shading_gpu_run(xyz, normals, sun_vec, t, helio, rec, pairs, n_points, tower_shadow, blockers):
     from . import backend
 
     dz = float(np.ptp(xyz[:, 2])) if xyz.shape[0] > 1 else 0.0

@@ -29,8 +29,10 @@ backend it used (``backend_name``, ``describe``) and comparisons should not mix 
 from __future__ import annotations
 
 import contextlib
+import functools
 import math
 import os
+import warnings
 
 import numpy as np
 
@@ -241,6 +243,46 @@ def _beams(cp, aim_xyz, t, sigma, power, sl):
     return (_dev(cp, aim_xyz[sl]), _dev(cp, t[sl]), _dev(cp, sigma[sl]), _dev(cp, power[sl]))
 
 
+OOM_FALLBACKS: list[str] = []  # GPU steps that ran out of device memory and were done on the CPU instead
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "outofmemory" in text.replace(" ", "") or "out of memory" in text or "memoryallocation" in text
+
+
+def free_device_memory() -> None:
+    """Hand the memory pools' cached blocks back to the device (after a failed allocation)."""
+    cp = _cupy()
+    if cp is None:
+        return
+    for pool in ("get_default_memory_pool", "get_default_pinned_memory_pool"):
+        with contextlib.suppress(Exception):
+            getattr(cp, pool)().free_all_blocks()
+
+
+def falls_back_on_oom(fn):
+    """A GPU entry point (returns None for "use the CPU path"): when the device runs out of memory, its pools
+    are freed and None is returned, so this step runs on the CPU and the calculation goes on (results agree to
+    rounding). Other errors propagate."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - CuPy's OutOfMemoryError / CUDA allocation errors
+            if not _is_out_of_memory(exc):
+                raise
+            free_device_memory()
+            if not OOM_FALLBACKS:
+                warnings.warn(f"GPU memory full in {fn.__name__} ({exc}); this step runs on the CPU",
+                              RuntimeWarning, stacklevel=2)
+            OOM_FALLBACKS.append(fn.__name__)
+            return None
+
+    return wrapper
+
+
 def _gpu_for(n_elements: int, dense: bool = False):
     """CuPy when the GPU backend is on and the work is large enough, else None.
 
@@ -251,6 +293,7 @@ def _gpu_for(n_elements: int, dense: bool = False):
     return _cupy()
 
 
+@falls_back_on_oom
 def footprints_gpu(points, normals, aim_xyz, t, sigma, power):
     """The footprint matrix on the GPU, or None when the CPU path should be used."""
     cp = _gpu_for(aim_xyz.shape[0] * points.shape[0], dense=True)
@@ -261,6 +304,7 @@ def footprints_gpu(points, normals, aim_xyz, t, sigma, power):
         return cp.asnumpy(footprints_xp(cp, *args))
 
 
+@falls_back_on_oom
 def flux_sum_gpu(points, normals, aim_xyz, t, sigma, power):
     """Superposed flux of all beams at the points, (P,), reduced on the device; None -> CPU path."""
     n_b, n_p = aim_xyz.shape[0], points.shape[0]
@@ -276,6 +320,7 @@ def flux_sum_gpu(points, normals, aim_xyz, t, sigma, power):
         return cp.asnumpy(out)
 
 
+@falls_back_on_oom
 def flux_and_power_gpu(points, normals, aim_xyz, t, sigma, power, cell_area):
     """(flux at the points (P,), flux sum per beam x ``cell_area`` (R,)), reduced on the device; None -> CPU."""
     n_b, n_p = aim_xyz.shape[0], points.shape[0]
@@ -294,6 +339,7 @@ def flux_and_power_gpu(points, normals, aim_xyz, t, sigma, power, cell_area):
         return cp.asnumpy(flux), cp.asnumpy(per_beam)
 
 
+@falls_back_on_oom
 def row_stats_gpu(points, normals, aim_xyz, t, sigma, power, weights):
     """Per beam: the flux sum over the points and the ``weights``-weighted sum, (R,) each; None -> CPU path."""
     n_b, n_p = aim_xyz.shape[0], points.shape[0]
@@ -311,6 +357,7 @@ def row_stats_gpu(points, normals, aim_xyz, t, sigma, power, weights):
         return cp.asnumpy(sums), cp.asnumpy(dots)
 
 
+@falls_back_on_oom
 def sparse_responses_gpu(points, normals, aim_xyz, t, sigma, power, cutoff):
     """Sparse candidate responses of N heliostats x K candidates, built on the device.
 
@@ -377,6 +424,7 @@ def intercept_xp(xp, ndtr, aim_xyz, t, sigma, radius, c_bot, z_span, x, w):
     return xp.minimum(xp.maximum(xp.where(ok, frac, 0.0), 0.0), 1.0)
 
 
+@falls_back_on_oom
 def intercept_fraction_gpu(aim_xyz, t, sigma, radius, c_bot, z_span, n_quad):
     """Gaussian intercept fractions of (n,) beams on the device; None -> CPU path."""
     n = sigma.shape[0]

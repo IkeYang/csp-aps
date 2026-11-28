@@ -11,6 +11,11 @@
   - 瞄准结果：“全场叠加热流”（全部工作镜叠加的热流图、管屏柱状图、周向与高度分布、CV 与细网格复核峰值）排在第一位，不画瞄准点；瞄准点叠加图的底图同样是全场热流，抽样只用于画瞄准点和光斑圈（`gui_app._full_field_flux`，`gui_plots.tradeoff_profiles(labels=...)`）。
   - 气象文件范围检查：`sun.weather_coverage`、`sun.weather_dni_at`（超出 max(1 h, 1.5 × 间隔) 即报错），`simulate.sun_state` 不再静默取最近记录；界面时刻默认落在文件内（`_default_time`）、显示覆盖时段、超出时报错并停用开始按钮（`_weather_window`）。
   - 证书内存保护：`certify.model_bytes` / `check_model_memory` / `CertificateTooLarge`（48 字节 / 非零项，留 max(2 GB, 15%) 内存）；`task_aim` 跳过证书并在结果中说明（`certificate_skipped`），`task_pareto` 关闭证书，通量价格换位改用能量定价；`layout_value.solve_instant` 只按固定的 8 GB 规模判断（`FORMAL_CERTIFY_MAX_BYTES`），与机器无关、结果可复现。
+- **显卡内存：布局搜索不再因显存不足中断**（现场反馈：差分进化布局搜索在阴影遮挡计算中报 `cupy.cuda.memory.OutOfMemoryError`，已占 17.4 GB、再要 4.7 GB，上限 19.6 GB）。原因：阴影遮挡的邻镜搜索半径随 1/tan(太阳高度) 增大（下限 2°）并计入全场高差，日出日落时大候选镜场有上亿对邻镜；显卡代码把全部镜对的 (对数, 3) 数组同时放在显存里，CPU 代码同样整块放在内存里。修正：
+  - 镜对分块流过阴影遮挡计算（显卡按 `block_elements`，CPU 每块 100 万对），显存和内存占用与镜对数无关；命中按镜子取并集，结果与分块无关，与修正前逐位相同（现场镜场 2,521 / 5,037 面、太阳高度 3°–20° 核对）。
+  - 邻镜缓存用 int32 下标，距离只算一次（`shading.PairCache`）。
+  - 所有显卡计算入口（`backend.falls_back_on_oom`：光斑核、热流叠加、响应、截断、阴影遮挡；均匀度局部搜索）遇到显存不足时释放显存池，这一步改在 CPU 上算并提示一次，计算继续，不再整个任务失败。
+  - 测试 `tests/test_gpu_memory.py`（显存上限可设的 CuPy 替身；修正前 3 项全部失败）。
 - **全机内存协调：并行计算不再把内存占满**（现场反馈：251 GB 工作站上 4 个进程各约 52 GB，内存耗尽，系统结束了桌面会话）。原因：瞄准问题（全场约 12–16 GB）和最优性证书模型（约 42 GB）分配前，每个进程只看当时的剩余内存，同时开工的进程看到同一份剩余内存；进程池按每进程 1.5 GB 估计，放进了 4 个这样的进程。触发路径之一：布局优化正式换位的通量定价（`dual_prices`），4 个进程各建一个“布局 + 空位”的证书模型；多个程序各占一张卡同时算也一样。修正（与卡数、进程数无关）：
   - `memguard`：大块内存分配前在全机登记簿里预约（文件锁 + 每个预约一个小文件，放在临时目录），别人已预约而尚未占上的部分（预约量减去其常驻内存的增长）计为已用；放不下时排队等别的计算释放，没有谁能释放时报 `MemoryShortage`（证书转为 `CertificateTooLarge`，按原有方式跳过）。预约随对象释放（`weakref.finalize`），进程结束则作废。瞄准问题（`aps.build_response`，`problem_memory_bytes` = 0.5 GB + 每镜每候选点 64 kB）与证书模型（`certify._build_model`，`model_bytes`）都走这里。
   - 进程池按工作量估计每进程内存（`parallel.pool(per_worker_bytes=…)`、`worker_memory_bytes`；正式价值、通量定价、布局搜索都传入估计），`CSPAPS_WORKER_MEM_GB` 仍可直接指定。
